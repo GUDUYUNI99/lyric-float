@@ -1,0 +1,13 @@
+{
+  "folium": 1,
+  "id": "my-lyric-widget",
+  "name": "独立悬浮歌词",
+  "version": "0.2.1",
+  "description": "",
+  "permissions": [
+    "playback.control",
+    "playback.read"
+  ],
+  "client": "client.mjs",
+  "main": "main.cjs"
+}
