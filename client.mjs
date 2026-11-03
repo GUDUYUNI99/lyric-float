@@ -238,7 +238,17 @@ const mountLyricWidget = (folium, session, ctx) => {
     let lastSentKey = '';
     let reportedFailure = false;
 
+    // rpc 是 Folium 1.7 才有的：老宿主上别让整个歌词样式因为取不到成员而挂掉。
+    const canReport = Boolean(folium.rpc && typeof folium.rpc.call === 'function');
+    const canReceiveActions = canReport && typeof folium.rpc.on === 'function';
+    if (!canReport) {
+        folium.log.warn('[lyric-widget] 当前 Folium 版本没有 folium.rpc.call（需要 1.7+），悬浮窗收不到数据');
+    } else if (!canReceiveActions) {
+        folium.log.warn('[lyric-widget] 当前 Folium 版本没有 folium.rpc.on（需要 1.7+），悬浮窗的按钮/滑块会无效');
+    }
+
     const syncData = (force = false) => {
+        if (!canReport) return;
         const payload = buildPayload(folium, ctx, session.id);
         // 一次变化可能同时触发多个监听，内容相同的快照不必重复发；request-sync 强制重发。
         const key = JSON.stringify(payload);
@@ -273,7 +283,6 @@ const mountLyricWidget = (folium, session, ctx) => {
     };
 
     const disposers = [
-        folium.rpc.on(RPC_ACTION, handleActionMessage),
         ctx.onChange(() => syncData()),
         folium.events.on('playback.songChanged', refreshAndSync),
         folium.events.on('playback.stateChanged', refreshAndSync),
@@ -282,6 +291,8 @@ const mountLyricWidget = (folium, session, ctx) => {
         folium.events.on('playback.likeChanged', () => syncData()),
         folium.events.on('playback.seeked', () => syncData()),
     ];
+    // 先登记 action 监听再发第一份数据，避免主进程刚发出的指令被丢掉。
+    if (canReceiveActions) disposers.unshift(folium.rpc.on(RPC_ACTION, handleActionMessage));
 
     // 挂载即对齐会话并发一次：主进程不用等到下一次播放事件才知道当前状态。
     refreshAndSync();
