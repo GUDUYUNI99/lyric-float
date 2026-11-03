@@ -49,6 +49,15 @@ const RPC_ACTION = 'action';
 // 别的模组若也叫 'action-to-client' 就会收到本窗口的消息。
 const IPC_ACTION = 'my-lyric-widget:action-to-client';
 const IPC_DATA = 'my-lyric-widget:data-from-client';
+// 排查用的页面→主进程调试通道（真机定位完连监听一起删掉）。
+const IPC_DEBUG = 'my-lyric-widget:debug';
+
+// ---- 排查日志（真机 IPC 链路定位用，定位完删掉） ----
+// 模块级：main.cjs 被 require 就会打印，用来确认模组主进程入口真的被宿主加载了。
+console.log(`${LOG_PREFIX} main 模块已求值（main.cjs 被 require）`, {
+    electron: process.versions.electron,
+    node: process.versions.node,
+});
 
 const WINDOW_WIDTH = 600;
 const WINDOW_HEIGHT = 200;
@@ -242,6 +251,12 @@ const WIDGET_HTML = `<!DOCTYPE html>
 <script>
 const { ipcRenderer } = require('electron');
 
+// ---- 排查日志：页面里的打印只有它自己的 DevTools 看得见，这里统一转发到主进程日志面板（定位完连监听一起删）。
+const debugToMain = (message) => ipcRenderer.send('${IPC_DEBUG}', message);
+debugToMain('page boot');
+window.addEventListener('error', (event) =>
+    debugToMain('page error: ' + event.message + ' @' + event.lineno + ':' + event.colno));
+
 const els = {
     song: document.getElementById('song'),
     line: document.getElementById('line'),
@@ -263,12 +278,20 @@ let volumeDragging = false;
 let volumeTimer = null;
 let lastVolumeSent = null;
 
-const sendAction = (payload) => ipcRenderer.send('${IPC_ACTION}', payload);
+const sendAction = (payload) => {
+    debugToMain('sendAction: ' + JSON.stringify(payload));
+    ipcRenderer.send('${IPC_ACTION}', payload);
+};
 
 const render = (payload) => {
     if (!payload || typeof payload !== 'object') return;
 
     const line = payload.line || {};
+    debugToMain(
+        'render: state=' + payload.state +
+        ' line="' + (line.text || '') + '"' +
+        ' title="' + ((payload.song && payload.song.title) || '') + '"',
+    );
     // 空字符串是合法的行文本（只有翻译、没有原文的行），不要退回「等待播放...」。
     els.line.textContent = typeof line.text === 'string' ? line.text : WAITING_TEXT;
 
@@ -374,6 +397,14 @@ module.exports = function activate(api) {
         disposed: false,
     };
 
+    // ---- 排查日志（真机 IPC 链路定位用，定位完删掉） ----
+    api.log.info(LOG_PREFIX + ' main activate', JSON.stringify({
+        version: api.manifest && api.manifest.version,
+        folium: api.host && api.host.folium,
+        hasHandle: typeof (api.rpc && api.rpc.handle),
+        hasSend: typeof (api.rpc && api.rpc.send),
+    }));
+
     /** 把归一化后的指令发给 client.mjs；主进程 -> client 用 api.rpc.send（Folium 1.7+）。 */
     const sendActionToClient = (action) => {
         if (!action) return;
@@ -385,6 +416,7 @@ module.exports = function activate(api) {
             return;
         }
         try {
+            api.log.info(LOG_PREFIX + ' 转发 action 给 client', JSON.stringify(action));
             api.rpc.send(RPC_ACTION, action);
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 发送 action 给 client 失败', error);
@@ -465,11 +497,20 @@ module.exports = function activate(api) {
     /** 把最新快照交给窗口页面（窗口不在 / 已销毁时丢弃）。 */
     const sendPayloadToWindow = (payload) => {
         const widgetWindow = state.win;
-        if (!widgetWindow || widgetWindow.isDestroyed()) return;
+        if (!widgetWindow || widgetWindow.isDestroyed()) {
+            api.log.info(LOG_PREFIX + ' 转发中止：没有可用悬浮窗');
+            return;
+        }
         const contents = widgetWindow.webContents;
-        if (!contents || contents.isDestroyed()) return;
+        if (!contents || contents.isDestroyed()) {
+            api.log.info(LOG_PREFIX + ' 转发中止：webContents 不可用');
+            return;
+        }
         try {
             contents.send(IPC_DATA, payload);
+            api.log.info(LOG_PREFIX + ' 已 send IPC_DATA 给悬浮窗页面', JSON.stringify({
+                line: payload && payload.line && payload.line.text,
+            }));
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 向悬浮窗发送数据失败', error);
         }
@@ -561,6 +602,9 @@ module.exports = function activate(api) {
 
         // 用 on 而不是 once：页面崩溃后 reload 也会重新走到这里，重新补快照。
         widgetWindow.webContents.on('did-finish-load', () => {
+            api.log.info(LOG_PREFIX + ' 悬浮窗页面 did-finish-load', JSON.stringify({
+                hasLastPayload: !!state.lastPayload,
+            }));
             if (state.lastPayload) sendPayloadToWindow(state.lastPayload);
             sendActionToClient({ action: 'request-sync' });
         });
@@ -695,6 +739,14 @@ module.exports = function activate(api) {
 
     // 先把 RPC 处理函数登记好：client.mjs 随时可能开始发快照。
     api.rpc.handle(RPC_UPDATE, (payload) => {
+        // ---- 排查日志（真机 IPC 链路定位用，定位完删掉） ----
+        api.log.info(LOG_PREFIX + ' 收到 update-data', JSON.stringify({
+            state: payload && payload.state,
+            line: payload && payload.line && payload.line.text,
+            title: payload && payload.song && payload.song.title,
+            session: payload && payload.playSessionId,
+            hasWindow: !!state.win && !state.win.isDestroyed(),
+        }));
         if (!payload || typeof payload !== 'object') {
             api.log.warn(LOG_PREFIX + ' update-data 收到非对象载荷，已忽略', describeForLog(payload));
             return;
@@ -708,7 +760,20 @@ module.exports = function activate(api) {
         sendPayloadToWindow(payload);
     });
 
-    ipcMain.on(IPC_ACTION, onActionFromWindow);
+    // ---- 排查日志（真机 IPC 链路定位用，定位完连这两个监听一起删） ----
+    const onActionFromWindowDebug = (event, raw) => {
+        api.log.info(LOG_PREFIX + ' 收到悬浮窗指令', JSON.stringify({
+            raw,
+            fromWidget: !!state.win && event.sender === state.win.webContents,
+        }));
+        onActionFromWindow(event, raw);
+    };
+    const onDebugFromWindow = (event, message) => {
+        api.log.info(LOG_PREFIX + ' [page] ' + String(message));
+    };
+
+    ipcMain.on(IPC_ACTION, onActionFromWindowDebug);
+    ipcMain.on(IPC_DEBUG, onDebugFromWindow);
     app.on('browser-window-created', onBrowserWindowCreated);
 
     const dispose = () => {
@@ -720,7 +785,8 @@ module.exports = function activate(api) {
         }
         app.removeListener('browser-window-created', onBrowserWindowCreated);
         try {
-            ipcMain.removeListener(IPC_ACTION, onActionFromWindow);
+            ipcMain.removeListener(IPC_ACTION, onActionFromWindowDebug);
+            ipcMain.removeListener(IPC_DEBUG, onDebugFromWindow);
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 移除窗口指令监听失败', error);
         }
