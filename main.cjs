@@ -38,6 +38,8 @@
 'use strict';
 
 const { app, BrowserWindow, ipcMain, screen } = require('electron');
+const fs = require('fs');
+const path = require('path');
 
 const LOG_PREFIX = '[lyric-widget]';
 
@@ -51,6 +53,21 @@ const IPC_ACTION = 'my-lyric-widget:action-to-client';
 const IPC_DATA = 'my-lyric-widget:data-from-client';
 // 排查用的页面→主进程调试通道（真机定位完连监听一起删掉）。
 const IPC_DEBUG = 'my-lyric-widget:debug';
+// 主进程→页面的悬停状态（true/false）。整窗是拖拽区时渲染进程收不到鼠标事件，
+// 所以「鼠标是否停在窗口上」由主进程轮询光标位置后从这条通道推给页面。
+const IPC_HOVER = 'my-lyric-widget:hover';
+// 悬停检测的轮询间隔：40~120ms 都够用；80ms 既跟得上手速，又几乎不占 CPU。
+const HOVER_POLL_MS = 80;
+// 固定/解锁状态（页面→主进程：用户点了图钉；主进程→页面：启动时恢复上次的固定状态）。
+const IPC_PINNED = 'my-lyric-widget:pinned';
+// 排版模式（页面→主进程：用户切了排版；主进程→页面：启动时恢复上次的排版）。
+const IPC_LAYOUT = 'my-lyric-widget:layout';
+// 排版三态（主进程侧只用来校验从页面收到的值，别让坏值写进状态文件）。
+const LAYOUT_MODE_IDS = ['text', 'text-trans', 'full'];
+// 窗口状态（位置 + 是否固定）存在 userData 下的一个小 JSON 里，重启后恢复。
+// 只记这两个值：尺寸固定、不需要记。
+const STATE_FILE_NAME = 'my-lyric-widget-state.json';
+const SAVE_DEBOUNCE_MS = 500;
 
 // ---- 图标（内联 SVG） ----
 // 形状数据原样取自 lucide-react v1.48.0 的 dist/esm/icons/*.mjs，和 Folia 播放器自带的
@@ -86,8 +103,12 @@ const ICON_PATHS = {
     'volume-1': '<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/>',
     'volume-2': '<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/>',
     'volume-x': '<path d="M11 4.702a.7.7 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.7.7 0 0 0 11 19.298z"/><path d="m16.5 14.5 5-5"/><path d="m16.5 9.5 5 5"/>',
-    // 双语/单行排版切换按钮。
-    languages: '<path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/>',
+    // 双语/单行排版切换按钮。「文」和「A」拆成两组，方便中间态只点亮「文」。
+    'layout-zh': '<path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/>',
+    'layout-a': '<path d="m22 22-5-10-5 10"/><path d="M14 18h6"/>',
+    // 固定 / 解锁按钮：pin 表示「未固定，可点亮固定」，pin-off 表示「已固定，点亮解锁」。
+    pin: '<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>',
+    'pin-off': '<path d="M12 17v5"/><path d="M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89"/><path d="m2 2 20 20"/><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h11"/>',
 };
 
 /** 包一层 <svg>：只有 filled 的图标用 currentColor 填实（和播放器的 Pause/Play 一致）。 */
@@ -99,6 +120,13 @@ const svgIcon = (name, options) => {
         + ICON_PATHS[name]
         + '</svg>';
 };
+
+/** 排版按钮专用：两组子图形各自带 class，中间态只点亮「文」，第三态再点亮「A」。 */
+const layoutIcon = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"'
+    + ' fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    + '<g class="icon-zh">' + ICON_PATHS['layout-zh'] + '</g>'
+    + '<g class="icon-a">' + ICON_PATHS['layout-a'] + '</g>'
+    + '</svg>';
 
 /** 页面里会直接用到的图标整段字符串（序列化进内联脚本，避免页面再拼一遍）。 */
 const ICON_SVG = {
@@ -112,7 +140,9 @@ const ICON_SVG = {
     'volume-1': svgIcon('volume-1'),
     'volume-2': svgIcon('volume-2'),
     'volume-x': svgIcon('volume-x'),
-    layout: svgIcon('languages'),
+    layout: layoutIcon,
+    pin: svgIcon('pin'),
+    'pin-off': svgIcon('pin-off'),
 };
 
 // ---- 排查日志（真机 IPC 链路定位用，定位完删掉） ----
@@ -193,16 +223,34 @@ const WIDGET_HTML = `<!DOCTYPE html>
         user-select: none;
         cursor: default;
     }
+    /*
+     * 窗口默认完全透明：只留歌词文字。鼠标悬停（body.hover）才淡入半透明黑底和底部控制条。
+     * 固定（body.pinned）状态下悬停只给极弱高亮，控制条不出现，只露右上角的解锁按钮。
+     */
     .widget {
         box-sizing: border-box;
+        position: relative;
         display: flex;
         flex-direction: column;
         height: 100%;
         padding: 12px 16px 10px;
-        background: rgba(0, 0, 0, 0.6);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: transparent;
+        border: 1px solid transparent;
         border-radius: 16px;
         overflow: hidden;
+        transition: background-color 0.22s ease, border-color 0.22s ease;
+    }
+    body.hover:not(.pinned) .widget {
+        background: rgba(0, 0, 0, 0.58);
+        border-color: rgba(255, 255, 255, 0.08);
+    }
+    body.hover.pinned .widget {
+        background: rgba(0, 0, 0, 0.14);
+        border-color: rgba(255, 255, 255, 0.05);
+    }
+    /* 固定模式下整窗不可拖动；未固定时 body 是 drag 区，按钮/滑块/解锁按钮单独 no-drag。 */
+    body.pinned {
+        -webkit-app-region: no-drag;
     }
     .song {
         flex: none;
@@ -213,6 +261,12 @@ const WIDGET_HTML = `<!DOCTYPE html>
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+        /* 歌曲行属于「悬停才出现」的界面元素，和底栏一起淡入淡出。 */
+        opacity: 0;
+        transition: opacity 0.18s ease;
+    }
+    body.hover:not(.pinned) .song {
+        opacity: 1;
     }
     .lyric {
         flex: 1;
@@ -233,7 +287,8 @@ const WIDGET_HTML = `<!DOCTYPE html>
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        text-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
+        /* 窗口背景可能是任意壁纸（甚至纯白），所以歌词要自带一圈暗描边保证可读。 */
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 2px 12px rgba(0, 0, 0, 0.6);
     }
     /* 双语排版（原文 + 译文）里的大号译文：原文的 0.7 倍。38 * 0.7 = 26.6，向上取整 27px。 */
     .lyric-trans {
@@ -245,7 +300,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        text-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 2px 10px rgba(0, 0, 0, 0.55);
     }
     .lyric-trans:empty,
     .lyric-trans[hidden] {
@@ -261,6 +316,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8), 0 2px 8px rgba(0, 0, 0, 0.45);
     }
     .lyric-sub:empty {
         display: none;
@@ -273,6 +329,16 @@ const WIDGET_HTML = `<!DOCTYPE html>
         gap: 8px;
         padding-top: 8px;
         border-top: 1px solid rgba(255, 255, 255, 0.08);
+        /* 默认藏起来（但仍然占位，避免歌词在淡入淡出时上下跳）。 */
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(6px);
+        transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+    body.hover:not(.pinned) .controls {
+        opacity: 1;
+        pointer-events: auto;
+        transform: none;
     }
     button {
         -webkit-app-region: no-drag;
@@ -329,14 +395,48 @@ const WIDGET_HTML = `<!DOCTYPE html>
         opacity: 1;
     }
     /*
-     * 排版按钮三态，用高亮程度表示当前看得到几行：
-     * text（不高亮，只有原文）→ text-trans（半亮，原文 + 译文）→ full（全亮，原文 + 译文 + 罗马音）。
+     * 排版按钮三态：点亮图标里对应的那一半，而不是整个按钮换色。
+     *   text        ：都不亮 —— 只有原文
+     *   text-trans  ：只亮「文」（译文），「A」保持默认色
+     *   full        ：亮「文」+「A」（译文 + 罗马音）
+     * 亮起来的颜色和循环/固定按钮一致，都是 #7dd3fc。
      */
-    #layout[data-mode="text-trans"] {
-        color: rgba(125, 211, 252, 0.55);
+    #layout .icon-zh,
+    #layout .icon-a {
+        transition: color 0.18s ease;
     }
-    #layout[data-mode="full"] {
+    #layout[data-mode="text-trans"] .icon-zh {
         color: #7dd3fc;
+    }
+    #layout[data-mode="full"] .icon-zh,
+    #layout[data-mode="full"] .icon-a {
+        color: #7dd3fc;
+    }
+    /* 固定按钮点亮时用和循环/排版一致的蓝色。 */
+    #pin[data-mode="pinned"] {
+        color: #7dd3fc;
+    }
+    /*
+     * 解锁按钮：固定模式下出现在窗口右上角。固定后底栏整体藏起来，
+     * 所以这是唯一能把窗口解锁回「可拖拽 + 完整控制栏」的入口。
+     */
+    .unlock {
+        position: absolute;
+        top: 10px;
+        right: 12px;
+        -webkit-app-region: no-drag;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.18s ease;
+    }
+    body.pinned.hover .unlock {
+        opacity: 1;
+        pointer-events: auto;
+    }
+    /* 解锁按钮在窗口最上沿，提示气泡改为向下弹，否则会被窗口上边缘裁掉。 */
+    .unlock::after {
+        top: calc(100% + 8px);
+        bottom: auto;
     }
     /* 图标尺寸跟播放器控件一致：20px（播放器小屏是 18px，这里窗口固定，取 20px）。 */
     .icon {
@@ -397,7 +497,9 @@ const WIDGET_HTML = `<!DOCTYPE html>
         <span class="volume-icon" id="volume-icon" aria-hidden="true">${ICON_SVG['volume-2']}</span>
         <input id="volume" class="volume" type="range" min="0" max="100" step="1" value="100" title="音量" aria-label="音量">
         <span class="volume-value" id="volume-value">100%</span>
+        <button id="pin" type="button" data-tip="固定位置" aria-label="固定位置" data-mode="floating">${ICON_SVG.pin}</button>
     </div>
+    <button id="unlock" class="unlock" type="button" data-tip="解锁（恢复拖拽）" aria-label="解锁">${ICON_SVG['pin-off']}</button>
 </div>
 <script>
 const { ipcRenderer } = require('electron');
@@ -419,6 +521,8 @@ const els = {
     next: document.getElementById('next'),
     loop: document.getElementById('loop'),
     layout: document.getElementById('layout'),
+    pin: document.getElementById('pin'),
+    unlock: document.getElementById('unlock'),
     volume: document.getElementById('volume'),
     volumeIcon: document.getElementById('volume-icon'),
     volumeValue: document.getElementById('volume-value'),
@@ -561,8 +665,68 @@ els.layout.addEventListener('click', () => {
     layoutMode = LAYOUT_MODES[(LAYOUT_MODES.indexOf(layoutMode) + 1) % LAYOUT_MODES.length];
     applyLayoutButton();
     if (lastPayload) render(lastPayload);
+    // 记住这次选择，重启后恢复。
+    ipcRenderer.send('${IPC_LAYOUT}', layoutMode);
+});
+// 主进程在页面加载完后推来上次的排版选择（值不合法就保持默认的 text）。
+ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
+    if (!LAYOUT_MODES.includes(value)) return;
+    layoutMode = value;
+    applyLayoutButton();
+    if (lastPayload) render(lastPayload);
 });
 applyLayoutButton();
+
+// ---- 悬停显示 / 固定位置 ----
+// 未固定：整窗可拖拽（body 是 drag 区），鼠标离开后只剩透明歌词，悬停时浮出半透明底 + 完整控制栏。
+// 已固定：整窗 no-drag，悬停也不再出控制栏，只在右上角给一个解锁按钮。
+// 固定状态由主进程记在 userData 的小 JSON 里，启动时通过 IPC_PINNED 推回来。
+let isPinned = false;
+const applyPinState = () => {
+    document.body.classList.toggle('pinned', isPinned);
+    if (els.pin) {
+        els.pin.dataset.mode = isPinned ? 'pinned' : 'floating';
+        setIcon(els.pin, isPinned ? 'pin-off' : 'pin');
+        setButtonLabel(els.pin, isPinned ? '取消固定' : '固定位置');
+    }
+};
+const reportPinState = () => {
+    ipcRenderer.send('${IPC_PINNED}', isPinned);
+};
+ipcRenderer.on('${IPC_PINNED}', (event, value) => {
+    isPinned = value === true;
+    applyPinState();
+});
+if (els.pin) {
+    els.pin.addEventListener('click', () => {
+        isPinned = true;
+        applyPinState();
+        reportPinState();
+    });
+}
+if (els.unlock) {
+    els.unlock.addEventListener('click', () => {
+        isPinned = false;
+        applyPinState();
+        reportPinState();
+    });
+}
+applyPinState();
+
+// 悬停状态挂在 body 上（body.hover），纯 CSS 负责过渡，JS 只切换类。
+// 主进程每 80ms 用光标位置算一次「在不在窗口上」，从这里推过来（拖拽区收不到鼠标事件）；
+// 页面自己的 mouseenter/mouseleave 只在窗口不是拖拽区时才有效，保留作为即时补充。
+let hovered = false;
+const setHovered = (next) => {
+    if (hovered === next) return;
+    hovered = next;
+    document.body.classList.toggle('hover', next);
+};
+ipcRenderer.on('${IPC_HOVER}', (event, value) => setHovered(value === true));
+window.addEventListener('mouseenter', () => setHovered(true));
+window.addEventListener('mouseleave', () => setHovered(false));
+// 窗口失焦（比如点了别的程序）时也当成鼠标离开，免得控制栏一直挂在那儿。
+window.addEventListener('blur', () => setHovered(false));
 
 els.volume.addEventListener('pointerdown', () => {
     volumeDragging = true;
@@ -614,7 +778,79 @@ module.exports = function activate(api) {
         recreateAttempts: 0,
         warnedRecreateLimit: false,
         disposed: false,
+        // 窗口状态持久化：{ x, y, pinned }，读自 userData 下的 STATE_FILE_NAME。
+        persisted: null,
+        persistTimer: null,
     };
+
+    // ---- 窗口状态持久化（位置 + 是否固定） ----
+    // 以前每次启动都把窗口摆回「主屏底部居中」，用户拖到的位置一重启就丢；
+    // 这里在 userData 下记一个小 JSON，启动时恢复。
+    const stateFilePath = () => path.join(app.getPath('userData'), STATE_FILE_NAME);
+
+    const readPersistedState = () => {
+        try {
+            const parsed = JSON.parse(fs.readFileSync(stateFilePath(), 'utf8'));
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+        } catch (error) {
+            // 第一次运行没有这个文件是正常情况，不打扰用户。
+            if (!error || error.code !== 'ENOENT') {
+                api.log.warn(LOG_PREFIX + ' 读取窗口状态失败，本次用默认位置', error);
+            }
+            return {};
+        }
+    };
+
+    const savePersistedState = () => {
+        if (!state.persisted) return;
+        try {
+            fs.mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+            fs.writeFileSync(stateFilePath(), JSON.stringify(state.persisted));
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 保存窗口状态失败（不影响歌词显示）', error);
+        }
+    };
+
+    /** 拖动时 'move' 触发得很密，合并成一次写盘。 */
+    const scheduleSave = () => {
+        if (state.persistTimer) return;
+        state.persistTimer = setTimeout(() => {
+            state.persistTimer = null;
+            savePersistedState();
+        }, SAVE_DEBOUNCE_MS);
+    };
+
+    /** 把窗口当前坐标记进内存（真正落盘由 scheduleSave / 退出时统一做）。 */
+    const rememberWindowPosition = (widgetWindow) => {
+        if (!state.persisted || !widgetWindow || widgetWindow.isDestroyed()) return;
+        try {
+            const bounds = widgetWindow.getBounds();
+            state.persisted.x = bounds.x;
+            state.persisted.y = bounds.y;
+        } catch (error) {
+            // 读不到就算了，下次启动回默认位置。
+        }
+    };
+
+    /** 保存的位置还算不算「看得见」：至少要有一部分落在某个显示器的工作区里。 */
+    const isPositionUsable = (position) => {
+        try {
+            return screen.getAllDisplays().some(({ workArea }) => (
+                position.x + WINDOW_WIDTH > workArea.x + 40
+                && position.x < workArea.x + workArea.width - 40
+                && position.y + WINDOW_HEIGHT > workArea.y + 20
+                && position.y < workArea.y + workArea.height - 20
+            ));
+        } catch (error) {
+            return false;
+        }
+    };
+
+    state.persisted = readPersistedState();
+    api.log.info(LOG_PREFIX + ' 窗口状态', JSON.stringify({
+        file: stateFilePath(),
+        saved: state.persisted,
+    }));
 
     // ---- 排查日志（真机 IPC 链路定位用，定位完删掉） ----
     api.log.info(LOG_PREFIX + ' main activate', JSON.stringify({
@@ -752,7 +988,20 @@ module.exports = function activate(api) {
     };
 
     /** 默认位置：主显示器工作区底部中间。 */
+    /** 窗口位置：优先恢复上次拖到的位置；没有记录 / 记录已跑出屏幕时回默认位置。 */
     const placeWindow = (widgetWindow) => {
+        const saved = state.persisted;
+        if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+            const position = { x: Math.round(saved.x), y: Math.round(saved.y) };
+            if (isPositionUsable(position)) {
+                try {
+                    widgetWindow.setPosition(position.x, position.y);
+                    return;
+                } catch (error) {
+                    api.log.warn(LOG_PREFIX + ' 恢复上次窗口位置失败，改用默认位置', error);
+                }
+            }
+        }
         try {
             const { workArea } = screen.getPrimaryDisplay();
             const x = Math.round(workArea.x + (workArea.width - WINDOW_WIDTH) / 2);
@@ -761,6 +1010,50 @@ module.exports = function activate(api) {
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 读取屏幕尺寸失败，窗口使用默认位置', error);
         }
+    };
+
+    /**
+     * 悬停检测：页面整窗是 -webkit-app-region: drag 区域，Windows 下拖拽区不会把鼠标事件
+     * 交给渲染进程（所以页面里的 :hover / mouseenter 在这块区域收不到）。这里由主进程
+     * 轮询「光标是否落在窗口矩形内」，变化时通过 IPC_HOVER 推给页面。
+     * 返回停止函数，窗口关闭时自动调用。
+     */
+    const startHoverWatch = (widgetWindow) => {
+        let lastHover = null;
+        let timer = null;
+        const stop = () => {
+            if (timer) {
+                clearInterval(timer);
+                timer = null;
+            }
+        };
+        const tick = () => {
+            if (state.disposed || widgetWindow.isDestroyed()) {
+                stop();
+                return;
+            }
+            let hover = false;
+            try {
+                const point = screen.getCursorScreenPoint();
+                const bounds = widgetWindow.getBounds();
+                hover = widgetWindow.isVisible()
+                    && point.x >= bounds.x && point.x < bounds.x + bounds.width
+                    && point.y >= bounds.y && point.y < bounds.y + bounds.height;
+            } catch (error) {
+                stop();
+                return;
+            }
+            if (hover === lastHover) return;
+            lastHover = hover;
+            try {
+                widgetWindow.webContents.send(IPC_HOVER, hover);
+            } catch (error) {
+                // 页面还在加载 / webContents 已销毁时 send 会抛，忽略后下一次轮询会重试。
+            }
+        };
+        timer = setInterval(tick, HOVER_POLL_MS);
+        widgetWindow.on('closed', stop);
+        return stop;
     };
 
     /** 创建悬浮窗；页面用 data URL 加载，不依赖任何外部文件。 */
@@ -802,6 +1095,13 @@ module.exports = function activate(api) {
 
         widgetWindow.setMenuBarVisibility(false);
         placeWindow(widgetWindow);
+        // 悬停状态由主进程轮询光标后推给页面（拖拽区里渲染进程收不到鼠标事件）。
+        startHoverWatch(widgetWindow);
+        // 拖动时记下位置：'move' 会连续触发，用 scheduleSave 合并成一次写盘。
+        widgetWindow.on('move', () => {
+            rememberWindowPosition(widgetWindow);
+            scheduleSave();
+        });
 
         // 页面只该是这一份 data URL：禁止页面自己导航、禁止开新窗口。
         widgetWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -826,6 +1126,12 @@ module.exports = function activate(api) {
             }));
             if (state.lastPayload) sendPayloadToWindow(state.lastPayload);
             sendActionToClient({ action: 'request-sync' });
+            // 恢复上次的固定状态。放在页面加载完之后推，页面收到才切 body.pinned（改拖拽区）。
+            widgetWindow.webContents.send(IPC_PINNED, !!(state.persisted && state.persisted.pinned));
+            // 恢复上次的排版选择（不存在或不合法时页面保持默认的 text）。
+            if (state.persisted && LAYOUT_MODE_IDS.includes(state.persisted.layout)) {
+                widgetWindow.webContents.send(IPC_LAYOUT, state.persisted.layout);
+            }
         });
 
         widgetWindow.webContents.on('render-process-gone', (event, details) => {
@@ -848,6 +1154,12 @@ module.exports = function activate(api) {
 
         widgetWindow.on('closed', () => {
             if (state.win === widgetWindow) state.win = null;
+            // 关窗时把还没落盘的位置/固定状态立刻写上，避免丢最后一次拖动。
+            if (state.persistTimer) {
+                clearTimeout(state.persistTimer);
+                state.persistTimer = null;
+            }
+            savePersistedState();
             if (!state.disposed) {
                 api.log.warn(LOG_PREFIX + ' 悬浮窗被关闭；收到下一份数据或宿主出现新窗口时会重新创建');
             }
@@ -990,9 +1302,26 @@ module.exports = function activate(api) {
     const onDebugFromWindow = (event, message) => {
         api.log.info(LOG_PREFIX + ' [page] ' + String(message));
     };
+    // 页面点图钉 / 解锁时把状态记下来，下次启动恢复（只认悬浮窗自己发来的消息）。
+    const onPinnedFromWindow = (event, value) => {
+        if (!state.persisted) return;
+        if (!state.win || event.sender !== state.win.webContents) return;
+        state.persisted.pinned = value === true;
+        savePersistedState();
+    };
+    // 页面切换排版时记下模式，下次启动恢复。
+    const onLayoutFromWindow = (event, value) => {
+        if (!state.persisted) return;
+        if (!state.win || event.sender !== state.win.webContents) return;
+        if (!LAYOUT_MODE_IDS.includes(value)) return;
+        state.persisted.layout = value;
+        savePersistedState();
+    };
 
     ipcMain.on(IPC_ACTION, onActionFromWindowDebug);
     ipcMain.on(IPC_DEBUG, onDebugFromWindow);
+    ipcMain.on(IPC_PINNED, onPinnedFromWindow);
+    ipcMain.on(IPC_LAYOUT, onLayoutFromWindow);
     app.on('browser-window-created', onBrowserWindowCreated);
 
     const dispose = () => {
@@ -1002,10 +1331,19 @@ module.exports = function activate(api) {
             clearTimeout(state.hostCloseTimer);
             state.hostCloseTimer = null;
         }
+        if (state.persistTimer) {
+            clearTimeout(state.persistTimer);
+            state.persistTimer = null;
+        }
+        // 停用模组时窗口可能还活着：把当前位置落盘再关。
+        if (state.win && !state.win.isDestroyed()) rememberWindowPosition(state.win);
+        savePersistedState();
         app.removeListener('browser-window-created', onBrowserWindowCreated);
         try {
             ipcMain.removeListener(IPC_ACTION, onActionFromWindowDebug);
             ipcMain.removeListener(IPC_DEBUG, onDebugFromWindow);
+            ipcMain.removeListener(IPC_PINNED, onPinnedFromWindow);
+            ipcMain.removeListener(IPC_LAYOUT, onLayoutFromWindow);
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 移除窗口指令监听失败', error);
         }
