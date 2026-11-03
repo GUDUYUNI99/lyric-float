@@ -52,6 +52,69 @@ const IPC_DATA = 'my-lyric-widget:data-from-client';
 // 排查用的页面→主进程调试通道（真机定位完连监听一起删掉）。
 const IPC_DEBUG = 'my-lyric-widget:debug';
 
+// ---- 图标（内联 SVG） ----
+// 形状数据原样取自 lucide-react v1.48.0 的 dist/esm/icons/*.mjs，和 Folia 播放器自带的
+// 控件用的是同一套图形（播放器主控条见 src/components/FloatingPlayerControls.tsx，
+// 其余按钮见 src/components/floating-player/playerControlSlotActions.ts）：
+//   - 24×24 viewBox、描边 stroke-width 2、颜色跟随 currentColor；
+//   - 只有播放/暂停（以及播放器里「已喜爱」的心形）用实心，其余都是线性。
+// 窗口页面是 data URL + CSP `default-src 'none'`，不能 require lucide-react、也不能加载
+// 任何外部资源，所以这里把 path 数据直接内联进页面。
+//
+// lucide — ISC License
+// Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT).
+// All other copyright (c) for Lucide are held by Lucide Contributors 2022.
+//
+// Permission to use, copy, modify, and/or distribute this software for any purpose with or
+// without fee is hereby granted, provided that the above copyright notice and this permission
+// notice appear in all copies.
+//
+// THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+// SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL
+// THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY
+// DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF
+// CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE
+// OR PERFORMANCE OF THIS SOFTWARE.
+const ICON_PATHS = {
+    'skip-back': '<path d="M17.971 4.285A2 2 0 0 1 21 6v12a2 2 0 0 1-3.029 1.715l-9.997-5.998a2 2 0 0 1-.003-3.432z"/><path d="M3 20V4"/>',
+    'skip-forward': '<path d="M21 4v16"/><path d="M6.029 4.285A2 2 0 0 0 3 6v12a2 2 0 0 0 3.029 1.715l9.997-5.998a2 2 0 0 0 .003-3.432z"/>',
+    play: '<path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"/>',
+    pause: '<rect x="14" y="3" width="5" height="18" rx="1"/><rect x="5" y="3" width="5" height="18" rx="1"/>',
+    repeat: '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
+    'repeat-1': '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><path d="M11 10h1v4"/>',
+    'repeat-off': '<path d="M11.656 6H21l-4-4"/><path d="M17.898 17.898A4 4 0 0 1 17 18H3l4-4"/><path d="m2 2 20 20"/><path d="M21 13v1a4 4 0 0 1-.171 1.159"/><path d="m21 6-4 4"/><path d="M3 11v-1a4 4 0 0 1 3.102-3.898"/><path d="m7 22-4-4"/>',
+    'volume-1': '<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/>',
+    'volume-2': '<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/>',
+    'volume-x': '<path d="M11 4.702a.7.7 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.7.7 0 0 0 11 19.298z"/><path d="m16.5 14.5 5-5"/><path d="m16.5 9.5 5 5"/>',
+    // 双语/单行排版切换按钮。
+    languages: '<path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/>',
+};
+
+/** 包一层 <svg>：只有 filled 的图标用 currentColor 填实（和播放器的 Pause/Play 一致）。 */
+const svgIcon = (name, options) => {
+    const filled = options && options.filled;
+    return '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"'
+        + ' fill="' + (filled ? 'currentColor' : 'none') + '"'
+        + ' stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+        + ICON_PATHS[name]
+        + '</svg>';
+};
+
+/** 页面里会直接用到的图标整段字符串（序列化进内联脚本，避免页面再拼一遍）。 */
+const ICON_SVG = {
+    prev: svgIcon('skip-back'),
+    next: svgIcon('skip-forward'),
+    play: svgIcon('play', { filled: true }),
+    pause: svgIcon('pause', { filled: true }),
+    'loop-off': svgIcon('repeat-off'),
+    'loop-all': svgIcon('repeat'),
+    'loop-one': svgIcon('repeat-1'),
+    'volume-1': svgIcon('volume-1'),
+    'volume-2': svgIcon('volume-2'),
+    'volume-x': svgIcon('volume-x'),
+    layout: svgIcon('languages'),
+};
+
 // ---- 排查日志（真机 IPC 链路定位用，定位完删掉） ----
 // 模块级：main.cjs 被 require 就会打印，用来确认模组主进程入口真的被宿主加载了。
 console.log(`${LOG_PREFIX} main 模块已求值（main.cjs 被 require）`, {
@@ -59,8 +122,9 @@ console.log(`${LOG_PREFIX} main 模块已求值（main.cjs 被 require）`, {
     node: process.versions.node,
 });
 
-const WINDOW_WIDTH = 600;
-const WINDOW_HEIGHT = 200;
+// 三种排版（原文 / 原文+译文 / 原文+译文+罗马音）叠起来比原来的两行高，窗口相应加高加宽。
+const WINDOW_WIDTH = 640;
+const WINDOW_HEIGHT = 236;
 // 默认停在工作区底部中间，离底边和左右边这么多像素。
 const WINDOW_MARGIN = 48;
 
@@ -162,7 +226,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
     }
     .lyric-text {
         max-width: 100%;
-        font-size: 26px;
+        font-size: 38px;
         font-weight: 600;
         line-height: 1.25;
         text-align: center;
@@ -171,11 +235,28 @@ const WIDGET_HTML = `<!DOCTYPE html>
         text-overflow: ellipsis;
         text-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
     }
+    /* 双语排版（原文 + 译文）里的大号译文：原文的 0.7 倍。38 * 0.7 = 26.6，向上取整 27px。 */
+    .lyric-trans {
+        max-width: 100%;
+        font-size: 27px;
+        font-weight: 500;
+        line-height: 1.3;
+        text-align: center;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+    }
+    .lyric-trans:empty,
+    .lyric-trans[hidden] {
+        display: none;
+    }
+    /* 罗马音行：只在「原文 + 译文 + 罗马音」排版出现，字号与译文一致。 */
     .lyric-sub {
         max-width: 100%;
-        font-size: 14px;
+        font-size: 27px;
         line-height: 1.3;
-        color: rgba(255, 255, 255, 0.72);
+        color: rgba(255, 255, 255, 0.64);
         text-align: center;
         white-space: nowrap;
         overflow: hidden;
@@ -195,24 +276,91 @@ const WIDGET_HTML = `<!DOCTYPE html>
     }
     button {
         -webkit-app-region: no-drag;
+        position: relative;
         flex: none;
-        padding: 5px 10px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        padding: 0;
         font: inherit;
-        font-size: 12px;
         color: rgba(255, 255, 255, 0.88);
-        background: rgba(255, 255, 255, 0.1);
+        background: transparent;
         border: 0;
         border-radius: 8px;
         cursor: pointer;
     }
     button:hover {
-        background: rgba(255, 255, 255, 0.18);
+        background: rgba(255, 255, 255, 0.14);
     }
     button:active {
-        background: rgba(255, 255, 255, 0.26);
+        background: rgba(255, 255, 255, 0.24);
     }
-    #loop {
-        min-width: 68px;
+    button:focus-visible {
+        outline: 2px solid #7dd3fc;
+        outline-offset: 1px;
+    }
+    /*
+     * 悬停提示：原生 title 的气泡固定在指针右下方、位置由系统决定，改不了；
+     * 所以去掉 title，用 data-tip + 伪元素自绘一个，固定出现在图标的右上方。
+     */
+    button::after {
+        content: attr(data-tip);
+        position: absolute;
+        left: 50%;
+        bottom: calc(100% + 8px);
+        padding: 3px 8px;
+        font-size: 11px;
+        font-weight: 400;
+        line-height: 1.3;
+        color: #fff;
+        white-space: nowrap;
+        background: rgba(18, 20, 26, 0.95);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 6px;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.12s ease;
+    }
+    button:hover::after,
+    button:focus-visible::after {
+        opacity: 1;
+    }
+    /*
+     * 排版按钮三态，用高亮程度表示当前看得到几行：
+     * text（不高亮，只有原文）→ text-trans（半亮，原文 + 译文）→ full（全亮，原文 + 译文 + 罗马音）。
+     */
+    #layout[data-mode="text-trans"] {
+        color: rgba(125, 211, 252, 0.55);
+    }
+    #layout[data-mode="full"] {
+        color: #7dd3fc;
+    }
+    /* 图标尺寸跟播放器控件一致：20px（播放器小屏是 18px，这里窗口固定，取 20px）。 */
+    .icon {
+        display: block;
+        width: 20px;
+        height: 20px;
+    }
+    /* 循环模式开了（列表/单曲）时图标点亮，和播放器里循环按钮的选中感一致。 */
+    #loop[data-mode="all"],
+    #loop[data-mode="one"] {
+        color: #7dd3fc;
+    }
+    .volume-icon {
+        flex: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 20px;
+        height: 20px;
+        color: rgba(255, 255, 255, 0.7);
+    }
+    .volume-icon .icon {
+        width: 18px;
+        height: 18px;
     }
     .volume {
         -webkit-app-region: no-drag;
@@ -235,15 +383,18 @@ const WIDGET_HTML = `<!DOCTYPE html>
 <body>
 <div class="widget">
     <div class="song" id="song">${WAITING_TEXT}</div>
-    <div class="lyric">
+    <div class="lyric" id="lyric" data-layout="text">
         <div class="lyric-text" id="line" aria-live="polite">${WAITING_TEXT}</div>
+        <div class="lyric-trans" id="trans" hidden></div>
         <div class="lyric-sub" id="sub"></div>
     </div>
     <div class="controls">
-        <button id="prev" title="上一首">上一首</button>
-        <button id="toggle" title="播放 / 暂停">播放</button>
-        <button id="next" title="下一首">下一首</button>
-        <button id="loop" title="切换循环模式">不循环</button>
+        <button id="prev" type="button" data-tip="上一首" aria-label="上一首">${ICON_SVG.prev}</button>
+        <button id="toggle" type="button" data-tip="播放" aria-label="播放">${ICON_SVG.play}</button>
+        <button id="next" type="button" data-tip="下一首" aria-label="下一首">${ICON_SVG.next}</button>
+        <button id="loop" type="button" data-tip="循环模式：不循环" aria-label="循环模式：不循环" data-mode="off">${ICON_SVG['loop-off']}</button>
+        <button id="layout" type="button" data-tip="排版：只显示原文" aria-label="排版" data-mode="text">${ICON_SVG.layout}</button>
+        <span class="volume-icon" id="volume-icon" aria-hidden="true">${ICON_SVG['volume-2']}</span>
         <input id="volume" class="volume" type="range" min="0" max="100" step="1" value="100" title="音量" aria-label="音量">
         <span class="volume-value" id="volume-value">100%</span>
     </div>
@@ -259,19 +410,45 @@ window.addEventListener('error', (event) =>
 
 const els = {
     song: document.getElementById('song'),
+    lyric: document.getElementById('lyric'),
     line: document.getElementById('line'),
+    trans: document.getElementById('trans'),
     sub: document.getElementById('sub'),
     prev: document.getElementById('prev'),
     toggle: document.getElementById('toggle'),
     next: document.getElementById('next'),
     loop: document.getElementById('loop'),
+    layout: document.getElementById('layout'),
     volume: document.getElementById('volume'),
+    volumeIcon: document.getElementById('volume-icon'),
     volumeValue: document.getElementById('volume-value'),
 };
 
-const LOOP_LABELS = { off: '不循环', all: '列表循环', one: '单曲循环' };
-const PLAY_LABELS = { playing: '暂停', paused: '播放', stopped: '播放' };
+// 图标整段字符串由主进程生成后塞进来（形状见 main.cjs 的 ICON_PATHS）。
+const ICONS = ${JSON.stringify(ICON_SVG)};
+// 只在图标真的换了才写 innerHTML，避免每帧重排。
+const setIcon = (el, name) => {
+    if (!el || !ICONS[name] || el.dataset.icon === name) return;
+    el.dataset.icon = name;
+    el.innerHTML = ICONS[name];
+};
+
+// 中文提示写到 data-tip（自绘气泡，固定在图标的右上方）+ aria-label（读屏可念）。
+// 不再写 title：原生气泡的位置由系统决定，改不动，会和自绘气泡重叠。
+const setButtonLabel = (el, label) => {
+    if (!el || el.dataset.tip === label) return;
+    el.dataset.tip = label;
+    el.setAttribute('aria-label', label);
+};
+
+const LOOP_TITLES = { off: '不循环', all: '列表循环', one: '单曲循环' };
 const WAITING_TEXT = '${WAITING_TEXT}';
+
+/** 音量图标按档位切换，规则同播放器的音量按钮：静音/0 → 叉，<50% → 一格，其余 → 两格。 */
+const volumeIconName = (percent) => {
+    if (!(percent > 0)) return 'volume-x';
+    return percent < 50 ? 'volume-1' : 'volume-2';
+};
 
 // 拖动音量条时，不要被主进程回传的音量覆盖；松手后再对齐。
 let volumeDragging = false;
@@ -283,8 +460,28 @@ const sendAction = (payload) => {
     ipcRenderer.send('${IPC_ACTION}', payload);
 };
 
+// 排版三态：text 只有原文 / text-trans 原文 + 译文 / full 原文 + 译文 + 罗马音。
+const LAYOUT_MODES = ['text', 'text-trans', 'full'];
+const LAYOUT_TIPS = {
+    text: '排版：只显示原文',
+    'text-trans': '排版：原文 + 译文',
+    full: '排版：原文 + 译文 + 罗马音',
+};
+let layoutMode = 'text';
+let lastPayload = null;
+
+/** 排版按钮的三态高亮、提示，以及 lyric 容器上的 data-layout，都跟着当前模式走。 */
+const applyLayoutButton = () => {
+    if (els.lyric) els.lyric.dataset.layout = layoutMode;
+    if (els.layout) {
+        els.layout.dataset.mode = layoutMode;
+        setButtonLabel(els.layout, LAYOUT_TIPS[layoutMode]);
+    }
+};
+
 const render = (payload) => {
     if (!payload || typeof payload !== 'object') return;
+    lastPayload = payload;
 
     const line = payload.line || {};
     debugToMain(
@@ -295,10 +492,14 @@ const render = (payload) => {
     // 空字符串是合法的行文本（只有翻译、没有原文的行），不要退回「等待播放...」。
     els.line.textContent = typeof line.text === 'string' ? line.text : WAITING_TEXT;
 
-    const sub = [line.translation, line.romanization]
-        .filter((part) => typeof part === 'string' && part !== '')
-        .join(' · ');
-    els.sub.textContent = sub;
+    // 三种排版：只原文 / 原文 + 译文 / 原文 + 译文 + 罗马音。
+    const translation = typeof line.translation === 'string' ? line.translation : '';
+    const romanization = typeof line.romanization === 'string' ? line.romanization : '';
+    const showTrans = layoutMode === 'text-trans' || layoutMode === 'full';
+    const showRoman = layoutMode === 'full';
+    els.trans.textContent = showTrans ? translation : '';
+    els.trans.hidden = !(showTrans && translation !== '');
+    els.sub.textContent = showRoman ? romanization : '';
 
     if (payload.song) {
         const title = typeof payload.song.title === 'string' ? payload.song.title : '';
@@ -309,8 +510,14 @@ const render = (payload) => {
         els.song.textContent = WAITING_TEXT;
     }
 
-    els.toggle.textContent = PLAY_LABELS[payload.state] || '播放';
-    els.loop.textContent = LOOP_LABELS[payload.loopMode] || LOOP_LABELS.off;
+    const playing = payload.state === 'playing';
+    setIcon(els.toggle, playing ? 'pause' : 'play');
+    setButtonLabel(els.toggle, playing ? '暂停' : '播放');
+
+    const loopMode = LOOP_TITLES[payload.loopMode] ? payload.loopMode : 'off';
+    setIcon(els.loop, 'loop-' + loopMode);
+    els.loop.setAttribute('data-mode', loopMode);
+    setButtonLabel(els.loop, '循环模式：' + LOOP_TITLES[loopMode]);
 
     if (!volumeDragging) {
         const volume = Number.isFinite(payload.volume) ? payload.volume : 1;
@@ -318,6 +525,10 @@ const render = (payload) => {
         els.volume.value = String(percent);
         els.volumeValue.textContent = percent + '%';
         lastVolumeSent = percent;
+        setIcon(els.volumeIcon, payload.muted === true ? 'volume-x' : volumeIconName(percent));
+    } else {
+        // 拖动过程中以滑块自己的值为准，别被回传的旧音量顶回去。
+        setIcon(els.volumeIcon, volumeIconName(Number(els.volume.value)));
     }
 };
 
@@ -345,6 +556,13 @@ els.prev.addEventListener('click', () => sendAction('prev'));
 els.toggle.addEventListener('click', () => sendAction('toggle'));
 els.next.addEventListener('click', () => sendAction('next'));
 els.loop.addEventListener('click', () => sendAction({ type: 'cycle-loop' }));
+// 排版切换是纯显示逻辑，不用问宿主：切完用最后一次快照就地重渲染。
+els.layout.addEventListener('click', () => {
+    layoutMode = LAYOUT_MODES[(LAYOUT_MODES.indexOf(layoutMode) + 1) % LAYOUT_MODES.length];
+    applyLayoutButton();
+    if (lastPayload) render(lastPayload);
+});
+applyLayoutButton();
 
 els.volume.addEventListener('pointerdown', () => {
     volumeDragging = true;
@@ -352,6 +570,7 @@ els.volume.addEventListener('pointerdown', () => {
 els.volume.addEventListener('input', () => {
     volumeDragging = true;
     els.volumeValue.textContent = els.volume.value + '%';
+    setIcon(els.volumeIcon, volumeIconName(Number(els.volume.value)));
     scheduleVolume();
 });
 els.volume.addEventListener('change', () => {
