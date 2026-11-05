@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800" font-family="Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif">
+  <defs>
+    <linearGradient id="desk" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26305a"/>
+      <stop offset="1" stop-color="#141a33"/>
+    </linearGradient>
+    <radialGradient id="glow1" cx="0.85" cy="0.15" r="0.5">
+      <stop offset="0" stop-color="#7aaaff" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#7aaaff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="0.1" cy="0.8" r="0.5">
+      <stop offset="0" stop-color="#966eff" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#966eff" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="hatch" width="26" height="26" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="26" stroke="#5eead4" stroke-opacity="0.33" stroke-width="3"/>
+    </pattern>
+    <mask id="passMask" maskUnits="userSpaceOnUse" x="0" y="0" width="1200" height="800">
+      <rect x="120" y="176" width="960" height="354" rx="22" fill="#fff"/>
+      <rect x="514" y="179" width="172" height="69" rx="30" fill="#000"/>
+    </mask>
+  </defs>
+
+  <rect width="1200" height="800" fill="url(#desk)"/>
+  <rect width="1200" height="800" fill="url(#glow1)"/>
+  <rect width="1200" height="800" fill="url(#glow2)"/>
+
+  <!-- 下方应用窗口（示意穿透后的落点） -->
+  <g>
+    <rect x="836" y="648" width="330" height="104" rx="14" fill="#f0f4fb" opacity="0.96"/>
+    <path d="M836 662 a14 14 0 0 1 14 -14 h302 a14 14 0 0 1 14 14 v20 h-330 z" fill="#d8e1f2" opacity="0.96"/>
+    <circle cx="858" cy="672" r="7" fill="#ff7878"/>
+    <circle cx="878" cy="672" r="7" fill="#ffc96e"/>
+    <text x="902" y="679" font-size="17" fill="#505e78">下方应用窗口</text>
+    <text x="858" y="720" font-size="16" fill="#7c8aa6">点击落到这里</text>
+  </g>
+
+  <!-- 标题 -->
+  <text x="60" y="82" font-size="44" font-weight="700" fill="#ffffff">锁定态点击穿透示意</text>
+  <text x="62" y="126" font-size="23" fill="#bacae8">1.1.0 改版后布局 · 窗口 640 × 236 · 蓝色 = 可点击，斜纹 = 穿透</text>
+
+  <!-- 悬浮窗底 -->
+  <rect x="120" y="176" width="960" height="354" rx="22" fill="#060a14" opacity="0.65"/>
+
+  <!-- 穿透区斜纹 -->
+  <rect x="120" y="176" width="960" height="354" fill="url(#hatch)" mask="url(#passMask)"/>
+
+  <!-- 两侧按钮：锁定后隐藏（不可点） -->
+  <g stroke="#ffffff" stroke-opacity="0.45" fill="#ffffff" fill-opacity="0.1">
+    <rect x="143" y="203" width="46" height="46" rx="10"/>
+    <rect x="207" y="203" width="46" height="46" rx="10"/>
+    <rect x="271" y="203" width="46" height="46" rx="10"/>
+    <rect x="823" y="203" width="46" height="46" rx="10"/>
+    <rect x="887" y="203" width="46" height="46" rx="10"/>
+    <rect x="951" y="203" width="46" height="46" rx="10"/>
+    <rect x="1015" y="203" width="46" height="46" rx="10"/>
+  </g>
+  <g stroke="#ffffff" stroke-opacity="0.4" stroke-width="2">
+    <line x1="152" y1="226" x2="180" y2="226"/>
+    <line x1="216" y1="226" x2="244" y2="226"/>
+    <line x1="280" y1="226" x2="308" y2="226"/>
+    <line x1="832" y1="226" x2="860" y2="226"/>
+    <line x1="896" y1="226" x2="924" y2="226"/>
+    <line x1="960" y1="226" x2="988" y2="226"/>
+    <line x1="1024" y1="226" x2="1052" y2="226"/>
+  </g>
+  <text x="120" y="288" font-size="17" fill="#8fb8c8" opacity="0.85">（上一首 / 播放 / 下一首）</text>
+  <text x="874" y="288" font-size="17" fill="#8fb8c8" opacity="0.85">（循环 / 排版 / 音量）</text>
+
+  <!-- 唯一可点：取消锁定胶囊 -->
+  <g>
+    <rect x="528" y="191" width="144" height="45" rx="22" fill="#7dd3fc" fill-opacity="0.42" stroke="#aae4ff" stroke-width="3"/>
+    <circle cx="556" cy="207" r="6" fill="none" stroke="#f0faff" stroke-width="3"/>
+    <line x1="556" y1="213" x2="556" y2="220" stroke="#f0faff" stroke-width="3" stroke-linecap="round"/>
+    <text x="574" y="221" font-size="18" font-weight="700" fill="#f0faff">取消锁定</text>
+  </g>
+
+  <!-- 歌词（在穿透区里） -->
+  <g text-anchor="middle" paint-order="stroke" stroke="#000000" stroke-opacity="0.55">
+    <text x="600" y="358" font-size="57" font-weight="700" stroke-width="7" fill="#ffffff">这是一行歌词原文</text>
+    <text x="600" y="432" font-size="40" stroke-width="5" fill="#ffffff">这是译文 / 罗马音</text>
+  </g>
+
+  <!-- 窗口描边 -->
+  <rect x="120" y="176" width="960" height="354" rx="22" fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="3"/>
+
+  <!-- 标注 -->
+  <g font-size="20">
+    <g>
+      <rect x="148" y="424" width="164" height="38" rx="9" fill="#0a1020" opacity="0.88" stroke="#e8f2ff" stroke-opacity="0.7" stroke-width="2"/>
+      <text x="158" y="450" fill="#e8f2ff">歌词区（穿透）</text>
+    </g>
+    <g>
+      <rect x="114" y="548" width="330" height="38" rx="9" fill="#0a1020" opacity="0.88" stroke="#e8f2ff" stroke-opacity="0.7" stroke-width="2"/>
+      <text x="124" y="574" fill="#e8f2ff">两侧按钮（锁定后隐藏）→ 穿透</text>
+      <line x1="240" y1="548" x2="240" y2="528" stroke="#ffffff" stroke-opacity="0.45" stroke-width="2"/>
+    </g>
+    <g>
+      <rect x="500" y="592" width="270" height="38" rx="9" fill="#0a1020" opacity="0.88" stroke="#aae4ff" stroke-opacity="0.85" stroke-width="2"/>
+      <text x="510" y="618" fill="#aae4ff">「取消锁定」→ 唯一可点</text>
+      <polyline points="600,592 600,530" fill="none" stroke="#ffffff" stroke-opacity="0.45" stroke-width="2"/>
+      <polyline points="600,592 500,592" fill="none" stroke="#ffffff" stroke-opacity="0.45" stroke-width="2"/>
+    </g>
+  </g>
+
+  <!-- 图例 -->
+  <g>
+    <rect x="60" y="746" width="40" height="26" rx="8" fill="#7dd3fc" fill-opacity="0.42" stroke="#aae4ff" stroke-width="2"/>
+    <text x="114" y="766" font-size="21" fill="#e2eeff">可点击（鼠标不穿透）</text>
+
+    <g transform="translate(420,0)">
+      <rect x="0" y="744" width="72" height="30" fill="#0a1020" stroke="#5eead4" stroke-opacity="0.7" stroke-width="2"/>
+      <line x1="0" y1="774" x2="30" y2="744" stroke="#5eead4" stroke-opacity="0.8" stroke-width="3"/>
+      <line x1="18" y1="774" x2="48" y2="744" stroke="#5eead4" stroke-opacity="0.8" stroke-width="3"/>
+      <line x1="36" y1="774" x2="66" y2="744" stroke="#5eead4" stroke-opacity="0.8" stroke-width="3"/>
+      <text x="88" y="766" font-size="21" fill="#c8f0e8">穿透（点击落到下方应用）</text>
+    </g>
+  </g>
+</svg>

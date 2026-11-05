@@ -1,15 +1,19 @@
 /**
- * my-lyric-widget 的渲染进程入口：只做数据搬运，不渲染任何界面。
+ * my-lyric-widget 的渲染进程入口：独立常驻的数据搬运模块，不渲染任何界面。
  *
- * 数据流（与 main.cjs 的协议）：
- *   渲染进程 -> 主进程：每次状态变化通过 folium.rpc.call('update-data', payload) 发一份完整快照；
+ * 1.0.0 起不再注册为「歌词样式（visualizer）」：只要模组启用，activate 就常驻运行，
+ * 不依赖用户在设置里选中某个样式，也不依赖宿主的 mount 上下文。
+ *
+ * 数据流（与 main.cjs 的协议，0.3.2 起未变）：
+ *   渲染进程 -> 主进程：每 100ms 轮询一次播放状态，内容有变化时通过
+ *                        folium.rpc.call('update-data', payload) 发一份完整快照；
  *                        main.cjs 侧对应 api.rpc.handle('update-data', (payload) => ...)。
  *   主进程 -> 渲染进程：main.cjs 用 api.rpc.send('action', { action: 'next' }) 发控制指令；
  *                        这里在 folium.rpc.on('action', ...) 里转成 folium.playback 的调用。
  *
- * payload 形状（主进程按这份结构写接收逻辑）：
+ * payload 形状（主进程按这份结构写接收逻辑，不要改字段名）：
  *   {
- *     playSessionId: string,   // 同一次播放内不变（宿主重新挂载也不换）；换歌 / 从 stopped 重新开始时换新的
+ *     playSessionId: string,   // 同一次播放内不变；换歌 / 从 stopped 重新开始时换新的
  *     song: { id, title, artist, album, source } | null,
  *     state: 'playing' | 'paused' | 'stopped',
  *     position: number,        // 秒；读取那一刻的值（不是持续推流，进度条要主进程自己推进）
@@ -21,16 +25,16 @@
  *     loopMode: 'off' | 'all' | 'one',
  *     line: {
  *       index,                 // 当前行下标；-1 表示没有当前行（句间保留上一句时同样是 -1）
- *       text,                  // 没有当前行时保留最近一句（含最后一句结束后）；连最近一句都没有（第一句开始前 / 无歌词）时是「等待播放...」
+ *       text,                  // 没有当前行时保留最近一句；连最近一句都没有时是「等待播放...」
  *       translation: string | null,
  *       romanization: string | null,
  *       words: null,           // 逐字 / 卡拉 OK 预留字段，当前恒为 null
  *       startTime: number | null,
  *       endTime: number | null,
  *     },
- *     theme: {                 // 视觉在挂载之前（或从未挂载过）时可能是 null：宿主没有全局主题读取接口，
+ *     theme: {                 // 宿主没有全局主题读取接口，只有 theme.changed 之后才有值，
  *       name, isDaylight, backgroundColor, primaryColor, accentColor, secondaryColor,
- *       fontStyle, fontStack,  // fontStack 是可直接写进 CSS 的 font-family
+ *       fontStyle, fontStack,  // 否则为 null，由 main.cjs 用默认样式兜底
  *     } | null,
  *   }
  *
@@ -40,32 +44,24 @@
  *   | { action: 'set-loop', mode: 'off' | 'all' | 'one' }
  *   | { action: 'request-sync' }   // 主进程窗口刚打开、错过之前的快照时，强制重发一次
  *
- * 同步策略（0.3.3：不再依赖「本样式被选中」）：
- *   - 主路径 mount：本样式被选中时宿主挂载这里，ctx 给出精确的歌词时钟（含用户歌词偏移），
- *     每个变化都发快照 —— 精度最高。
- *   - 兜底路径 activate：本样式没被选中时没有任何 mount，但 activate 仍然活着，
- *     于是用 folium.playback / folium.lyrics / folium.events 自己驱动同步：
- *       · folium.every 轮询（POLL_MS）驱动句内变化；
- *       · playback.* / lyrics.loaded / theme.changed 事件立即触发；
- *       · 行号用 playback.position 与歌词 startTime/endTime 比对；用户调过的歌词偏移由这里自己
- *         补回来（减法，见下方 readLyricOffsetSeconds 的说明），所以手动把歌词延后 5 秒时，
- *         悬浮窗也跟着延后 5 秒，不再整体偏一句。
- *       · 预览片段（preview clip）从歌曲中间开始时，播放位置与歌词时钟之间还差一个片段起点，
- *         这一项兜底路径拿不到；挂载后立刻切回宿主的精确时钟。
+ * 同步策略（1.0.0：完全自主，不再有 mount 路径）：
+ *   - folium.every(100ms) 轮询 + 播放/歌词/主题事件即时触发；
+ *   - 行号用 folium.playback.getState().position 与 folium.lyrics.getLines() 的
+ *     startTime / endTime 自行比对（findApproximateLineIndex）；
+ *   - 宿主没有全局歌词时钟，所以用户手动调过的歌词偏移由这里自己补回来
+ *     （见下方 readLyricOffsetSeconds 的说明）：手动把歌词延后 5 秒，悬浮窗也延后 5 秒；
+ *   - 已知精度差异：预览片段（preview clip）从歌曲中间开始时，播放位置与歌词时钟之间
+ *     还差一个片段起点，这一项宿主没有对外暴露，自主路径拿不到，整首播放则没有问题；
  *   - 宿主播放服务（folium.playback 等）由主窗口 App 挂载后才注册：activate 常常比它早，
  *     此时调用会抛 playback-unavailable-in-main-context。这不是故障，所以这里先探测 + 等待，
  *     任何宿主侧异常都在本模块内吞掉，不会被记成「client activate 出错 / 事件出错」。
- *   - 按键监听（folium.rpc.on('action')）只注册一次，放在 activate 里：不管样式有没有被选中，
- *     悬浮窗底部的按钮都有效。
- *   - 主题只在挂载过之后才有缓存值（theme.changed 也会更新缓存），没挂载过时 payload.theme 为 null。
  *
  * 约定：
  *   - 快照里不含 song.ref：ref 只在当前渲染会话有效，主进程存下来会失效；跨歌用 source + id。
- *   - 真正的悬浮窗由 main.cjs 创建；这个 visualizer 被选中只影响同步精度，不占画面。
+ *   - 真正的悬浮窗由 main.cjs 在 activate 时创建，这里只负责搬数据。
  *   - 句间（index -1）用 folium.lyrics.getRecentCompletedLine 保留上一句；
  *     连上一句都没有（如歌曲还没开始）时才发「等待播放...」。
- *   - 宿主会在歌词异步到达、换歌、静态模式每句等时机重新挂载；播放会话跨挂载复用，主进程只在
- *     playSessionId 真正变化时重置进度。静态模式（主题设置）只停背景动画，播放继续，照常同步。
+ *   - 导出窗口里没有播放页：只注册事件也不轮询，直接返回。
  */
 
 const RPC_UPDATE = 'update-data';
@@ -74,13 +70,13 @@ const ACTION_REQUEST_SYNC = 'request-sync';
 const WAITING_LINE_TEXT = '等待播放...';
 const LOOP_MODES = ['off', 'all', 'one'];
 
-// 兜底轮询周期：只用来驱动「句内换行」这类没有事件的状态变化；事件仍然即时触发。
-// 200ms 足以让句与句之间的切换看起来是即时的，同时把 IPC 频率压到最低。
-const POLL_MS = 200;
+// 轮询周期：驱动「句内换行」这类没有事件的状态变化。100ms 足够让换句看起来是即时的，
+// 同时靠内容去重把真正的 IPC 频率压到最低（同一行每秒只发一次）。
+const POLL_MS = 100;
 
-// ---- 用户歌词偏移（兜底路径自己复算） ----
+// ---- 用户歌词偏移（自主路径自己复算） ----
 // 宿主主窗口把「已经算上用户偏移」的歌词时钟交给 mount 的 ctx.lyricTime，但没有对外暴露全局
-// 歌词时钟；样式没被选中时只能自己补回来。键名与算法严格照抄宿主源码：
+// 歌词时钟；不挂载时只能自己补回来。键名与算法严格照抄宿主源码：
 //   · 单曲手动偏移：localStorage 'lyric_timeline_offsets'，JSON map<歌 id, 毫秒>
 //     （src/utils/lyrics/lyricOffsetMemory.ts）
 //   · 设备级延迟补偿：localStorage 'global_lyric_timeline_offset_ms'，钳在 ±2000ms
@@ -93,7 +89,7 @@ const LYRIC_OFFSET_STORAGE_KEY = 'lyric_timeline_offsets';
 const GLOBAL_LYRIC_OFFSET_STORAGE_KEY = 'global_lyric_timeline_offset_ms';
 const GLOBAL_LYRIC_OFFSET_LIMIT_MS = 2000;
 
-// localStorage 里的偏移表只在用户动手调整时才变；按原始字符串缓存，避免每 200ms 重新解析。
+// localStorage 里的偏移表只在用户动手调整时才变；按原始字符串缓存，避免每 100ms 重新解析。
 let offsetCacheRaw = null;
 let offsetCacheMap = {};
 
@@ -131,7 +127,7 @@ const readGlobalOffsetMs = () => {
     }
 };
 
-/** 兜底路径要从播放位置里减掉的偏移（秒）：单曲手动偏移 + 设备级延迟补偿。 */
+/** 自主路径要从播放位置里减掉的偏移（秒）：单曲手动偏移 + 设备级延迟补偿。 */
 const readLyricOffsetSeconds = (song) => {
     if (!song) return 0;
     return (readPerSongOffsetMs(song.id) + readGlobalOffsetMs()) / 1000;
@@ -155,13 +151,12 @@ const createPlaySessionId = () =>
     'ps-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 
 /**
- * 播放会话状态：放在 activate 作用域里跨挂载复用。
- * 宿主会在歌词异步到达、换歌、静态模式每句等时机重新挂载 visualizer；
- * 如果每次挂载都换 id，主进程会在同一首歌中途重置进度。
+ * 播放会话状态：放在 activate 作用域里复用。
+ * 从 stopped 重新开始 / 换歌都算新的播放会话，主进程据此重置进度条。
  */
 const createPlaySession = () => ({
     id: createPlaySessionId(),
-    songKey: null, // 上次观察到的歌；null 表示还没有基线（首次挂载）
+    songKey: null, // 上次观察到的歌；null 表示还没有基线（首次轮询）
     state: null, // 上次观察到的播放状态
     pendingSongStart: false, // 换歌刚换过 id，接下来那次 stopped -> playing 不再换
 });
@@ -186,7 +181,7 @@ const readSong = (song) => {
 };
 
 /**
- * 兜底路径的当前行下标：宿主没有全局歌词时钟，只能用播放位置比对歌词时间。
+ * 当前行下标：宿主没有全局歌词时钟，只能用播放位置比对歌词时间。
  * 返回最后一个 startTime <= time 的行下标；已经过了该行 endTime（句间）时返回 -1，
  * 交给 getRecentCompletedLine 保留上一句。歌词按时间递增，但这里不假设顺序，直接全表取最大下标。
  */
@@ -205,7 +200,6 @@ const findApproximateLineIndex = (lines, time) => {
 
 /**
  * 当前歌词行；两句之间保留上一句，只有上一句也没有（如歌曲还没开始）时才给「等待播放...」。
- * lines / index / time 由调用方给出：挂载时是 ctx 的精确值，兜底时是 getLines() + 播放位置的近似值。
  */
 const readLine = (folium, lines, index, time) => {
     const safeLines = Array.isArray(lines) ? lines : [];
@@ -216,7 +210,6 @@ const readLine = (folium, lines, index, time) => {
     if (!line) {
         // 没有当前行、也没有最近一句（第一句开始前 / 无歌词）时统一给等待文案；
         // 注意最后一句结束后 getRecentCompletedLine 仍返回最后一句，不会走到这里。
-        // index 也归 -1，保证「index >= 0」与「text 是歌词」两条约定一致。
         return {
             index: -1,
             text: WAITING_LINE_TEXT,
@@ -241,7 +234,7 @@ const readLine = (folium, lines, index, time) => {
 
 /**
  * 主题色与字体；fontStack 由宿主解析好，主进程可以直接写进 CSS 的 font-family。
- * theme 为 null（还没挂载过、也没收到 theme.changed）时返回 null，由主进程用默认样式兜底。
+ * theme 为 null（还没收到 theme.changed）时返回 null，由主进程用默认样式兜底。
  */
 const readTheme = (folium, theme) => {
     if (!theme) return null;
@@ -343,13 +336,12 @@ const handleAction = (folium, message) => {
 };
 
 /**
- * 同步引擎：activate 级创建一次，mount 只是把精确上下文交给它。
- * 这样「有没有被选中」只影响行号精度，不影响数据是否在流动、按钮是否有效。
+ * 同步引擎：activate 级创建一次，靠 folium.every 轮询 + 宿主事件驱动。
+ * 没有任何 mount 上下文，行号全部由播放位置与歌词 startTime / endTime 自行比对。
  */
 const createSyncEngine = (folium) => {
     const session = createPlaySession();
-    let mountedCtx = null; // 非 null = 本样式正在被宿主渲染，ctx 里有精确歌词时钟
-    let cachedTheme = null; // 宿主没有全局主题接口：最近一次从 mount / theme.changed 拿到的主题
+    let cachedTheme = null; // 宿主没有全局主题接口：最近一次从 theme.changed 拿到的主题
     let lastSentKey = '';
     let reportedFailure = false;
     // 宿主播放服务由主窗口 App 挂载后才注册（src/mods/runtime/hostActions.ts），激活时往往还没有；
@@ -359,7 +351,7 @@ const createSyncEngine = (folium) => {
     let hostNotReadyLogged = false;
     let reportedSyncError = false;
 
-    // rpc 是 Folium 1.7 才有的：老宿主上别让整个歌词样式因为取不到成员而挂掉。
+    // rpc 是 Folium 1.7 才有的：老宿主上别让整个模组因为取不到成员而挂掉。
     const canReport = Boolean(folium.rpc && typeof folium.rpc.call === 'function');
     const canReceiveActions = canReport && typeof folium.rpc.on === 'function';
 
@@ -373,24 +365,15 @@ const createSyncEngine = (folium) => {
         }
     };
 
-    /** 当前视图：挂载时用 ctx 的精确值，否则用全局 API 近似。 */
+    /**
+     * 当前视图：全部来自全局 API。
+     * 行号 = 播放位置 - 用户歌词偏移，再与歌词 startTime / endTime 比对。
+     */
     const readView = () => {
-        if (mountedCtx) {
-            const theme = mountedCtx.getTheme();
-            if (theme) cachedTheme = theme;
-            return {
-                lines: mountedCtx.lines || [],
-                lineIndex: mountedCtx.getLineIndex(),
-                time: mountedCtx.lyricTime.get(),
-                // 挂载时歌词时钟已经由宿主算上偏移，这里不需要再减。
-                offsetSec: null,
-                theme,
-                source: 'mount',
-            };
-        }
         const playback = folium.playback.getState();
-        const lines = folium.lyrics.getLines() || [];
-        // 兜底路径自己把用户偏移补回来：歌词时钟 = 播放位置 - 偏移（秒）。
+        const lines = (folium.lyrics && typeof folium.lyrics.getLines === 'function')
+            ? (folium.lyrics.getLines() || [])
+            : [];
         const offsetSec = readLyricOffsetSeconds(playback.song);
         const lyricTime = playback.position - offsetSec;
         return {
@@ -399,7 +382,6 @@ const createSyncEngine = (folium) => {
             time: lyricTime,
             offsetSec,
             theme: cachedTheme,
-            source: 'fallback',
         };
     };
 
@@ -426,18 +408,17 @@ const createSyncEngine = (folium) => {
             const payload = buildPayload(folium, view, session.id);
 
             // 一次变化可能同时触发多个监听；内容相同的快照不必重复发（request-sync 强制重发）。
-            // position 每秒都在变但不值得每秒推流（主进程自己推进进度条），所以去重时把它固定掉。
+            // position 每 100ms 都在变但不值得持续推流（主进程自己推进进度条），所以去重时把它固定掉。
             const key = JSON.stringify(payload, (name, value) => (name === 'position' ? 0 : value));
             if (!force && key === lastSentKey) return;
             lastSentKey = key;
 
             debugLog('[lyric-widget] syncData 发送', {
-                source: view.source,
                 force,
                 state: payload.state,
                 title: payload.song && payload.song.title,
                 line: payload.line.text,
-                // 兜底路径减掉的用户偏移（秒）；挂载路径是宿主算好的，显示 null。
+                // 自己减掉的用户偏移（秒）。
                 offset: view.offsetSec,
                 session: payload.playSessionId,
             });
@@ -496,7 +477,7 @@ const createSyncEngine = (folium) => {
             folium.events.on('playback.loopModeChanged', () => syncData()),
             folium.events.on('playback.likeChanged', () => syncData()),
             folium.events.on('playback.seeked', () => syncData()),
-            // 歌词异步到达 / 重新解析：兜底路径没有 ctx.onChange，必须靠这个事件刷新当前行。
+            // 歌词异步到达 / 重新解析：没有 mount 上下文，必须靠这个事件刷新当前行。
             folium.events.on('lyrics.loaded', () => syncData()),
             folium.events.on('theme.changed', (event) => {
                 const theme = event && event.theme;
@@ -504,62 +485,34 @@ const createSyncEngine = (folium) => {
                 syncData();
             }),
         ];
-        // 按键监听只在这里注册一次：不管样式有没有被选中，悬浮窗的按钮都有效。
+        // 按键监听只在这里注册一次：不管播放器用哪种歌词样式，悬浮窗的按钮都有效。
         if (canReceiveActions) disposers.push(folium.rpc.on(RPC_ACTION, handleActionMessage));
         return disposers;
-    };
-
-    /** mount 交出精确上下文；卸载（null）时立刻用兜底视图补一帧，避免窗口停在旧行。 */
-    const setMountedContext = (ctx) => {
-        mountedCtx = ctx;
-        if (!ctx) syncData();
     };
 
     return {
         syncData,
         attachListeners,
-        setMountedContext,
         canReport,
         canReceiveActions,
     };
 };
 
 /**
- * 挂载：这个样式不画任何东西，mount 只负责把精确上下文交给同步引擎。
- * 宿主会在歌曲 / 歌词数据 / staticMode 变化时重新挂载，每次挂载都会立刻发一份完整快照。
+ * 1.0.0 起本模组不再注册 visualizer，旧版本留在 localStorage 里的
+ * `visualizer_mode = mod:my-lyric-widget:lyric-widget` 已经指向不存在的样式。
+ * 宿主在启动时已经把无效值回退成内置样式，但设置面板会提示「属于某个模组」；
+ * 这里只清掉「指向本模组」的那一条，其他值一律不碰。
  */
-const mountLyricWidget = (engine, folium, ctx) => {
-    debugLog('[lyric-widget] mount 进入', {
-        context: folium.env.context,
-        isPreview: ctx.isPreview,
-        lines: ctx.lines && ctx.lines.length,
-        lineIndex: ctx.getLineIndex(),
-        canCall: !!(folium.rpc && folium.rpc.call),
-        canOn: !!(folium.rpc && folium.rpc.on),
-    });
-    // 设置面板里的预览、导出窗口都不是真实播放，不搬数据。
-    // 静态模式只是主题设置里「禁用几何背景」的选项，播放继续，仍需同步（它会让宿主每句重新挂载）。
-    if (ctx.isPreview) {
-        debugLog('[lyric-widget] mount 早退（isPreview）');
-        return;
+const clearStaleVisualizerSelection = (folium) => {
+    try {
+        const saved = localStorage.getItem('visualizer_mode');
+        if (!saved || !saved.startsWith('mod:' + folium.modId + ':')) return;
+        localStorage.removeItem('visualizer_mode');
+        debugLog('[lyric-widget] 已清除旧的歌词样式选择（不再需要选中本模组）', saved);
+    } catch {
+        // localStorage 不可用时不影响同步。
     }
-
-    engine.setMountedContext(ctx);
-    // ctx.onChange 在歌词时钟推进 / 行变化时触发：这是「有精确时钟」时的高精度路径。
-    const disposeChange = typeof ctx.onChange === 'function' ? ctx.onChange(() => engine.syncData()) : null;
-    // 挂载即对齐会话并发一次：主进程不用等到下一次播放事件才知道当前状态。
-    engine.syncData();
-
-    // 卸载（切样式、换歌重新挂载、模组停止）时只撤监听，不再发消息：
-    // 换歌也会走卸载，发一条「已停用」会让主进程误以为用户关掉了悬浮窗。
-    return () => {
-        try {
-            if (disposeChange) disposeChange();
-        } catch (error) {
-            folium.log.warn('[lyric-widget] 卸载 onChange 时出错', error);
-        }
-        engine.setMountedContext(null);
-    };
 };
 
 export default function activate(folium) {
@@ -571,8 +524,7 @@ export default function activate(folium) {
         hasOn: !!(folium.rpc && folium.rpc.on),
         hasEvery: typeof folium.every === 'function',
         hasLyrics: !!(folium.lyrics && typeof folium.lyrics.getLines === 'function'),
-        // 宿主保存的可视化模式：mod:<id>:<name> 说明用户选的确实是本模组。
-        // 不管它是什么，兜底路径都会继续同步（0.3.3 起不再依赖这个值）。
+        // 旧版本保存的可视化模式；现在只用于清理，不再影响是否同步。
         savedVisualizerMode: (() => {
             try {
                 return localStorage.getItem('visualizer_mode');
@@ -584,14 +536,8 @@ export default function activate(folium) {
 
     const engine = createSyncEngine(folium);
 
-    // 注册仍然必须有：被选中时用它拿到精确歌词时钟，导出窗口也要求它存在。
-    folium.registries.visualizers.register({
-        id: 'lyric-widget',
-        label: { 'zh-CN': '悬浮歌词', en: 'Floating Lyrics' },
-        // container 不使用：界面在主进程开的窗口里。
-        mount: (container, ctx) => mountLyricWidget(engine, folium, ctx),
-    });
-    debugLog('[lyric-widget] visualizer 已注册 lyric-widget');
+    // 不再注册 visualizer：本模组是常驻功能，和当前播放器用哪种歌词样式无关。
+    clearStaleVisualizerSelection(folium);
 
     if (!engine.canReport) {
         folium.log.warn('[lyric-widget] 当前 Folium 版本没有 folium.rpc.call（需要 1.7+），悬浮窗收不到数据');
@@ -601,16 +547,16 @@ export default function activate(folium) {
         folium.log.warn('[lyric-widget] 当前 Folium 版本没有 folium.rpc.on（需要 1.7+），悬浮窗的按钮/滑块会无效');
     }
 
-    // 导出窗口只注册、不搬数据（那里没有播放页，也不该往悬浮窗推快照）。
+    // 导出窗口里没有播放页：不轮询、不搬数据。
     if (folium.env.context !== 'main') {
-        debugLog('[lyric-widget] 非 main 上下文，只注册不同步');
+        debugLog('[lyric-widget] 非 main 上下文，不同步');
         return;
     }
 
     const disposers = engine.attachListeners();
 
-    // 兜底驱动：样式没被选中时没有任何 ctx 事件，靠这个轮询发现句内换行。
-    // folium.every 由宿主托管（模组停止时自动清理），不自己 setInterval。
+    // 自主驱动：每 100ms 读一次全局播放状态，自己算当前行；folium.every 由宿主托管
+    // （模组停止时自动清理），不自己 setInterval。
     if (typeof folium.every === 'function') {
         disposers.push(folium.every(POLL_MS, () => engine.syncData()));
     } else {
@@ -618,7 +564,8 @@ export default function activate(folium) {
         disposers.push(() => clearInterval(timer));
     }
 
-    // 激活即发首帧：主进程窗口可能比模组早开一秒左右，早发的这条即使失败也会被轮询自动补上。
+    // 激活即发首帧：main.cjs 的窗口在它自己的 activate 里已经先建好（显示「等待播放...」），
+    // 这帧即使失败（宿主播放服务还没就绪）也会被轮询自动补上。
     engine.syncData(true);
 
     return () => {
@@ -629,7 +576,6 @@ export default function activate(folium) {
                 folium.log.warn('[lyric-widget] 停止同步时出错', error);
             }
         }
-        engine.setMountedContext(null);
-        debugLog('[lyric-widget] client 已停止（监听已撤）');
+        debugLog('[lyric-widget] client 已停止（监听与轮询已撤）');
     };
 }
