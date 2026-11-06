@@ -1,121 +1,196 @@
 # my-lyric-widget 交接文档
 
-给接手的人或下一个会话：**现在是什么状态、怎么验证、下一步做什么**。为什么长成这样读
-[迭代文档](my-lyric-widget-iterations.md)；Folium 的接口细节读 `mods/README.md`、`docs/folium/api.md`、`mods/folium.d.ts`。
+给接手的人 / 下一个会话：**现在是什么状态、下一步做什么、坑在哪**。
+设计来龙去脉读 [迭代文档](my-lyric-widget-iterations.md)；1.3.0 与 1.6.3 的完整差距读
+`D:\folia-dev\1.3.0-vs-1.6.3-功能对比与风险.md`。
 
-最后更新：2026-11-03，对应模组版本 0.3.2。
+最后更新：**2026-11-07**，对应状态「1.6.3 已存档、准备回滚到 1.3.0、回滚尚未执行」。
 
-## 1. 一句话
+---
 
-在 `mods/my-lyric-widget/`：`client.mjs` 把播放状态和当前歌词行搬给本模组的主进程，`main.cjs` 开一个独立的
-无边框透明置顶小窗显示歌词和播放控制。歌词样式本身是空白的。
+## 1. 一句话现状
 
-## 2. 文件
+代码做到 **1.6.3**（分支 `wip/1.6.3`，已推 GitHub），但真机上「换歌偶发卡死」反复无法稳定修复，
+用户决定**回滚到 1.3.0** 作为可用版本。回滚**还没有执行**，先写下这份交接。
 
-| 路径 | 作用 |
-| --- | --- |
-| `mods/my-lyric-widget/mod.json` | 版本 0.3.2；`folium: 1`；`permissions: ["playback.control", "playback.read"]`；`client: client.mjs`，`main: main.cjs` |
-| `mods/my-lyric-widget/client.mjs` | 323 行。注册空 visualizer（id `lyric-widget`，模式 id `mod:my-lyric-widget:lyric-widget`），挂载时同步快照、接收 action |
-| `mods/my-lyric-widget/main.cjs` | 743 行。悬浮窗页面（内联 HTML）、宿主窗口跟踪、指令归一化、RPC 收发、dispose |
-| `mods/my-lyric-widget/.git` | 模组目录自己是个 git 仓库（`2ad2d6e` 是 client 首版；之后 main/client/mod.json 的改动都还没提交） |
-| 本文件 / `my-lyric-widget-iterations.md` | 放在仓库 `docs/`，**不在模组目录里**（模组目录里的每个文件都算模组内容） |
+职责边界不变：`client.mjs` 只搬数据，`main.cjs` 管窗口与渲染；界面本体在那个独立悬浮窗里。
 
-## 3. 数据流与协议
+---
 
+## 2. 三条分支（这是最重要的一节）
+
+仓库：`D:\folia-dev\folia-major\mods\my-lyric-widget`（模组目录自己是个 git 仓库）
+远端：`https://github.com/GUDUYUNI99/my-lyric-widget.git`
+
+| 分支 | 提交 | 内容 | 用途 |
+| --- | --- | --- | --- |
+| `wip/1.6.3`（**当前**） | `3861698` | 1.6.3 全量（1.4.0–1.6.3 所有功能） | 存档；已推 GitHub；提交说明里标注了「bug 较多，不建议直接用」 |
+| `feature/standalone-mod` | `bea218b` | **1.3.0 快照**（2026-11-05 23:21） | 回滚目标 |
+| `main` | `9a3df47` | 1.0.0 基线 | 历史 |
+
+回滚（一条命令，10 秒，改完重启 Folia 生效）：
+
+```bash
+cd D:\folia-dev\folia-major\mods\my-lyric-widget
+git switch feature/standalone-mod
 ```
-client.mjs  --folium.rpc.call('update-data', payload)--> main.cjs: api.rpc.handle('update-data', ...)
-client.mjs  <--folium.rpc.on('action', handler)---------- main.cjs: api.rpc.send('action', action)
-悬浮窗页面  --ipcRenderer.send('my-lyric-widget:action-to-client', ...)--> main.cjs: ipcMain.on(...)
-悬浮窗页面  <--ipcRenderer.on('my-lyric-widget:data-from-client')------- main.cjs: webContents.send(...)
+
+切回 1.6.3：`git switch wip/1.6.3`。
+注意：`git switch` 会连带把 `docs/` 里的文档恢复成对应版本——本文件与上述对比文档在
+`D:\folia-dev\` 下另存了一份，不受影响。
+
+---
+
+## 3. 回滚后会得到什么
+
+1.3.0 的能力边界（这些是**设计如此**，不是缺陷）：
+
+- 窗口固定 **640×180**，不随字号变（没有字号设置）；
+- 两行歌词（原文 + 译文 / 罗马音，由顶部排版按钮三态循环）；
+- 长句**直接截断**（`nowrap + ellipsis`）；
+- 没有逐字歌词（`line.words` 恒为 `null`）；
+- 没有设置面板、没有命令面板、没有播放条「词」按钮、没有窗口右上角 ×；
+- 有：任务栏置顶守卫（1.0.1）、固定态部分点击穿透（1.2.0）、去 DWM 阴影/圆角（1.2.0）、
+  位置/固定/排版持久化。
+
+会失去什么、每条对应哪个版本，见对比文档第 3 节表格。简言之：**15 项功能与 +1929 行代码**。
+
+---
+
+## 4. 回滚后如果要继续做，建议顺序
+
+1. **先解决「换歌偶发卡死」再谈功能**。1.6.3 的定位是「页面用全局最大行号判旧帧，换歌后行号从 0 重来，
+   新歌每一帧都被当旧帧丢掉」；已经加了 `shownSessionId` 重置，但用户复测仍有，说明还有第二条路径。
+   建议的下一步（约 40 行）：把排序逻辑搬到主进程——按 `playSessionId` 分桶，同一首歌里
+   `position` 明显后退（>0.5s）且行号不前进的帧直接丢弃，页面删掉 `shownLineIndex` 那套保护。
+2. 修「× 关掉再打开第一帧是旧句」：补发 + `request-sync` 已做，仍偶发，怀疑补发早于页面监听注册，
+   可在 `did-finish-load` 里再补一次（现在只在 load 时发一次 config，未发 payload）。
+3. 再按 1.4 → 1.5 → 1.6 的顺序**分批**加回功能，每批都真机验证一遍再进下一批。
+4. 逐字 + 长句滚动同时开启时的观感（染色是否跟着滚、换句是否立即复位）一直没真机确认过。
+
+---
+
+## 5. 文件地图
+
+当前（1.6.3）：
+
+| 路径 | 行数 | 说明 |
+| --- | --- | --- |
+| `mod.json` | 13 | `folium: 1`；权限 `playback.control` + `playback.read`；`version: 1.6.3` |
+| `client.mjs` | 1391 | 数据投影（`readLine` / `projectWords`）、独立轮询引擎、设置分区（`buildSettingsSection`，13 项）、5 条命令、播放条「词」按钮、1.6 轮询兜底 |
+| `main.cjs` | 2672 | 悬浮窗与内联页面、`normalizeConfig`（三段配置）、`windowHeightFor`（字号→高度）、`displaySurface` / `setDisplaySurface`（形态）、`setWidgetOpen`（显隐）、走马灯滚动、逐字 rAF、任务栏守卫、部分点击穿透 |
+| `docs/` | 597 → 1124 | 迭代文档 |
+
+1.3.0（回滚后）：`client.mjs` 536 行、`main.cjs` 1564 行、文档 597 行。
+
+关键函数（1.6.3 行号，会随改动漂移，仅供定位）：
+
+- `main.cjs:253` `normalizeConfig`、`:303` `lyricBlockHeight`、`:308` `windowHeightFor`
+- `main.cjs:1788` `sendPayloadToWindow`、`:1828` `displaySurface`、`:1836` `reportWidgetVisibility`
+- `main.cjs:1870` `setWidgetOpen`、`:1931` `syncDisplaySurface`、`:1973` `setDisplaySurface`
+- `main.cjs:2020` `applyWindowSize`、`:2060` `startHoverWatch`、`:2155` `startTaskbarGuard`
+- `main.cjs:2197` `createWidgetWindow`、`:2418` `ensureWidgetWindow`
+- `client.mjs:221` `findApproximateLineIndex`、`:238` `projectWords`、`:255` `readLine`
+- `client.mjs:625` `registerWidgetToggleButton`、`:752` `buildSettingsSection`、`:984` `registerSettingsSection`
+- `client.mjs:1071` `registerWidgetCommands`、`:1160` `startCommandPolling`
+
+---
+
+## 6. 协议（1.6.3）
+
+### 6.1 RPC / IPC
+
+| 通道 | 方向 | 用途 |
+| --- | --- | --- |
+| `update-data` | client → main | 每次内容变化推一份快照（`position` 变化会被去重掉） |
+| `action` | main → client | 播放控制指令 |
+| `config` | client → main | 13 项设置（三段结构），main 归一化后转给页面 |
+| `toggle-pin` | client → main | 命令面板的锁定/解锁 |
+| `toggle-widget` | client → main | 播放条「词」按钮：显示 / 隐藏桌面歌词，返回 `{visible}` |
+| `widget-state` | client → main | 首帧对齐查询，返回 `{visible, surface, canSend}` |
+| `set-surface` | client → main | 切换形态，返回 `{surface}` |
+| `take-commands` | client → main | 1.6 宿主兼容：取走主进程排队的消息 |
+| `widget-visibility` | main → client | 显隐 + 形态变化推送 |
+| `my-lyric-widget:data-from-client` | main → 页面 | 快照 |
+| `my-lyric-widget:action-to-client` | 页面 → main | 按钮指令 |
+| `my-lyric-widget:hover` | main → 页面 | 悬停态（拖拽区吞鼠标，只能主进程轮询光标） |
+| `my-lyric-widget:pinned` | main → 页面 | 固定态 |
+| `my-lyric-widget:layout` | main → 页面 | 排版 |
+| `my-lyric-widget:pin-rect` | 页面 → main | 解锁按钮矩形（固定态命中判定） |
+| `my-lyric-widget:close` | 页面 → main | 右上角 × |
+| `my-lyric-widget:config` | main → 页面 | 设置 |
+| `my-lyric-widget:surface` | main ↔ 页面 | 形态（图标高亮 + 点击切换） |
+
+### 6.2 payload
+
+```js
+{
+  playSessionId, song, state, position, duration, liked, canLike,
+  volume, muted, loopMode,
+  line: { index, text, translation, romanization, words, next, startTime, endTime },
+  theme
+}
 ```
 
-- **client → main 只有 `rpc.call`**，client 侧没有 `rpc.send`（那是 main 侧的 API）。名字 `update-data` 两边各有一个常量（`RPC_UPDATE`）。
-- **main → client 只有 `rpc.send`**（Folium 1.7+，不排队、不重放，client 未激活/窗口重建时直接丢）。
-  所以窗口 `did-finish-load` 时主进程会补发最后一份快照，再发一次 `request-sync`。
-- **payload 字段**（client.mjs 文件头有完整注释）：
-  `playSessionId`、`song{id,title,artist,album,source}|null`、`state`、`position`、`duration`、`liked`、`canLike`、
-  `volume`、`muted`、`loopMode`、`line{index,text,translation,romanization,words,startTime,endTime}`、
-  `theme{name,isDaylight,backgroundColor,primaryColor,accentColor,secondaryColor,fontStyle,fontStack}`。
-  窗口目前只用到 `song`、`state`、`volume`、`loopMode`、`line`。
-- **action 的规范形状**：`{action:'next'|'prev'|'toggle'|'request-sync'}`、`{action:'set-volume',volume:0–1}`、
-  `{action:'set-loop',mode:'off'|'all'|'one'}`。窗口页面发简写（`'next'`、`{type:'set-volume',value:0–100}`、
-  `{type:'set-loop',value}`、`{type:'cycle-loop'}`），由 `main.cjs` 的 `normalizeAction` 归一化。
-- 窗口的 `sender` 必须等于本悬浮窗的 `webContents`，否则只记 warn、不转发。
+- `words`：1.5.0 起有值；宿主保证恒为数组，长度 1 = 没有逐字时间。
+- `next`：1.5.0 为「歌词板」形态准备的，1.6.0 砍掉形态后**已无渲染路径消费**，属于契约残留。
 
-## 4. 关键位置（按行号）
+### 6.3 设置（13 项，宿主 `settingsSections`）
 
-`mods/my-lyric-widget/client.mjs`
+`display`、`fontSize`(20–50)、`karaoke`、`fontMode`、`surface`、`surfaceOpacity`、`radius`、
+`border`、`backdrop`、`sungColor`、`unsungOpacity`、`pausedDim`、`marquee`。
 
-| 行 | 内容 |
-| --- | --- |
-| 1–50 | 文件头：payload / action 形状、约定 |
-| 52–56 | 常量：`RPC_UPDATE`、`RPC_ACTION`、`ACTION_REQUEST_SYNC`、`WAITING_LINE_TEXT`、`LOOP_MODES` |
-| 61–74 | `createPlaySessionId`、`createPlaySession`（`id` / `songKey` / `state` / `pendingSongStart`） |
-| 77–93 | `getSongKey`（source+id，没有 id 退回 title+artist）、`readSong`（去掉 `ref`） |
-| 96–126 | `readLine`：`ctx.getLineIndex()` ≥ 0 取 `ctx.lines[index]`，否则 `folium.lyrics.getRecentCompletedLine` |
-| 129–141 | `readTheme`（含 `folium.theme.resolveFontStack`） |
-| 144–161 | `buildPayload` |
-| 164–188 | `refreshPlaySession`：换歌 / 从 stopped 重新开始才换 `playSessionId` |
-| 191–226 | `handleAction`：next / prev / toggle / set-volume（只收有限 number）/ set-loop |
-| 232–311 | `mountLyricWidget`：守卫、`syncData`（JSON 去重 + 失败清键 + 每个挂载周期只 warn 一次）、监听登记、卸载只撤监听 |
-| 313–323 | `activate`：`registries.visualizers.register` |
+### 6.4 持久化
 
-`mods/my-lyric-widget/main.cjs`
+- `userData/my-lyric-widget-state.json`：`{x, y, pinned, layout, open, surface}`
+  （1.3.0 只有前四项，多出来的键会被忽略，双向兼容）。
+- 设置由宿主保存在 `folia_folium_params_v1` 的 `lyric-widget` 分区；回滚到 1.3.0 后这些值仍在，
+  只是没人读，重新升级会自动生效。
 
-| 行 | 内容 |
-| --- | --- |
-| 1–37 | 文件头：数据流、约定 |
-| 40–68 | 常量：RPC 名、IPC 通道、窗口尺寸/边距、`HOST_EMPTY_GRACE_MS = 300`、`MAX_CRASH_RELOADS = 2`、`CRASH_RELOAD_WINDOW_MS = 60000`、`MAX_WIDGET_RECREATES = 3` |
-| 73–98 | `describeForLog`、`toFiniteNumber`、`nextLoopMode` |
-| 104–356 | `WIDGET_HTML`：样式 + 页面脚本（`render`、音量节流 `scheduleVolume`/`sendVolume`、`ipcRenderer.on(IPC_DATA)`） |
-| 358–375 | `activate` 内的 `state`（win / lastPayload / lastLoopMode / hostWindows / crashTimes / recreateAttempts / disposed） |
-| 378–392 | `sendActionToClient`（`api.rpc.send`，1.7 检查） |
-| 395–408 | `resolveLoopMode` |
-| 414–463 | `normalizeAction` |
-| 466–492 | `sendPayloadToWindow`、`onActionFromWindow` |
-| 495–607 | `placeWindow`、`createWidgetWindow`（窗口选项、开窗/导航拦截、`showInactive`、`did-finish-load` 补发、崩溃 reload、`loadURL` 失败销毁） |
-| 615–694 | 宿主窗口跟踪：`trackHostWindow` / `collectHostWindows` / `scheduleHostEmptyCheck` / `closeWidgetWindow` / `ensureWidgetWindow` / `onBrowserWindowCreated` |
-| 697–743 | `api.rpc.handle('update-data')`、`ipcMain.on`、`app.on('browser-window-created')`、`api.onDispose(dispose)`、首建窗口 |
+---
 
-## 5. 怎么验证
+## 7. 怎么验证
 
-1. `node --check mods/my-lyric-widget/client.mjs` 和 `node --check mods/my-lyric-widget/main.cjs`。
-2. `npm run folium:check -- my-lyric-widget`：应退出码 0，只有「没有 preview 图」「没有签名」两条 note。
-   它只读文件、不运行模组，改完 `mod.json` / 注册表名称 / 权限必须跑。
-3. 真机：`skills/run-desktop` 的驱动（`node skills/run-desktop/driver.mjs serve`，隔离 profile），
-   设置 → 模组打开「模组系统」→ 重载 → 启用 `my-lyric-widget` → 歌词动画选「悬浮歌词」。驱动用 `windows` 看悬浮窗、
-   `ss` 截图、主进程日志在 `test-results/run-desktop/main.log`（找 `[lyric-widget]`）。
-   **不要用 `npm run dev:electron`（真实 profile）。**
-4. 注意：当前会话沙箱里 Electron 起不来（`exited-without-window` / exitCode 2147483651），只做过 mock 冒烟。
+静态检查（沙箱里可跑）：
 
-## 6. 已知限制（都不是 bug，改之前先确认要不要改）
+```bash
+cd D:\folia-dev\folia-major
+npm run folium:check -- my-lyric-widget          # 期待 no problem found + 两条 note
+node --check mods/my-lyric-widget/main.cjs
+node --check mods/my-lyric-widget/client.mjs
+```
 
-- **必须选中「悬浮歌词」样式才同步**：`mount` 只在本样式选中时调用；切走后窗口冻在最后一帧。
-  想任意样式下都同步，现有 API 做不到（见迭代文档 §4.2）。
-- **导出窗口**：visualizer 注册必须保留，否则导出会报错停下；`mount` 在导出窗口/预览里早退，不推数据。
-  导出画面里本样式是空白，可考虑加 `hostLayers: { background: false, subtitles: false }`。
-- **`position` 是事件时刻的快照**，进度条要主进程自己外推。
-- **窗口安全配置是用户指定的**：`nodeIntegration: true`、`contextIsolation: false`、`sandbox: false`。
-  页面用 `textContent` 写歌词，**不要改成拼 HTML**。
-- **循环模式只有 off/all/one**（宿主没有随机），窗口显示 不循环 / 列表循环 / 单曲循环。
-- **窗口没有关闭入口**：用户关掉后，下一条数据到达时会重建；重建有次数上限（3 次），达上限后只 warn。
-- **macOS 也随宿主收窗**，原因是宿主 `app.on('activate')` 只在没有任何窗口时才重建主窗口。
-- **`muted` 只读**，没有 `set-muted` action。
-- **长歌词**：`26px` 单行 `nowrap`，超出省略号；窗口 600px 约 21 个汉字。
+真机（只能在 Folia 里做，沙箱起不了 Electron 的 GUI）：
 
-## 7. 下一步建议（按优先级）
+1. 连播 3 首歌（上一首听到后半段），看新歌第一句是否立刻出现、全程跟随 —— 这是 1.6.x 的卡死点。
+2. × 关掉 → 等两句 → 再打开，第一帧是否当前句；之后换歌是否继续。
+3. 字号 20 / 38 / 50 来回切，窗口高度与位置是否正确。
+4. 逐字 + 长句滚动同时开，染色是否跟着文字走、换句是否立即复位。
+5. 设置改形态 ↔ 窗口切换键高亮是否互相同步。
+6. 125% / 150% 缩放、双屏不同 DPI 下拖到副屏。
 
-1. **真机联调**（最高优先级）：用 `skills/run-desktop` 过一遍第 5 节第 3 步，重点看透明窗口、`require('electron')`、
-   拖动、按钮/音量是否真的发到播放器，主进程日志有没有 `[lyric-widget]` 警告。这是目前唯一没覆盖的大块。
-2. **长歌词自适应**：26px 单行截断；可按长度降字号或允许两行。
-3. **窗口位置持久化**：用 `api.storage`（需在 `mod.json` 加 `filesystem.data` 权限）记住用户拖到的位置；
-   顺便考虑右下角默认位置、穿透开关、窗口关闭按钮（目前都没有）。
-4. **进度条 / 时间**：需要主进程按 `position` + `duration` 外推，或轮询 `api.runtime.getPlaybackSnapshot()`（已声明 `playback.read`）。
-5. **逐字 / 卡拉 OK**：payload 里 `line.words` 已留位置，client 改为传 `line.words`；渲染时仍然只能用 `textContent`/DOM 节点，不能拼 HTML。
-6. **`set-muted`**：需要的话加 action，client 调 `folium.playback.setMuted`。
+回滚后的验证（1.3.0）：窗口 640×180、三态排版、长句截断、无 ×、无播放条按钮，属预期。
 
-## 8. 工作区注意事项
+---
 
-- 仓库根目录 `package-lock.json` 有一处 `peer` 标记挪动的改动，**不是本任务产生的**，不要当成自己的改动提交。
-- 仓库根目录的 `.cc-safety-net/` 是本机一个命令检查插件的项目级声明，与模组无关。
-- 模组目录里的 `.git` 是独立仓库，提交模组改动要在 `mods/my-lyric-widget` 里操作。
+## 8. 踩过的坑（别重复）
+
+1. **`settingsPanel` 必须是函数**（`FoliumMount`），传 `{ mount }` 对象会让 `settingsSections.register`
+   直接抛错，被 try/catch 吞掉后**整个设置分区消失**（1.6.0 的真机现象）。
+2. **宿主设置卡是二选一**：传了 `settingsPanel` 就不再渲染 schema 表单，做不到「上面自绘 + 下面表单」。
+3. **`progressButtons` 挂在 ShadowRoot 里**：`<style>` 必须注入按钮所在的 root，挂 `document.head` 全不生效（1.4.0 的白框 bug）。
+4. **设置文案必须是语言映射对象** `{ 'zh-CN': ..., en: ... }`，传字符串会被宿主整片丢弃。
+5. **拖拽区（`-webkit-app-region: drag`）吞鼠标事件**，页面收不到 hover，只能主进程轮询光标。
+6. **固定态整窗 `setIgnoreMouseEvents`** 时，命中判定靠页面报上来的按钮矩形（`pin-rect`），坐标用 `getContentBounds()`。
+7. **换歌时行号从 0 重来**，任何「按行号单调性」做的保护都必须带会话号，否则会吞掉新歌的所有帧（1.6.3 的卡死）。
+8. **不要改仓库根配置**（`package.json`、`main.js`、`vite.config.*`）；模组只动自己目录。
+9. **沙箱里 shell 写不进 `folia-major/`**（`Permission denied`），要写文件用编辑器 / `write` 工具；git 操作需要更高权限。
+10. **Electron GUI 在沙箱起不来**（`mojo ... platform_channel.cc Check failed: 拒绝访问`），一切窗口观感只能真机验。
+
+---
+
+## 9. 参考资料
+
+- `D:\folia-dev\1.3.0-vs-1.6.3-功能对比与风险.md` —— 两版功能差距、协议差异、已知/潜在 bug 清单
+- `D:\folia-dev\folia-major\mods\my-lyric-widget\docs\my-lyric-widget-iterations.md` —— 每轮改动与原因
+- `D:\folia-dev\folia-major\mods\README.md`、`docs/folium/api.md`、`mods/folium.d.ts` —— 宿主接口
