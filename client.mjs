@@ -60,8 +60,8 @@
  * 约定：
  *   - 快照里不含 song.ref：ref 只在当前渲染会话有效，主进程存下来会失效；跨歌用 source + id。
  *   - 真正的悬浮窗由 main.cjs 在 activate 时创建，这里只负责搬数据。
- *   - 句间（index -1）用 folium.lyrics.getRecentCompletedLine 保留上一句；
- *     连上一句都没有（如歌曲还没开始）时才发「等待播放...」。
+ *   - 句间也带行号（1.5.5）：resolveLineIndex 把「上一句已唱完」解析成那一句的下标，文本仍是上一句；
+ *     连上一句都没有（如歌曲还没开始）时才发 index -1 +「等待播放...」。
  *   - 导出窗口里没有播放页：只注册事件也不轮询，直接返回。
  */
 
@@ -109,7 +109,11 @@ const LOOP_MODES = ['off', 'all', 'one'];
 // 轮询周期：驱动「句内换行」这类没有事件的状态变化。100ms 足够让换句看起来是即时的，
 // 同时靠内容去重把真正的 IPC 频率压到最低（同一行每秒只发一次）。
 const POLL_MS = 100;
-
+// 1.5.5：位置跳变阈值（秒）。宿主只在拖动 > 1.5s 时发 playback.seeked，小拖动没有任何通知，
+// 而拖动后落在同一句里时去重键也和上一帧完全一样——画面就停在拖动前的状态。
+// 每轮轮询拿「上一帧位置 + 这段时间」推算该到哪，偏差超过这个值就当作位置跳变，补发一帧。
+// 0.75 秒：正常播放的推算误差只有几十毫秒，而宿主自己的拖动判定是 1.5 秒，这里留一半余量。
+const POSITION_JUMP_TOLERANCE_SEC = 0.75;
 // ---- 用户歌词偏移（自主路径自己复算） ----
 // 宿主主窗口把「已经算上用户偏移」的歌词时钟交给 mount 的 ctx.lyricTime，但没有对外暴露全局
 // 歌词时钟；不挂载时只能自己补回来。键名与算法严格照抄宿主源码：
@@ -218,15 +222,20 @@ const readSong = (song) => {
 
 /**
  * 当前行下标：宿主没有全局歌词时钟，只能用播放位置比对歌词时间。
- * 返回最后一个 startTime <= time 的行下标；已经过了该行 endTime（句间）时返回 -1，
- * 交给 getRecentCompletedLine 保留上一句。歌词按时间递增，但这里不假设顺序，直接全表取最大下标。
+ * 返回最后一个 startTime <= time 的行下标。两句之间（该句 endTime 已过）也会返回那一句，
+ * 不再返回 -1 —— 见 resolveLineIndex 的说明：句间帧必须带着行号，上下游才知道说的哪一句。
+ * 歌词按时间递增，但这里不假设顺序，直接全表取 startTime 最大的那一行。
  */
 const findApproximateLineIndex = (lines, time) => {
     if (!Array.isArray(lines) || lines.length === 0) return -1;
     let index = -1;
+    let latestStart = -Infinity;
     for (let i = 0; i < lines.length; i += 1) {
         const start = lines[i].startTime;
-        if (typeof start === 'number' && Number.isFinite(start) && start <= time) index = i;
+        if (typeof start === 'number' && Number.isFinite(start) && start <= time && start >= latestStart) {
+            latestStart = start;
+            index = i;
+        }
     }
     if (index < 0) return -1;
     const end = lines[index].endTime;
@@ -235,14 +244,34 @@ const findApproximateLineIndex = (lines, time) => {
 };
 
 /**
+ * 真正要显示的那一行（1.5.5）。
+ * 之前句间帧在 payload 里带的是 index -1 + 上一句的文本，主进程与页面都分辨不出「这一帧说的是哪一句」，
+ * 于是同一句会在句间、下一句开始时、往回拖时反复顶掉画面（日志里表现为某一句出现频率明显不对）。
+ * 现在统一解析成「有行号的那一行」：
+ *   - 该句已唱完（句间）时保留上一句，但 index 仍指向它，让上下游能按时间判断新旧；
+ *   - 只有什么都没得显示（第一句之前 / 无歌词）时才是 index -1 +「等待播放...」。
+ */
+const resolveLineIndex = (folium, lines, index, time) => {
+    if (index >= 0) return index;
+    const previous = folium.lyrics.getRecentCompletedLine(lines, index, time);
+    if (!previous) return -1;
+    if (typeof previous.index === 'number' && Number.isFinite(previous.index)) return previous.index;
+    // 宿主没给下标就自己找一次：取还没唱完、startTime 最大的那一句。
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const start = lines[i] && lines[i].startTime;
+        if (typeof start === 'number' && Number.isFinite(start) && start <= time) return i;
+    }
+    return -1;
+};
+
+/**
  * 当前歌词行；两句之间保留上一句，只有上一句也没有（如歌曲还没开始）时才给「等待播放...」。
+ * 调用方传进来的 index 已经是 resolveLineIndex 解析过的行号（句间也指向上一句），
+ * 只有「什么都没得显示」时才是 -1。
  */
 const readLine = (folium, lines, index, time) => {
     const safeLines = Array.isArray(lines) ? lines : [];
-    // 句间 index 为 -1：让宿主找出最后一句已结束的歌词，避免主进程窗口每句间隙闪一次等待文案。
-    const line = index >= 0
-        ? safeLines[index]
-        : folium.lyrics.getRecentCompletedLine(safeLines, index, time);
+    const line = index >= 0 ? safeLines[index] : null;
     if (!line) {
         // 没有当前行、也没有最近一句（第一句开始前 / 无歌词）时统一给等待文案；
         // 注意最后一句结束后 getRecentCompletedLine 仍返回最后一句，不会走到这里。
@@ -388,6 +417,10 @@ const createSyncEngine = (folium) => {
     let reportedSyncError = false;
     // 1.5.1：设置分区注册后挂上来（pushNow 不受 60ms 防抖约束）。request-config 靠它重推配置。
     let settingsPusher = null;
+    // 1.5.5：上一份快照里的播放位置与会话号，用来发现「位置突然跳变」——拖进度条时用。
+    let lastSentPosition = null;
+    let lastSentSession = null;
+    let lastSyncAt = 0;
 
     // rpc 是 Folium 1.7 才有的：老宿主上别让整个模组因为取不到成员而挂掉。
     const canReport = Boolean(folium.rpc && typeof folium.rpc.call === 'function');
@@ -416,7 +449,7 @@ const createSyncEngine = (folium) => {
         const lyricTime = playback.position - offsetSec;
         return {
             lines,
-            lineIndex: findApproximateLineIndex(lines, lyricTime),
+            lineIndex: resolveLineIndex(folium, lines, findApproximateLineIndex(lines, lyricTime), lyricTime),
             time: lyricTime,
             offsetSec,
             theme: cachedTheme,
@@ -450,18 +483,36 @@ const createSyncEngine = (folium) => {
             // 1.5.3：sentAt 同理——它是「这份快照是什么时候的」，每次都不一样；不固定的话去重键永远不同，
             // 快照就会每 100ms 全量重发一次（控制台刷屏、页面每帧重渲染）。
             const key = JSON.stringify(payload, (name, value) => (name === 'position' || name === 'sentAt' ? 0 : value));
-            if (!force && key === lastSentKey) return;
+            // 1.5.5：内容没变也要看一眼位置对不对得上。
+            // 宿主只在拖动幅度 > 1.5s 时才发 playback.seeked（src/mods/runtime/hostBridge.ts 的 SEEK_JUMP_SEC），
+            // 小拖动完全没通知；而拖动后停在「同一句」里时去重键也完全一样，画面就停在拖动前的状态。
+            // 这里按「上一帧位置 + 这段时间本该走过的时间」推算现在该到哪，偏太多了就当作位置跳变补发一帧。
+            // 往前拖、往回拖都要补；是否采纳由主进程按播放状态判断。
+            // 播放中位置才会自己往前走：暂停/不在播放时前后两帧位置理应相同，任何偏差都是拖动。
+            const now = Date.now();
+            const stepSec = payload.state === 'playing' ? Math.max(0, (now - lastSyncAt) / 1000) : 0;
+            const expectedPosition = lastSentPosition === null ? null : lastSentPosition + stepSec;
+            const drifted = lastSentSession === payload.playSessionId
+                && expectedPosition !== null
+                && Math.abs(payload.position - expectedPosition) > POSITION_JUMP_TOLERANCE_SEC;
+            lastSyncAt = now;
+            if (!force && key === lastSentKey && !drifted) return;
             lastSentKey = key;
+            lastSentPosition = payload.position;
+            lastSentSession = payload.playSessionId;
 
-            debugLog('[lyric-widget] syncData 发送', {
-                force,
-                state: payload.state,
-                title: payload.song && payload.song.title,
-                line: payload.line.text,
-                // 自己减掉的用户偏移（秒）。
-                offset: view.offsetSec,
-                session: payload.playSessionId,
-            });
+            if (DEBUG) {
+                debugLog('[lyric-widget] syncData 发送', {
+                    force,
+                    drifted,
+                    state: payload.state,
+                    title: payload.song && payload.song.title,
+                    line: payload.line.text,
+                    // 自己减掉的用户偏移（秒）。
+                    offset: view.offsetSec,
+                    session: payload.playSessionId,
+                });
+            }
 
             folium.rpc
                 .call(RPC_UPDATE, payload)

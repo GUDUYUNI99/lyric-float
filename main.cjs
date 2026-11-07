@@ -224,6 +224,9 @@ const WINDOW_MARGIN = 48;
 // 这些值的「真源」在宿主的模组设置里（client.mjs 用 settingsSections 声明表单），
 // client 每次变化都通过 folium.rpc.call('config', ...) 推给主进程；主进程只做校验、定尺寸、转给页面。
 const RPC_CONFIG = 'config';
+// 1.5.2：页面每画完一帧就把「已经画到哪」（行号 + 位置）从这条通道推上来，
+// 主进程据此把晚到的旧快照挡在页面前面。用 IPC 而不是 RPC：消息很轻，也不占 client 的 rpc 名字。
+const IPC_SHOWN_FRAME = 'my-lyric-widget:shown-frame';
 // 1.5.1：主进程 → client 的「重发一次配置」指令（和 request-sync 一样走 action 通道）。
 // 配置真源在 client 侧，而宿主「重载模组」在模组文件没变时不会重跑 client，只能由这边主动去要。
 const ACTION_REQUEST_CONFIG = 'request-config';
@@ -339,6 +342,9 @@ const MAX_WIDGET_RECREATES = 3;
 //   - 同一句内的小幅后退一律接受（事件时刻快照、播放器抖动都落在这里）。
 const REORDER_MAX_BACKSTEP = 1;
 const STALE_GUARD_MS = 800;
+// 1.5.5：位置跳变阈值（秒）。和 client.mjs 的同名常量保持一致——
+// 那边用它发现「拖动后内容没变、去重把它吃了」的帧并强制补发，这边用同一口径认出来、直接采纳。
+const POSITION_JUMP_TOLERANCE_SEC = 0.75;
 /** 行号：只认 ≥0 的整数，其余（句间、没有歌词行、字段缺失）一律按 -1 处理。 */
 const lineIndexOf = (payload) => {
     const line = payload && payload.line;
@@ -1053,6 +1059,21 @@ const applyLayoutButton = () => {
     }
 };
 
+/**
+ * 把「这一帧已经画到哪」报给主进程（1.5.2）。
+ * 主进程据此挡下晚到的旧快照——否则拖进度条 / 换歌时画面会闪回上一句。
+ * 报的是「真的画出来了的那一帧」，所以必须在 render 里、写完之后调。
+ */
+const reportShownFrame = (payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const line = payload.line || {};
+    ipcRenderer.send('${IPC_SHOWN_FRAME}', {
+        session: typeof payload.playSessionId === 'string' ? payload.playSessionId : '',
+        position: Number(payload.position) || 0,
+        lineIndex: Number.isFinite(line.index) ? line.index : -1,
+    });
+};
+
 const render = (payload, receivedAt) => {
     if (!payload || typeof payload !== 'object') return;
     // 1.5.1：同一个 payload 可能被重渲染多次（切排版、字体变了），第一次见到它时记下
@@ -1115,6 +1136,9 @@ const render = (payload, receivedAt) => {
         // 拖动过程中以滑块自己的值为准，别被回传的旧音量顶回去。
         setIcon(els.volumeIcon, volumeIconName(Number(els.volume.value)));
     }
+    // 1.5.2：这一帧真的画完了。报给主进程，让它知道页面已经显示到哪，
+    // 之后再有更靠前的旧快照发过来就可以直接挡掉（拖进度条 / 换歌时的闪回就是它造成的）。
+    reportShownFrame(payload);
 };
 
 // 宿主每次 setVolume 都会保存设置，所以拖动时最多每 150ms 发一次，松手再补最终值。
@@ -1565,6 +1589,103 @@ module.exports = function activate(api) {
         }
     };
 
+    /**
+     * 这一帧是不是「位置被直接跳了」（拖进度条 / 单曲循环回开头，1.5.5）。
+     * 判据只有位置跳变本身：和上一份快照同比，偏离超过 POSITION_JUMP_TOLERANCE_SEC。
+     * 不能靠「行号往回」来判断：正常播放换句时位置往前走、行号变大；真正会「行号往回」的只有
+     * 「用户拖回去了」和「旧帧迟到了」两种，后者归 isStaleFrame 管，所以跳变帧必须优先采纳。
+     * 暂停时位置本来就不该变，那里任何偏差都算跳变（用户暂停后拖动全靠这条）。
+     */
+    const isPositionJump = (previous, next) => {
+        if (!previous || !next) return false;
+        if (previous.playSessionId !== next.playSessionId) return false;
+        const before = positionOf(previous);
+        const after = positionOf(next);
+        if (before === null || after === null) return false;
+        if (before === after) return false;
+        // 播放中位置是连续推进的，只有跳得够远才算拖动；暂停/停住时位置应该完全不变，任何变化都是拖动。
+        if (previous.state === 'playing' && next.state === 'playing') {
+            return Math.abs(after - before) > POSITION_JUMP_TOLERANCE_SEC;
+        }
+        return true;
+    };
+
+    // ---- 1.5.2 页面帧顺序保护 ----
+    // 主进程发往页面的快照是异步的：IPC 排队、页面自己也在忙，先发的帧不保证先到。
+    // 拖进度条 / 换歌时这一点会在画面上「闪回」：晚到的旧句被画出来，把新句盖掉。
+    // isStaleFrame 只管住 state.lastPayload 这一条入口，管不住往页面的这条出口，所以在出口再挡一次：
+    //   - 页面每画完一帧就把「画到哪」推上来（IPC_SHOWN_FRAME），这是「页面已经显示到哪」的真值；
+    //   - 位置更靠前、行号还更靠后的帧一律不发（迟到的旧帧）；
+    //   - 真往回拖（> REORDER_MAX_BACKSTEP）和换会话一律放行；
+    //   - 连续挡了 STALE_GUARD_MS 说明判错了，放行一帧并重定基准，保证画面不会停住。
+    const shownGate = { session: undefined, position: null, lineIndex: -1, blockedSince: null };
+
+    /**
+     * 页面换了一个（首次加载 / 崩溃 reload / 重新建窗）：上一份页面报的「已显示到哪」全部作废。
+     * 必须清，否则新页面从「等待播放...」起画，而基准还停在上一个页面画过的靠后位置，
+     * 新页面第一帧就会被当成滞后快照挡掉，画面一直是空的。
+     */
+    const resetShownGate = () => {
+        shownGate.session = undefined;
+        shownGate.position = null;
+        shownGate.lineIndex = -1;
+        shownGate.blockedSince = null;
+    };
+
+    /** 页面画出一帧（握手那一帧 / 之后每次渲染）：记下「页面已经显示到哪」。 */
+    const noteShownFrame = (grid, frame) => {
+        if (!frame || typeof frame !== 'object') return;
+        const session = typeof frame.session === 'string' ? frame.session : '';
+        const position = toFiniteNumber(frame.position);
+        const lineIndex = toFiniteNumber(frame.lineIndex);
+        if (grid.session !== session) {
+            grid.session = session;
+            grid.position = position;
+            grid.lineIndex = lineIndex === null ? -1 : lineIndex;
+            grid.blockedSince = null;
+            return;
+        }
+        // 回报本身也可能乱序：只往前记，不让它把基准拖回旧位置。
+        if (position === null) return;
+        if (grid.position === null || position > grid.position) {
+            grid.position = position;
+            grid.lineIndex = lineIndex === null ? -1 : lineIndex;
+        }
+        grid.blockedSince = null;
+    };
+
+    /** 这一帧该不该挡在页面前面（页面已经显示到更靠后的位置了）。 */
+    const shouldHoldForPage = (grid, payload) => {
+        const session = payload && typeof payload.playSessionId === 'string' ? payload.playSessionId : '';
+        const position = positionOf(payload);
+        const lineIndex = lineIndexOf(payload);
+        if (grid.session !== session || grid.position === null || position === null) return false;
+        const regression = grid.position - position;
+        if (regression <= 0) return false;
+        // 真的往回拖了（超过同一句内的抖动）：用户要的就是更早那一句，放行。
+        // 但如果宿主说「正在播放」、行号却在退，而退的幅度不到 1 秒，这多半是延迟到达的旧帧
+        // （正常播放时行号只会往前），交给下面的挡帧分支按 800ms 兜底，画面不至于闪回去。
+        const movingForward = payload && payload.state === 'playing';
+        if (regression > REORDER_MAX_BACKSTEP && !movingForward) {
+            grid.position = position;
+            grid.lineIndex = Math.max(grid.lineIndex, lineIndex);
+            grid.blockedSince = null;
+            return false;
+        }
+        if (regression > REORDER_MAX_BACKSTEP) return false;
+        if (lineIndex < 0 || grid.lineIndex < 0 || lineIndex >= grid.lineIndex) return false;
+        if (grid.blockedSince === null) {
+            grid.blockedSince = Date.now();
+            return true;
+        }
+        // 挡太久了说明判错了（例如宿主时钟回跳），放行并重定基准。
+        if (Date.now() - grid.blockedSince < STALE_GUARD_MS) return true;
+        grid.position = position;
+        grid.lineIndex = lineIndex;
+        grid.blockedSince = null;
+        return false;
+    };
+
     /** 把最新快照交给窗口页面（窗口不在 / 已销毁 / 被 × 隐藏时丢弃）。 */
     const sendPayloadToWindow = (payload) => {
         // 1.4.0：隐藏期间不往页面推数据（页面还在，但没必要逐帧重绘不可见的内容）；
@@ -1578,6 +1699,16 @@ module.exports = function activate(api) {
         const contents = widgetWindow.webContents;
         if (!contents || contents.isDestroyed()) {
             api.log.info(LOG_PREFIX + ' 转发中止：webContents 不可用');
+            return;
+        }
+        // 1.5.2：页面已经显示到更靠后的一帧了，这一帧晚到，发过去只会让画面闪回去。
+        if (shouldHoldForPage(shownGate, payload)) {
+            api.log.info(LOG_PREFIX + ' 挡下滞后的快照（页面已经更靠后）', JSON.stringify({
+                position: positionOf(payload),
+                lineIndex: lineIndexOf(payload),
+                shownPosition: shownGate.position,
+                shownLineIndex: shownGate.lineIndex,
+            }));
             return;
         }
         try {
@@ -2073,6 +2204,9 @@ module.exports = function activate(api) {
         }
 
         widgetWindow.once('ready-to-show', () => {
+            // 1.5.2：窗口上屏走的是这条路，和 setWidgetOpen 的显示握手无关——
+            // 新页面上屏前它是「还没显示过任何一帧」的，基准必须一起清掉。
+            resetShownGate();
             // showInactive：悬浮歌词不该把键盘焦点从主窗口/别的应用抢走。
             // 1.4.0：上次退出时是「关掉」状态就别显示，窗口建好先留着（播放条「词」按钮随时叫醒）。
             if (!widgetWindow.isDestroyed() && state.widgetOpen) widgetWindow.showInactive();
@@ -2088,6 +2222,8 @@ module.exports = function activate(api) {
             // 1.5.0：字号 / 字体 / 外观配置。必须在第一帧快照之前下发，否则页面会按默认 38px
             // 先渲染一次、再跳成用户设的字号（一帧闪烁）。
             widgetWindow.webContents.send(IPC_CONFIG, state.config);
+            // 1.5.2：新页面还没显示过任何一帧，上一轮页面报的「已显示到哪」作废。
+            resetShownGate();
             if (state.lastPayload) sendPayloadToWindow(state.lastPayload);
             sendActionToClient({ action: 'request-sync' });
             // 1.5.1：页面准备好之后再要一次配置——reconcile 时页面与 client 的加载顺序无保证，
@@ -2273,6 +2409,31 @@ module.exports = function activate(api) {
             api.log.warn(LOG_PREFIX + ' update-data 收到非对象载荷，已忽略', describeForLog(payload));
             return;
         }
+        // 1.5.5：位置跳变帧（拖进度条）一律采纳，而且要放在帧门之前。
+        // 那个门是给「换歌时交错的旧帧」用的；用户主动拖了位置，就算行号看着在退也必须接受，
+        // 否则画面会停在拖动前的状态，直到位置自己爬回原处（日志里某一句反复出现就是这个）。
+        // 这里不能先 ensureWidgetWindow()：用户已经关掉悬浮窗时，「下一次快照到达就把它找回来」的做法
+        // 会让一次拖动把关掉的窗口又叫出来。窗口由下面的常路径按需创建即可。
+        if (isPositionJump(state.lastPayload, payload)) {
+            api.log.info(LOG_PREFIX + ' 采纳位置跳变帧', JSON.stringify({
+                state: payload.state,
+                from: state.lastPayload && state.lastPayload.position,
+                to: payload.position,
+            }));
+            // 两套门的基准一起重定：页面马上要显示这个新位置，旧基准留着只会误伤后面的帧。
+            frameGate.session = undefined;
+            frameGate.position = null;
+            frameGate.lineIndex = -1;
+            frameGate.droppingSince = null;
+            resetShownGate();
+            state.lastPayload = payload;
+            if (LOOP_MODES.includes(payload.loopMode)) {
+                state.lastLoopMode = payload.loopMode;
+            }
+            ensureWidgetWindow();
+            sendPayloadToWindow(payload);
+            return;
+        }
         // 迟到帧在进 state 之前就丢掉：lastPayload 只记真正更新的那一帧，页面重载补发也不会补到旧句。
         if (isStaleFrame(frameGate, payload)) {
             api.log.info(LOG_PREFIX + ' 丢弃迟到的旧帧', JSON.stringify({
@@ -2407,7 +2568,15 @@ module.exports = function activate(api) {
         return { pinned: state.pinned };
     });
 
+    /** 1.5.2：页面每画完一帧就会推一条「已经显示到哪」，记下来供出口挡滞后快照用。 */
+    const onShownFrameFromWindow = (event, frame) => {
+        if (!state.win || state.win.isDestroyed()) return;
+        if (event.sender !== state.win.webContents) return;
+        noteShownFrame(shownGate, frame);
+    };
+
     ipcMain.on(IPC_ACTION, onActionFromWindowDebug);
+    ipcMain.on(IPC_SHOWN_FRAME, onShownFrameFromWindow);
     ipcMain.on(IPC_DEBUG, onDebugFromWindow);
     ipcMain.on(IPC_PINNED, onPinnedFromWindow);
     ipcMain.on(IPC_PIN_RECT, onPinRectFromWindow);
@@ -2436,6 +2605,7 @@ module.exports = function activate(api) {
         app.removeListener('browser-window-created', onBrowserWindowCreated);
         try {
             ipcMain.removeListener(IPC_ACTION, onActionFromWindowDebug);
+            ipcMain.removeListener(IPC_SHOWN_FRAME, onShownFrameFromWindow);
             ipcMain.removeListener(IPC_DEBUG, onDebugFromWindow);
             ipcMain.removeListener(IPC_PINNED, onPinnedFromWindow);
             ipcMain.removeListener(IPC_PIN_RECT, onPinRectFromWindow);
