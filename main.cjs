@@ -1137,7 +1137,7 @@ const positionNowFrom = (payload, receivedAt) => {
 const MARQUEE_LEAD_IN = 1.2;
 const MARQUEE_TAIL = 0.15;
 const MARQUEE_MIN_SPEED = 60;   // 1.6.4 起不参与计算，留作语义常量（短溢出改由 MARQUEE_SCROLL_SECONDS 决定）
-const MARQUEE_MAX_SPEED = 380;
+const MARQUEE_MAX_SPEED = 190;
 const MARQUEE_MIN_SHRINK = 0.8;
 const MARQUEE_DEFAULT_SECONDS = 8;
 /**
@@ -1148,12 +1148,12 @@ const MARQUEE_DEFAULT_SECONDS = 8;
 const MARQUEE_MIN_OVERFLOW = 6;
 /**
  * 短溢出的最低速度保证（秒，1.6.4）。
- * 真机实测 1.6.4 第一版（0.5 秒最低时长 → 13px 用 26px/s 走半秒）用户仍然看不出在动，
- * 300ms 内只挪 5px 左右，和「没滚」没区别。改成按总可滚时长反推下限：
- * 不管溢出多小，都保证在一小段时间内走完 —— 13px 用 206px/s，0.06 秒就挪到位，
- * 手机上那个「唰」一下的短促位移反而最容易被看见。长句不受影响（剩余时间反推的速度更慢）。
+ * 真机历程：① 最初 13px 用 60px/s，0.22 秒走完 —— 看不出；② 改成 26px/s 走 0.5 秒 —— 300ms 只挪 5px，
+ * 还是看不出；③ 改成 206px/s 走 0.063 秒 —— 用户反馈「太快了，时间和速度都太快」。
+ * 现在取中间档：13px 用 65px/s 走 0.2 秒，位置变化 13px 能看见，节奏也不像弹一下。
+ * 长句不受影响（按剩余可唱时间反推的速度通常比这个更快）。
  */
-const MARQUEE_SCROLL_SECONDS = 0.063;
+const MARQUEE_SCROLL_SECONDS = 0.2;
 
 const marqueeTargets = [];
 let marqueeRaf = 0;
@@ -1279,11 +1279,12 @@ const measureMarquee = (state, availableSeconds) => {
         needed = overflow / budget;
     }
     state.max = overflow;
-    // 1.6.4：13px 用 60px/s 只要 0.22 秒就走完，真机上就是「明明滚了却完全看不出在动」。
-    // 速度 = max(剩余可唱时间反推, 按总可滚时长反推)，上限 MARQUEE_MAX_SPEED：
-    // 短溢出时后者更大（13px → 206px/s，0.06 秒挪到位，肉眼能看出「唰」了一下），长句时前者更大、速度不变。
+    // 1.6.6：短溢出按「保证走 MARQUEE_SCROLL_SECONDS 秒」反推下限，长句由剩余可唱时间反推的 needed 主导；
+    // 两者取慢的那个（滚动只为「让人读得完」，1.6.2 用户反馈偏快就是这个量纲），上限 MARQUEE_MAX_SPEED，
+    // 超出上限时上一段已经给这一句缩过字号了。
     const neededSlow = overflow / MARQUEE_SCROLL_SECONDS;
-    state.speed = Math.min(MARQUEE_MAX_SPEED, Math.max(needed, neededSlow));
+    const pace = Math.max(needed, neededSlow);
+    state.speed = Math.min(MARQUEE_MAX_SPEED, pace);
     state.offset = 0;
     state.delay = MARQUEE_LEAD_IN;
     state.done = false;
