@@ -875,7 +875,7 @@ const buildSettingsSection = () => ({
                 'Scrolls lines that do not fit; speed follows the remaining time of the line. When off, long lines are truncated with an ellipsis.',
             ),
             group: L('桌面歌词', 'Desktop lyric'),
-            defaultValue: false,
+            defaultValue: true,
         },
     ],
 });

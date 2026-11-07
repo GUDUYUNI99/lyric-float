@@ -49,9 +49,13 @@
  *     api.rpc.send('widget-visibility', { visible }) 推回 client 给按钮高亮。
  *     窗口右上角的 × 走 ipcRenderer.send('my-lyric-widget:close')，效果同样是隐藏（模组仍启用）。
  *     隐藏期间照收快照（记 lastPayload）但不转给页面；重新显示时补发最后一份并 request-sync。
- *   - 1.6.1 长句横向滚动（页内叫 marquee）：配置在 desktop.marquee，默认关闭，关着时行为与 1.5.x
- *     完全一致（长句尾部省略号截断）。开着时页面把歌词拆成「视口 + 轨道」两层，溢出才 translateX，
- *     速度按这一句剩余可唱时间反推，句首留白、滚到底交还居中，极端长句只对该句临时缩小字号。
+ *   - 1.6.1 长句横向滚动（页内叫 marquee）：配置在 desktop.marquee。开着时页面把歌词拆成
+ *     「视口 + 轨道」两层，溢出才 translateX，速度按这一句剩余可唱时间反推，句首留白、滚到底交还
+ *     居中，极端长句只对该句临时缩小字号；关掉时长句尾部省略号截断。
+ *   - 1.6.2 修「开不开都不滚」：视口原来只有 max-width:100% 的 auto 宽度（.lyric 是 flex 列 +
+ *     align-items:center），宽度会跟着内容撑到 608px 才封顶，于是 scrollWidth 恒等于 clientWidth、
+ *     溢出恒为 0，长句滚动永远不触发。视口改成 width:100% + box-sizing:border-box（固定占满一行），
+ *     滚动开关默认值改为开启。
  */
 'use strict';
 
@@ -266,7 +270,8 @@ const DEFAULT_CONFIG = {
         backdrop: false,
     },
     desktop: {
-        marquee: false,
+        // 1.6.2 起默认开启：用户要的就是「长句能读完」，默认关的话打开设置也看不出变化。
+        marquee: true,
     },
     window: {},
 };
@@ -285,7 +290,7 @@ const normalizeConfig = (raw) => {
     };
     if (!raw || typeof raw !== 'object') return config;
     const sharedSource = raw.shared && typeof raw.shared === 'object' ? raw.shared : raw;
-    // 1.6.1：desktop 段目前只有「长句滚动」一项；缺省即关，行为与 1.5.x 一致。
+    // 1.6.1：desktop 段目前只有「长句滚动」一项。1.6.2 起默认开启；只有明确给了 false 才关。
     const desktopSource = raw.desktop && typeof raw.desktop === 'object' ? raw.desktop : null;
 
     const fontSize = toFiniteNumber(sharedSource.fontSize);
@@ -575,8 +580,18 @@ const WIDGET_HTML = `<!DOCTYPE html>
         background: rgba(0, 0, 0, 0.35);
         padding: 33px 10px 0;
     }
-    .lyric-text {
+    .lyric-text,
+    .lyric-trans {
+        /* 1.6.2 起视口必须「占满一行」再裁切。
+           原来是 max-width:100% 的 auto 宽度（.lyric 是 flex 列 + align-items:center），
+           宽度会跟着内容一路撑到 608px 才封顶，于是 scrollWidth 永远等于 clientWidth、
+           overflow 恒为 0 → 长句滚动永远不会触发（真机上就是「开不开都不滚」）。
+           改成固定撑满：宽 = 一行可用宽度，超出部分才由 overflow:hidden 裁掉。 */
+        box-sizing: border-box;
+        width: 100%;
         max-width: 100%;
+        /* 字号只在这里给基准值；滚动系统临时缩字号时写在视口的行内 style 上，
+           行内样式优先级更高，缩完 resetMarquee 清掉就能回到基准。 */
         font-size: var(--lyric-size, 38px);
         font-weight: 600;
         line-height: 1.25;
@@ -586,6 +601,17 @@ const WIDGET_HTML = `<!DOCTYPE html>
         text-overflow: ellipsis;
         /* 窗口背景可能是任意壁纸（甚至纯白），所以歌词要自带一圈暗描边保证可读。 */
         text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 2px 12px rgba(0, 0, 0, 0.6);
+    }
+    /* 译文行单独覆盖字号与字重（原文见上面的合并规则）。 */
+    .lyric-trans {
+        font-size: var(--trans-size, 27px);
+        font-weight: 500;
+        line-height: 1.3;
+        text-align: center;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 2px 10px rgba(0, 0, 0, 0.55);
     }
     /* 1.6.1 长句滚动：视口（.lyric-text / .lyric-trans）负责裁切，轨道（.line-track）负责平移。 */
     .line-track {
@@ -609,18 +635,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
         will-change: auto;
         transform: none !important;
     }
-    /* 双语排版（原文 + 译文）里的大号译文：原文的 0.7 倍。38 * 0.7 = 26.6，向上取整 27px。 */
-    .lyric-trans {
-        max-width: 100%;
-        font-size: var(--trans-size, 27px);
-        font-weight: 500;
-        line-height: 1.3;
-        text-align: center;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 2px 10px rgba(0, 0, 0, 0.55);
-    }
+    /* 双语排版里的译文行：原文的 0.7 倍（38 * 0.7 = 26.6 → 27px），规则见上面的合并声明。 */
     .lyric-trans:empty,
     .lyric-trans[hidden] {
         display: none;
@@ -1022,7 +1037,8 @@ let config = {
         backdrop: false,
     },
     desktop: {
-        marquee: false,
+        // 1.6.2 起默认开启（与主进程 DEFAULT_CONFIG 一致）。
+        marquee: true,
     },
     window: {},
 };
@@ -1092,10 +1108,12 @@ const positionNowFrom = (payload, receivedAt) => {
 };
 
 /**
- * 1.6.1 长句滚动（「走马灯」）。默认关闭，设置里打开才生效；关着的时候长句照旧截断（尾部省略号）。
+ * 1.6.1 长句滚动（「走马灯」）。1.6.2 起默认开启；设置里关掉时长句照旧截断（尾部省略号）。
  *
  * - 视口（.lyric-text / .lyric-trans）负责裁切，轨道（.line-track）负责 translateX；
- * - 只有溢出（scrollWidth > clientWidth）才滚，短句完全静止，和以前一样；
+ *   视口必须固定成「一行可用宽度」（width:100%），否则宽度会跟着内容撑开、永远量不出溢出
+ *   ——1.6.1 真机上「开不开都不滚」就是这个原因，1.6.2 修的是这里；
+ * - 只有溢出（scrollWidth > clientWidth，超过 2px）才滚，短句完全静止，和以前一样；
  * - 速度按「本句剩余可唱时间」反推：句首留 MARQUEE_LEAD_IN 秒让人读完，句尾留 MARQUEE_TAIL 秒，
  *   速度夹在 MARQUEE_MIN_SPEED~MARQUEE_MAX_SPEED 之间（用户 1.6.2 真机反馈「偏快」，节奏以这里为准）；
  * - 需要的速度超过上限时，只对这一句临时缩小字号（最多缩到 80%）把溢出压下来，普通歌词永远原字号；
@@ -1210,17 +1228,20 @@ const measureMarquee = (state, availableSeconds) => {
     if (!viewport || !track || !track.scrollWidth) return;
     const baseSize = config.shared.fontSize || FONT_SIZE_DEFAULT;
     const budget = Math.max(0.9, availableSeconds - MARQUEE_LEAD_IN - MARQUEE_TAIL);
-    let overflow = track.scrollWidth - viewport.clientWidth;
+    const viewportWidth = viewport.clientWidth;
+    // 视口自己要是没有宽度（还没布局完、或被 display:none），量出来的「溢出」没有意义。
+    if (!viewportWidth) return;
+    let overflow = track.scrollWidth - viewportWidth;
     if (overflow <= 2) return;
     let needed = overflow / budget;
     if (needed > MARQUEE_MAX_SPEED) {
         // 极端长句：先只给这一句缩一点，把溢出压到「上限速度能滚完」的量级。
-        const allowedWidth = viewport.clientWidth + MARQUEE_MAX_SPEED * budget;
+        const allowedWidth = viewportWidth + MARQUEE_MAX_SPEED * budget;
         const ratio = Math.max(MARQUEE_MIN_SHRINK, allowedWidth / track.scrollWidth);
         viewport.style.fontSize = Math.round(baseSize * ratio) + 'px';
         state.shrinking = true;
-        // 改字号后必须重新取宽度，否则 max 还是旧值。
-        overflow = track.scrollWidth - viewport.clientWidth;
+        // 改字号后必须重新取宽度，否则 max 还是旧值；视口是 100% 宽的，缩字号不会改变它的宽度。
+        overflow = track.scrollWidth - viewportWidth;
         if (overflow <= 2) {
             // 缩小后已经放得下：不再滚，等同「这一句刚好够宽」。
             resetMarquee(state);
