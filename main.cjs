@@ -51,11 +51,16 @@
  *     隐藏期间照收快照（记 lastPayload）但不转给页面；重新显示时补发最后一份并 request-sync。
  *   - 1.6.1 长句横向滚动（页内叫 marquee）：配置在 desktop.marquee。开着时页面把歌词拆成
  *     「视口 + 轨道」两层，溢出才 translateX，速度按这一句剩余可唱时间反推，句首留白、滚到底交还
- *     居中，极端长句只对该句临时缩小字号；关掉时长句尾部省略号截断。
+ *     居中，极端长句只对该句临时缩小字号；关掉时长句尾部省略号截断（默认开启，同 1.6.3）。
  *   - 1.6.2 修「开不开都不滚」：视口原来只有 max-width:100% 的 auto 宽度（.lyric 是 flex 列 +
  *     align-items:center），宽度会跟着内容撑到 608px 才封顶，于是 scrollWidth 恒等于 clientWidth、
  *     溢出恒为 0，长句滚动永远不触发。视口改成 width:100% + box-sizing:border-box（固定占满一行），
  *     滚动开关默认值改为开启。
+ *   - 1.6.3 继续修「还是不滚」：①轨道 .line-track 补 font:inherit（字体/字重一旦和视口不一致，
+ *     量出来的宽度就对不上实际显示）；②渲染后分两拍量（同帧量的 scrollWidth 可能还是等待文案的宽度），
+ *     下一帧补量一次；③applyConfig 里先强制一次同步排版再量（配置常比首帧先到）；
+ *     ④速度改用「现在」的位置而不是快照里的旧位置算剩余时间；⑤溢出阈值保持 6px
+ *     （相当于「刚好放得下」的余量），超过就按剩余时间反推速度滚。
  */
 'use strict';
 
@@ -592,6 +597,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
         max-width: 100%;
         /* 字号只在这里给基准值；滚动系统临时缩字号时写在视口的行内 style 上，
            行内样式优先级更高，缩完 resetMarquee 清掉就能回到基准。 */
+        font-family: inherit;
         font-size: var(--lyric-size, 38px);
         font-weight: 600;
         line-height: 1.25;
@@ -617,6 +623,9 @@ const WIDGET_HTML = `<!DOCTYPE html>
     .line-track {
         display: inline-block;
         white-space: nowrap;
+        /* 1.6.3：字体要跟着视口走。轨道上只要有任一条规则让它丢了 font-family，
+           量出来的宽度就和实际显示的字宽对不上（量出来偏窄 → 溢出偏小甚至为 0 → 不滚）。 */
+        font: inherit;
         will-change: transform;
     }
     /* 滚动中改成左对齐：从句子开头读起，滚到最后一段时刚好停在眼眶里。
@@ -1082,6 +1091,10 @@ const applyConfig = (next) => {
     // 1.6.1 长句滚动开关：先挂类让 CSS 立刻生效，再按新字号重排这一句的滚动。
     // 关掉时 remeasureLyrics 里的 resetMarquee 会把平移和临时字号一并清掉。
     document.body.classList.toggle('marquee-off', !marqueeEnabled());
+    // 量宽度之前必须先把这一帧的布局做实：配置可能比首帧到得早，这时页面还没排过版，
+    // clientWidth / scrollWidth 全是最初那一下的值（往往是 0 或等待文案的宽度），
+    // 量出来的滚动量就是错的。强制一次同步排版再量。
+    void document.body.offsetHeight;
     remeasureLyrics();
 };
 
@@ -1126,6 +1139,12 @@ const MARQUEE_MIN_SPEED = 60;
 const MARQUEE_MAX_SPEED = 380;
 const MARQUEE_MIN_SHRINK = 0.8;
 const MARQUEE_DEFAULT_SECONDS = 8;
+/**
+ * 溢出少于这么多像素就当作「这一句刚好放得下」，不滚（1.6.3）。
+ * 「放得下」要留一点余量：中文行末的字挤在裁切边上很难看，所以阈值不是一个字宽，
+ * 而是一点点（6px）—— 差半个字也算溢出，按最低速度平移一下，肉眼能看出在动。
+ */
+const MARQUEE_MIN_OVERFLOW = 6;
 
 const marqueeTargets = [];
 let marqueeRaf = 0;
@@ -1232,7 +1251,8 @@ const measureMarquee = (state, availableSeconds) => {
     // 视口自己要是没有宽度（还没布局完、或被 display:none），量出来的「溢出」没有意义。
     if (!viewportWidth) return;
     let overflow = track.scrollWidth - viewportWidth;
-    if (overflow <= 2) return;
+    // 1.6.3：阈值 6px 只当「刚好放得下」的余量用。为负说明根本不长，直接不滚。
+    if (overflow < MARQUEE_MIN_OVERFLOW) return;
     let needed = overflow / budget;
     if (needed > MARQUEE_MAX_SPEED) {
         // 极端长句：先只给这一句缩一点，把溢出压到「上限速度能滚完」的量级。
@@ -1242,7 +1262,7 @@ const measureMarquee = (state, availableSeconds) => {
         state.shrinking = true;
         // 改字号后必须重新取宽度，否则 max 还是旧值；视口是 100% 宽的，缩字号不会改变它的宽度。
         overflow = track.scrollWidth - viewportWidth;
-        if (overflow <= 2) {
+        if (overflow < MARQUEE_MIN_OVERFLOW) {
             // 缩小后已经放得下：不再滚，等同「这一句刚好够宽」。
             resetMarquee(state);
             return;
@@ -1260,10 +1280,17 @@ const measureMarquee = (state, availableSeconds) => {
 
 /** 一句还剩多少秒（用于算滚动速度）；非播放中或没有时间戳时给一个宽裕值。 */
 const secondsLeftForLine = (line, payload) => {
-    const end = line && Number(line.endTime);
-    const position = payload && Number(payload.position);
-    if (Number.isFinite(end) && Number.isFinite(position) && end > position) return end - position;
-    return MARQUEE_DEFAULT_SECONDS;
+    const end = Number(line && line.endTime);
+    // 1.6.3：位置取「现在」，不是快照里那个时刻的位置。config 变化后的重量、下一拍补量都会走到这里，
+    // 用快照的旧 position 会把剩余时间算长（滚动变慢），甚至算成负数。
+    const position = positionNowFrom(payload, lastPayloadReceivedAt);
+    if (!Number.isFinite(end) || !Number.isFinite(position)) return MARQUEE_DEFAULT_SECONDS;
+    const left = end - position;
+    // 只有「还没唱完」才用剩余时间反推速度。句间、刚换句时 endTime 可能已经过去（剩余为负），
+    // 或时间戳缺失 —— 这时如果按 0 秒算，预算会被夹到下限 0.9 秒，速度直接顶到 380px/s 上限，
+    // 肉眼就是「闪一下就没了」。所以一律回落到 8 秒这个宽裕值。
+    if (!(left > 0)) return MARQUEE_DEFAULT_SECONDS;
+    return left;
 };
 
 /** 歌词内容 / 宽度 / 字号变化后重新量一次（换句、改设置、窗口 resize）。 */
@@ -1345,7 +1372,26 @@ const render = (payload, receivedAt) => {
 
     // 1.6.1 长句滚动：内容写完、布局稳定之后再量（量的是 scrollWidth，必须等这次写入生效）。
     // 换句会立刻复位重排，滚动不排队、不阻塞下一次渲染。
+    // 1.6.3 起分两拍量：同一帧里刚写进去的文本，scrollWidth 要等样式重算；
+    // 有些字体在这个时刻量出来的宽度还只是「等待文案」那么宽 → 溢出算成 0，长句就不滚。
+    // 先按当下量一次（大多数情况就已经准了），下一帧再量一次兜底。
     remeasureLyrics();
+    // 排查日志（定位完删）：把真实量到的宽度打出来，用来确认「溢出到底是多少」。
+    const debugRect = els.line.getBoundingClientRect();
+    debugToMain(
+        'measure: text="' + els.lineTrack.textContent + '"' +
+        ' textW=' + els.lineTrack.scrollWidth +
+        ' viewW=' + els.line.clientWidth +
+        ' rectW=' + Math.round(debugRect.width) +
+        ' font=' + getComputedStyle(els.line).fontSize +
+        ' marquee=' + marqueeEnabled(),
+    );
+    requestAnimationFrame(() => {
+        // 这一帧里如果又换句了，就不要用量到的旧结果覆盖新句的滚动。
+        if (lastPayload !== payload) return;
+        remeasureLyrics();
+        debugToMain('measure2: textW=' + els.lineTrack.scrollWidth + ' viewW=' + els.line.clientWidth);
+    });
 
     const playing = payload.state === 'playing';
     setIcon(els.toggle, playing ? 'pause' : 'play');
