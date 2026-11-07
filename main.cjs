@@ -61,7 +61,12 @@
  *     下一帧补量一次；③applyConfig 里先强制一次同步排版再量（配置常比首帧先到）；
  *     ④速度改用「现在」的位置而不是快照里的旧位置算剩余时间；⑤溢出阈值保持 6px
  *     （相当于「刚好放得下」的余量），超过就按剩余时间反推速度滚。
+ *   - 1.6.7 区分「没歌词」和「还没到第一句」：payload 新增 lineStatus（见 client.mjs 文件头），
+ *     页面用 lyricTextOf 挑文案 —— 有歌在播且歌词为空超过 1.5 秒显示「此歌曲暂无歌词」，
+ *     有歌词但还没到第一句显示「……」，歌词还在加载（切歌后的短暂空窗）仍是「等待播放...」。
+ *     同时删掉 1.6.3–1.6.6 的 measure 排查日志。
  */
+
 'use strict';
 
 const { app, BrowserWindow, ipcMain, screen } = require('electron');
@@ -998,6 +1003,9 @@ const setButtonLabel = (el, label) => {
 
 const LOOP_TITLES = { off: '不循环', all: '列表循环', one: '单曲循环' };
 const WAITING_TEXT = '${WAITING_TEXT}';
+// 1.6.7：没有可显示歌词时的两种提示（数据侧由 client 的 lineStatus 判定，见 client.mjs 的 readLineStatus）。
+const NO_LYRIC_TEXT = '此歌曲暂无歌词';
+const UPCOMING_TEXT = '……';
 
 /** 音量图标按档位切换，规则同播放器的音量按钮：静音/0 → 叉，<50% → 一格，其余 → 两格。 */
 const volumeIconName = (percent) => {
@@ -1342,6 +1350,24 @@ const reportShownFrame = (payload) => {
     });
 };
 
+/**
+ * 这一帧该显示什么文字（1.6.7）。
+ * 只有两种情况要换掉快照里的 line.text：
+ *   - 确认这首歌没有歌词（lineStatus === 'none'）：显示「此歌曲暂无歌词」
+ *   - 有歌词但还没到第一句（'upcoming'，前奏）：显示省略号
+ * 其余一律用 line.text —— 空字符串也是合法文本（只有翻译、没有原文的行）。
+ * 「没选中歌 / 已停止」时不谈「没有歌词」，仍显示「等待播放...」。
+ */
+const lyricTextOf = (payload) => {
+    const line = (payload && payload.line) || {};
+    const status = payload && payload.lineStatus;
+    const hasSong = Boolean(payload && payload.song);
+    const notStopped = Boolean(payload) && payload.state !== 'stopped';
+    if (hasSong && notStopped && status === 'none') return NO_LYRIC_TEXT;
+    if (hasSong && status === 'upcoming') return UPCOMING_TEXT;
+    return typeof line.text === 'string' ? line.text : WAITING_TEXT;
+};
+
 const render = (payload, receivedAt) => {
     if (!payload || typeof payload !== 'object') return;
     // 1.5.1：同一个 payload 可能被重渲染多次（切排版、字体变了），第一次见到它时记下
@@ -1360,8 +1386,8 @@ const render = (payload, receivedAt) => {
         ' line="' + (line.text || '') + '"' +
         ' title="' + ((payload.song && payload.song.title) || '') + '"',
     );
-    // 空字符串是合法的行文本（只有翻译、没有原文的行），不要退回「等待播放...」。
-    els.lineTrack.textContent = typeof line.text === 'string' ? line.text : WAITING_TEXT;
+    // 1.6.7：没歌词 / 还没到第一句时换文案；其余（含空字符串）都用快照里的文本。
+    els.lineTrack.textContent = lyricTextOf(payload);
     // 暂停变淡要知道播放状态；只认 playing，其他都当暂停。
     document.body.dataset.playback = typeof payload.state === 'string' ? payload.state : 'paused';
     // 跟随主题字体：冷启动时配置比首帧先到（那时还没有 theme），所以每次快照都再对一次。
@@ -1390,21 +1416,12 @@ const render = (payload, receivedAt) => {
     // 有些字体在这个时刻量出来的宽度还只是「等待文案」那么宽 → 溢出算成 0，长句就不滚。
     // 先按当下量一次（大多数情况就已经准了），下一帧再量一次兜底。
     remeasureLyrics();
-    // 排查日志（定位完删）：把真实量到的宽度打出来，用来确认「溢出到底是多少」。
-    const debugRect = els.line.getBoundingClientRect();
-    debugToMain(
-        'measure: text="' + els.lineTrack.textContent + '"' +
-        ' textW=' + els.lineTrack.scrollWidth +
-        ' viewW=' + els.line.clientWidth +
-        ' rectW=' + Math.round(debugRect.width) +
-        ' font=' + getComputedStyle(els.line).fontSize +
-        ' marquee=' + marqueeEnabled(),
-    );
+    // 1.6.3–1.6.6 曾在这里打两拍 measure 日志（textW / viewW / rectW / font）用来看溢出到底多少；
+    // 1.6.5 的真机日志（textW=619 viewW=606）已经确认测量正确，1.6.7 起删掉，避免每条快照都往日志里写一行。
     requestAnimationFrame(() => {
         // 这一帧里如果又换句了，就不要用量到的旧结果覆盖新句的滚动。
         if (lastPayload !== payload) return;
         remeasureLyrics();
-        debugToMain('measure2: textW=' + els.lineTrack.scrollWidth + ' viewW=' + els.line.clientWidth);
     });
 
     const playing = payload.state === 'playing';

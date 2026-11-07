@@ -33,6 +33,11 @@
  *     },
  *     sentAt: number,          // 1.5.1：这份快照的发送时刻（epoch ms，和主进程 Date.now() 同源）；
  *                              // position 只在这一刻成立，页面推算「现在」必须用它
+ *     lineStatus,             // 1.6.7：这一帧「为什么没有可显示的歌词」，页面据此换文案
+ *                              //   'ready'    正常有行可显示（line.text 就是该显示的文本）
+ *                              //   'upcoming' 有歌词，但还没到第一句（前奏）：页面显示「……」
+ *                              //   'loading'  一首歌刚切过来、歌词还在加载：页面仍显示「等待播放...」
+ *                              //   'none'     确认这首歌没有歌词：页面显示「此歌曲暂无歌词」
  *     theme: {                 // 宿主没有全局主题读取接口，只有 theme.changed 之后才有值，
  *       name, isDaylight, backgroundColor, primaryColor, accentColor, secondaryColor,
  *       fontStyle, fontStack,  // 否则为 null，由 main.cjs 用默认样式兜底
@@ -104,6 +109,9 @@ const FONT_SIZE_OPTIONS = Array.from({ length: FONT_SIZE_MAX - FONT_SIZE_MIN + 1
     };
 });
 const WAITING_LINE_TEXT = '等待播放...';
+// 1.6.7：「这首歌没有歌词」的防抖。宿主刚切歌时 getLines() 会有一小会儿是空数组（歌词还在加载），
+// 直接判「没有歌词」会让慢加载的歌先闪一下错误文案。空数组要持续这么久才认定为「确实没有歌词」。
+const EMPTY_LYRIC_DEBOUNCE_MS = 1500;
 const LOOP_MODES = ['off', 'all', 'one'];
 
 // 轮询周期：驱动「句内换行」这类没有事件的状态变化。100ms 足够让换句看起来是即时的，
@@ -334,6 +342,8 @@ const buildPayload = (folium, view, playSessionId) => {
         muted,
         loopMode: folium.playback.getLoopMode(),
         line: readLine(folium, view.lines, view.lineIndex, view.time),
+        // 1.6.7：页面据此区分「等待播放 / 歌词还在加载 / 这首歌没歌词 / 还没到第一句」。
+        lineStatus: view.lineStatus,
         theme: readTheme(folium, view.theme),
         // 这份 position 是「什么时候」的位置。页面在配置变化后要用旧快照重渲染，只有靠它才能
         // 把「上次内容变化那一刻的位置」换算成「现在」（见 main.cjs 页面的 positionNowFrom）。
@@ -427,6 +437,10 @@ const createSyncEngine = (folium) => {
     let lastSentPosition = null;
     let lastSentSession = null;
     let lastSyncAt = 0;
+    // 1.6.7：歌词为空时的防抖起点。记录「从什么时候开始、哪一首歌的歌词是空的」，
+    // 换歌或歌词回来都要重新计时，避免慢加载的歌先闪一下「暂无歌词」。
+    let emptyLyricSince = 0;
+    let emptyLyricSongKey = null;
 
     // rpc 是 Folium 1.7 才有的：老宿主上别让整个模组因为取不到成员而挂掉。
     const canReport = Boolean(folium.rpc && typeof folium.rpc.call === 'function');
@@ -443,6 +457,26 @@ const createSyncEngine = (folium) => {
     };
 
     /**
+     * 这一帧「为什么没有可显示的歌词」（1.6.7）。页面只用它换文案，不参与任何判断。
+     *   - 有歌词但还没到第一句（前奏 / 第一句之前）：'upcoming' → 页面显示「……」
+     *   - 歌词数组为空：刚切歌时先当 'loading'（空数组持续不到防抖时长），
+     *     超过 EMPTY_LYRIC_DEBOUNCE_MS 仍为空才认定 'none'（这首歌确实没有歌词）
+     *   - 其余都是 'ready'
+     */
+    const readLineStatus = (playback, lines, lineIndex) => {
+        if (lines.length > 0) return lineIndex >= 0 ? 'ready' : 'upcoming';
+        const now = Date.now();
+        const songKey = playback.song ? getSongKey(playback.song) : '';
+        if (emptyLyricSongKey !== songKey || emptyLyricSince === 0) {
+            emptyLyricSongKey = songKey;
+            emptyLyricSince = now;
+        }
+        // 没歌可播（没选中歌 / 已停止）时不谈「没有歌词」，那是「等待播放」的语义。
+        if (!playback.song) return 'ready';
+        return now - emptyLyricSince >= EMPTY_LYRIC_DEBOUNCE_MS ? 'none' : 'loading';
+    };
+
+    /**
      * 当前视图：全部来自全局 API。
      * 行号 = 播放位置 - 用户歌词偏移，再与歌词 startTime / endTime 比对。
      */
@@ -453,9 +487,16 @@ const createSyncEngine = (folium) => {
             : [];
         const offsetSec = readLyricOffsetSeconds(playback.song);
         const lyricTime = playback.position - offsetSec;
+        const lineIndex = resolveLineIndex(folium, lines, findApproximateLineIndex(lines, lyricTime), lyricTime);
+        // 歌词回来了就把防抖计时清零，下一首从零开始算。
+        if (lines.length > 0) {
+            emptyLyricSince = 0;
+            emptyLyricSongKey = null;
+        }
         return {
             lines,
-            lineIndex: resolveLineIndex(folium, lines, findApproximateLineIndex(lines, lyricTime), lyricTime),
+            lineIndex,
+            lineStatus: readLineStatus(playback, lines, lineIndex),
             time: lyricTime,
             offsetSec,
             theme: cachedTheme,
