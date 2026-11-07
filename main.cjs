@@ -96,6 +96,9 @@ const PIN_HIT_PADDING = 2;
 // 显示握手：主进程等页面回 IPC_SHOWN 的最长时间（页面 400ms 兜底回信，这里再留余量）。
 // 等不到就照常上屏——宁可闪一下，「词」按钮点了没反应更糟。
 const SHOWN_TIMEOUT_MS = 800;
+// 页面侧等「显示中之后的第一帧」最多等多久（ms）：等不到就用现有画面回信，宁可闪一下也不能不上屏。
+// 这个值写进页面模板，页面脚本里直接用它（曾经漏过模板插值，页面侧变成未定义变量、握手直接报错）。
+const SHOWN_FRAME_WAIT_MS = 400;
 // 右上角 ×（1.4.0，页面→主进程）：只隐藏悬浮窗，不停用模组。重新显示走播放条上的「词」按钮。
 const IPC_CLOSE = 'my-lyric-widget:close';
 // 1.5.1 显示握手（解决「× 关掉再打开时先闪一下旧画面」）：
@@ -1178,27 +1181,45 @@ els.layout.addEventListener('click', () => {
 // 以前的做法是「主进程先 showInactive，再补发快照等纠正」，第一帧上的是页面里残留的旧画面，
 // 所以会闪一下前面的句子 / 当前句的旧高亮。现在改成三段式：
 //   ① 主进程 hide 之后窗口一直保持 ignore-mouse，客户端根本点不到它；
-//   ② 要显示时先发 IPC_SHOW：页面先把控制器标成「显示中」（按钮点亮、鼠标穿透全窗，看见也点不到），
-//      同时请求 client 绕过去重发一帧当下这一句，记下这一刻的帧号；
-//   ③ 页面画完、并且等到一帧不早于「显示中」那一刻的快照之后，才回 IPC_SHOWN，主进程这时才
-//      showInactive：上屏的第一帧就是当下这一句，不会先露出旧的。
-// 兜底：主进程 800ms 等不到回信照常上屏；页面 400ms 等不到新帧就用现有画面回信（结果和旧版一样）。
+//   ② 要显示时先发 IPC_SHOW：页面把控制器标成「显示中」，同时请求 client 绕过去重发一帧
+//      当下这一句，并记下这一刻的帧号；
+//   ③ 页面画完「显示中」之后的第一帧、并且把整窗按「显示中」铺好底（body.showing）之后，才回
+//      IPC_SHOWN；主进程收到回信才 showInactive：上屏的第一帧就是当下这一句，底子也已经是好的。
+// 1.5.6：铺底这一环是补窗口的坑 —— hide() 再 showInactive() 出来的那一刻，窗口是**全透明**的，
+//        悬停轮询要等下一跳（最多 80ms）才发现光标在窗口上、把 body.hover 挂上。这几十毫秒里
+//        歌词已经画好、底子却是空的，就是用户说的「当前句先闪一下再正常」。
+//        所以铺底从「显示中」一直留到上屏之后的第一帧快照（releaseShownStyle 才撤），
+//        中间那段「收到回信 → showInactive」的空窗也不会露出空底子。
+// 兜底：主进程 800ms 等不到回信照常上屏；页面 400ms 等不到新帧就用现有画面走完上面两步。
 let showMark = null;
 let shownPending = false;
 let showTimer = null;
+// 1.5.6 铺底：applyShownStyle 挂上 body.showing（底色 + 控制条提前展开），
+// releaseShownStyle 在上屏之后的第一帧快照里撤掉，交还给悬停规则。
+const applyShownStyle = () => {
+    document.body.classList.add('showing');
+};
+// 上屏已经完成、快照也画上去了：这时才把铺底撤掉，交还给悬停规则（见 IPC_DATA 监听）。
+const releaseShownStyle = () => {
+    if (shownPending) return;
+    document.body.classList.remove('showing');
+};
+
 const flushShown = () => {
     if (showTimer) {
         clearTimeout(showTimer);
         showTimer = null;
     }
     shownPending = false;
-    document.body.classList.remove('showing');
     ipcRenderer.send('${IPC_SHOWN}');
 };
 const syncShownState = () => {
     if (!shownPending || !showMark || !showMark.rendered) return;
     // 还停在「显示中」那一刻之前的快照：等下一帧到了再回信，否则上屏的会是旧画面。
-    if (lastPayloadFrame < showMark.frame) return;
+    const renderedFrame = Number.isFinite(showMark.renderedFrame) ? showMark.renderedFrame : lastPayloadFrame;
+    if (renderedFrame < showMark.frame) return;
+    // 1.5.6：回信之前先把这一帧的底子铺好（正常路径 C），主进程收到 IPC_SHOWN 就立刻 showInactive。
+    applyShownStyle();
     flushShown();
 };
 // 主进程在页面加载完后推来上次的排版选择（值不合法就保持默认的 text）。
@@ -1212,11 +1233,18 @@ ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
 ipcRenderer.on('${IPC_SHOW}', () => {
     shownPending = true;
     showMark = { frame: payloadFrame + 1, rendered: false };
+    // 先把旧画面压住（窗口还没上屏，这一步是防「万一露出来」和「同步 render 重绘后空一帧」）。
+    applyShownStyle();
     // 控制器标成「显示中」：按钮立刻点亮；同时整窗先穿透（窗口还没上屏，万一在握手期间露出来
     // 也不能吃点击；上屏后主进程会把穿透状态改回真实的，见 ignore-hint）。
-    document.body.classList.add('showing');
     ipcRenderer.send('${IPC_IGNORE_HINT}', true);
-    showTimer = setTimeout(flushShown, SHOWN_FRAME_WAIT_MS);
+    // 兜底：400ms 等不到新帧就用现有画面回信（回信前同样先铺底）。
+    showTimer = setTimeout(() => {
+        showTimer = null;
+        if (!shownPending) return;
+        applyShownStyle();
+        flushShown();
+    }, ${SHOWN_FRAME_WAIT_MS});
 });
 applyLayoutButton();
 
@@ -1337,12 +1365,21 @@ els.volume.addEventListener('lostpointercapture', stopVolumeDragging);
 
 ipcRenderer.on('${IPC_DATA}', (event, payload) => {
     payloadFrame += 1;
+    const frameNo = payloadFrame;
     render(payload, Date.now());
-    lastPayloadFrame = payloadFrame;
+    lastPayloadFrame = frameNo;
+    // 1.5.6：回信的判据必须是「标记之后画完的那一帧」，不能是同步处理前的帧号。
+    // 原来先把全局帧号写进去再判，帧号比较恒为假，于是「显示中」那一刻残留的旧画面
+    // 也会被当成合格帧回信 → 上屏还是一闪旧句。
+    if (showMark) showMark.renderedFrame = frameNo;
     // 1.5.2：画完了再看这次显示握手能不能回信（要等的是「显示中」那一刻之后的帧）。
     if (shownPending && showMark) {
         showMark.rendered = true;
         syncShownState();
+    } else if (showMark) {
+        // 1.5.6：握手已经完成（回信已发），这一帧到达说明主进程已按回信上屏过：现在才撤铺底。
+        showMark = null;
+        releaseShownStyle();
     }
 });
 // 主进程在页面加载完后推来当前配置（字号 / 字体 / 外观），之后每次设置变化都会再推。
