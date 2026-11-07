@@ -2,7 +2,7 @@
   "folium": 1,
   "id": "my-lyric-widget",
   "name": "独立悬浮歌词",
-  "version": "1.5.6",
+  "version": "1.6.1",
   "description": "",
   "permissions": [
     "playback.control",

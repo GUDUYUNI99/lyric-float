@@ -49,6 +49,9 @@
  *     api.rpc.send('widget-visibility', { visible }) 推回 client 给按钮高亮。
  *     窗口右上角的 × 走 ipcRenderer.send('my-lyric-widget:close')，效果同样是隐藏（模组仍启用）。
  *     隐藏期间照收快照（记 lastPayload）但不转给页面；重新显示时补发最后一份并 request-sync。
+ *   - 1.6.1 长句横向滚动（页内叫 marquee）：配置在 desktop.marquee，默认关闭，关着时行为与 1.5.x
+ *     完全一致（长句尾部省略号截断）。开着时页面把歌词拆成「视口 + 轨道」两层，溢出才 translateX，
+ *     速度按这一句剩余可唱时间反推，句首留白、滚到底交还居中，极端长句只对该句临时缩小字号。
  */
 'use strict';
 
@@ -262,7 +265,9 @@ const DEFAULT_CONFIG = {
         pausedDim: false,
         backdrop: false,
     },
-    desktop: {},
+    desktop: {
+        marquee: false,
+    },
     window: {},
 };
 
@@ -280,6 +285,8 @@ const normalizeConfig = (raw) => {
     };
     if (!raw || typeof raw !== 'object') return config;
     const sharedSource = raw.shared && typeof raw.shared === 'object' ? raw.shared : raw;
+    // 1.6.1：desktop 段目前只有「长句滚动」一项；缺省即关，行为与 1.5.x 一致。
+    const desktopSource = raw.desktop && typeof raw.desktop === 'object' ? raw.desktop : null;
 
     const fontSize = toFiniteNumber(sharedSource.fontSize);
     if (fontSize !== null) config.shared.fontSize = Math.round(clampNumber(fontSize, FONT_SIZE_MIN, FONT_SIZE_MAX));
@@ -294,6 +301,7 @@ const normalizeConfig = (raw) => {
     config.shared.border = sharedSource.border !== false;
     config.shared.pausedDim = sharedSource.pausedDim === true;
     config.shared.backdrop = sharedSource.backdrop === true;
+    if (desktopSource) config.desktop.marquee = desktopSource.marquee === true;
     return config;
 };
 
@@ -578,6 +586,28 @@ const WIDGET_HTML = `<!DOCTYPE html>
         text-overflow: ellipsis;
         /* 窗口背景可能是任意壁纸（甚至纯白），所以歌词要自带一圈暗描边保证可读。 */
         text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 2px 12px rgba(0, 0, 0, 0.6);
+    }
+    /* 1.6.1 长句滚动：视口（.lyric-text / .lyric-trans）负责裁切，轨道（.line-track）负责平移。 */
+    .line-track {
+        display: inline-block;
+        white-space: nowrap;
+        will-change: transform;
+    }
+    /* 滚动中改成左对齐：从句子开头读起，滚到最后一段时刚好停在眼眶里。
+       已经滚到底（is-scrolled-end）就交还给居中，免得滚动结束那一刻文字突然跳一下。 */
+    .lyric-text.is-scrolling,
+    .lyric-trans.is-scrolling {
+        text-align: left;
+    }
+    .lyric-text.is-scrolled-end,
+    .lyric-trans.is-scrolled-end {
+        text-align: center;
+    }
+    /* 设置里关掉长句滚动时：轨道退化成普通内联元素，长句照旧截断（尾部省略号）。 */
+    body.marquee-off .line-track {
+        display: inline;
+        will-change: auto;
+        transform: none !important;
     }
     /* 双语排版（原文 + 译文）里的大号译文：原文的 0.7 倍。38 * 0.7 = 26.6，向上取整 27px。 */
     .lyric-trans {
@@ -891,8 +921,8 @@ const WIDGET_HTML = `<!DOCTYPE html>
         </div>
     </div>
     <div class="lyric" id="lyric" data-layout="text">
-        <div class="lyric-text" id="line" aria-live="polite">${WAITING_TEXT}</div>
-        <div class="lyric-trans" id="trans" hidden></div>
+        <div class="lyric-text" id="line" aria-live="polite"><span class="line-track" id="line-track">${WAITING_TEXT}</span></div>
+        <div class="lyric-trans" id="trans" hidden><span class="line-track" id="trans-track"></span></div>
         <div class="lyric-sub" id="sub"></div>
     </div>
     <button id="close" type="button" data-tip="关闭悬浮歌词（模组仍启用）" aria-label="关闭悬浮歌词">${ICON_SVG.close}</button>
@@ -909,7 +939,9 @@ window.addEventListener('error', (event) =>
 const els = {
     lyric: document.getElementById('lyric'),
     line: document.getElementById('line'),
+    lineTrack: document.getElementById('line-track'),
     trans: document.getElementById('trans'),
+    transTrack: document.getElementById('trans-track'),
     sub: document.getElementById('sub'),
     prev: document.getElementById('prev'),
     toggle: document.getElementById('toggle'),
@@ -989,7 +1021,9 @@ let config = {
         pausedDim: false,
         backdrop: false,
     },
-    desktop: {},
+    desktop: {
+        marquee: false,
+    },
     window: {},
 };
 
@@ -1029,6 +1063,10 @@ const applyConfig = (next) => {
     document.body.dataset.backdrop = String(current.backdrop === true);
     document.body.dataset.pausedDim = String(current.pausedDim === true);
     applyFontFamily(lastPayload && lastPayload.theme);
+    // 1.6.1 长句滚动开关：先挂类让 CSS 立刻生效，再按新字号重排这一句的滚动。
+    // 关掉时 remeasureLyrics 里的 resetMarquee 会把平移和临时字号一并清掉。
+    document.body.classList.toggle('marquee-off', !marqueeEnabled());
+    remeasureLyrics();
 };
 
 /** 这份快照里的 position 是「什么时候」的位置：优先用 client 打的 sentAt，缺了才退回收到时刻。 */
@@ -1051,6 +1089,171 @@ const positionNowFrom = (payload, receivedAt) => {
     // 时钟异常（负数或离谱的大）就不外推，宁可少走一点，也不要一下子跳到后面。
     if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > 30) return base;
     return base + elapsed;
+};
+
+/**
+ * 1.6.1 长句滚动（「走马灯」）。默认关闭，设置里打开才生效；关着的时候长句照旧截断（尾部省略号）。
+ *
+ * - 视口（.lyric-text / .lyric-trans）负责裁切，轨道（.line-track）负责 translateX；
+ * - 只有溢出（scrollWidth > clientWidth）才滚，短句完全静止，和以前一样；
+ * - 速度按「本句剩余可唱时间」反推：句首留 MARQUEE_LEAD_IN 秒让人读完，句尾留 MARQUEE_TAIL 秒，
+ *   速度夹在 MARQUEE_MIN_SPEED~MARQUEE_MAX_SPEED 之间（用户 1.6.2 真机反馈「偏快」，节奏以这里为准）；
+ * - 需要的速度超过上限时，只对这一句临时缩小字号（最多缩到 80%）把溢出压下来，普通歌词永远原字号；
+ * - 换句 = 立刻复位，滚动不排队、不阻塞渲染；暂停时停在原地，继续播放时接着走。
+ * - body.marquee-off 时整体不滚：这是「设置里关掉」的兜底，页面拿不到配置也能安全降级。
+ */
+const MARQUEE_LEAD_IN = 1.2;
+const MARQUEE_TAIL = 0.15;
+const MARQUEE_MIN_SPEED = 60;
+const MARQUEE_MAX_SPEED = 380;
+const MARQUEE_MIN_SHRINK = 0.8;
+const MARQUEE_DEFAULT_SECONDS = 8;
+
+const marqueeTargets = [];
+let marqueeRaf = 0;
+let marqueeLastAt = 0;
+
+const registerMarquee = (viewport, track) => {
+    if (!viewport || !track) return null;
+    const state = {
+        viewport,
+        track,
+        offset: 0,
+        max: 0,
+        speed: 0,
+        delay: 0,
+        done: true,
+        shrinking: false,
+    };
+    marqueeTargets.push(state);
+    return state;
+};
+
+const marqueeStates = {
+    line: registerMarquee(els.line, els.lineTrack),
+    trans: registerMarquee(els.trans, els.transTrack),
+};
+
+const marqueeEnabled = () => config.desktop.marquee === true;
+
+/** 换句 / 改配置 / 开关滚动时先复位：偏移归零、临时字号清掉、样式类摘掉。 */
+const resetMarquee = (state) => {
+    if (!state) return;
+    state.offset = 0;
+    state.max = 0;
+    state.speed = 0;
+    state.delay = 0;
+    state.done = true;
+    state.track.style.transform = '';
+    state.viewport.classList.remove('is-scrolling', 'is-scrolled-end');
+    if (state.shrinking) {
+        state.viewport.style.fontSize = '';
+        state.shrinking = false;
+    }
+};
+
+/**
+ * 停掉滚动循环（窗口隐藏时用）：rAF 在隐藏窗口里本来就会被浏览器节流甚至冻结，
+ * 显式停掉能省掉一次「醒来后补一帧」的位移跳变。
+ */
+const stopMarqueeLoop = () => {
+    if (marqueeRaf) {
+        cancelAnimationFrame(marqueeRaf);
+        marqueeRaf = 0;
+    }
+    marqueeLastAt = 0;
+};
+
+const stepMarquee = (now) => {
+    const dt = marqueeLastAt ? Math.min(0.1, (now - marqueeLastAt) / 1000) : 0;
+    marqueeLastAt = now;
+    let alive = false;
+    for (const state of marqueeTargets) {
+        if (!state || state.done) continue;
+        if (state.delay > 0) {
+            // 句首留白：先停在开头让人读完，再开始移动。
+            state.delay = Math.max(0, state.delay - dt);
+            alive = true;
+            continue;
+        }
+        state.offset = Math.min(state.max, state.offset + state.speed * dt);
+        state.track.style.transform = 'translateX(' + (-state.offset).toFixed(2) + 'px)';
+        if (state.offset >= state.max) {
+            state.done = true;
+            // 滚完交还给居中：最后一段仍完整露在眼眶里，不会在结束那一刻跳回去。
+            state.viewport.classList.add('is-scrolled-end');
+        } else {
+            alive = true;
+        }
+    }
+    marqueeRaf = alive ? requestAnimationFrame(stepMarquee) : 0;
+    if (!alive) marqueeLastAt = 0;
+};
+
+const ensureMarqueeLoop = () => {
+    if (marqueeRaf) return;
+    marqueeLastAt = 0;
+    marqueeRaf = requestAnimationFrame(stepMarquee);
+};
+
+/**
+ * 量一次某个视口：只有溢出才安排滚动。
+ * @param state  registerMarquee 返回的状态
+ * @param availableSeconds 这一句还剩多少秒可唱（算不出来就给 8 秒，够滚完多数长句）
+ */
+const measureMarquee = (state, availableSeconds) => {
+    if (!state) return;
+    resetMarquee(state);
+    if (!marqueeEnabled()) return;
+    const viewport = state.viewport;
+    const track = state.track;
+    if (!viewport || !track || !track.scrollWidth) return;
+    const baseSize = config.shared.fontSize || FONT_SIZE_DEFAULT;
+    const budget = Math.max(0.9, availableSeconds - MARQUEE_LEAD_IN - MARQUEE_TAIL);
+    let overflow = track.scrollWidth - viewport.clientWidth;
+    if (overflow <= 2) return;
+    let needed = overflow / budget;
+    if (needed > MARQUEE_MAX_SPEED) {
+        // 极端长句：先只给这一句缩一点，把溢出压到「上限速度能滚完」的量级。
+        const allowedWidth = viewport.clientWidth + MARQUEE_MAX_SPEED * budget;
+        const ratio = Math.max(MARQUEE_MIN_SHRINK, allowedWidth / track.scrollWidth);
+        viewport.style.fontSize = Math.round(baseSize * ratio) + 'px';
+        state.shrinking = true;
+        // 改字号后必须重新取宽度，否则 max 还是旧值。
+        overflow = track.scrollWidth - viewport.clientWidth;
+        if (overflow <= 2) {
+            // 缩小后已经放得下：不再滚，等同「这一句刚好够宽」。
+            resetMarquee(state);
+            return;
+        }
+        needed = overflow / budget;
+    }
+    state.max = overflow;
+    state.speed = Math.min(MARQUEE_MAX_SPEED, Math.max(MARQUEE_MIN_SPEED, needed));
+    state.offset = 0;
+    state.delay = MARQUEE_LEAD_IN;
+    state.done = false;
+    viewport.classList.add('is-scrolling');
+    ensureMarqueeLoop();
+};
+
+/** 一句还剩多少秒（用于算滚动速度）；非播放中或没有时间戳时给一个宽裕值。 */
+const secondsLeftForLine = (line, payload) => {
+    const end = line && Number(line.endTime);
+    const position = payload && Number(payload.position);
+    if (Number.isFinite(end) && Number.isFinite(position) && end > position) return end - position;
+    return MARQUEE_DEFAULT_SECONDS;
+};
+
+/** 歌词内容 / 宽度 / 字号变化后重新量一次（换句、改设置、窗口 resize）。 */
+const remeasureLyrics = () => {
+    if (!lastPayload || !lastPayload.line) return;
+    const line = lastPayload.line;
+    const secondsLeft = secondsLeftForLine(line, lastPayload);
+    measureMarquee(marqueeStates.line, secondsLeft);
+    const transText = els.trans && els.trans.textContent ? els.trans.textContent : '';
+    if (transText) measureMarquee(marqueeStates.trans, secondsLeft);
+    else resetMarquee(marqueeStates.trans);
 };
 
 /** 排版按钮的三态高亮、提示，以及 lyric 容器上的 data-layout，都跟着当前模式走。 */
@@ -1096,7 +1299,7 @@ const render = (payload, receivedAt) => {
         ' title="' + ((payload.song && payload.song.title) || '') + '"',
     );
     // 空字符串是合法的行文本（只有翻译、没有原文的行），不要退回「等待播放...」。
-    els.line.textContent = typeof line.text === 'string' ? line.text : WAITING_TEXT;
+    els.lineTrack.textContent = typeof line.text === 'string' ? line.text : WAITING_TEXT;
     // 暂停变淡要知道播放状态；只认 playing，其他都当暂停。
     document.body.dataset.playback = typeof payload.state === 'string' ? payload.state : 'paused';
     // 跟随主题字体：冷启动时配置比首帧先到（那时还没有 theme），所以每次快照都再对一次。
@@ -1112,12 +1315,16 @@ const render = (payload, receivedAt) => {
     } else if (layoutMode === 'roman') {
         secondLine = romanization !== '' ? romanization : translation;
     }
-    els.trans.textContent = secondLine;
+    els.transTrack.textContent = secondLine;
     els.trans.hidden = secondLine === '';
     // 三行排版（原文 + 译文 + 罗马音）已下线：这一行现在始终留空。
     // 要恢复：① 上面改成 secondLine = translation、并另算 showRoman；② 这里填罗马音；
     // ③ LAYOUT_MODES / LAYOUT_TIPS 和 CSS 的 #layout[data-mode="roman"] 规则各补一态。
     els.sub.textContent = '';
+
+    // 1.6.1 长句滚动：内容写完、布局稳定之后再量（量的是 scrollWidth，必须等这次写入生效）。
+    // 换句会立刻复位重排，滚动不排队、不阻塞下一次渲染。
+    remeasureLyrics();
 
     const playing = payload.state === 'playing';
     setIcon(els.toggle, playing ? 'pause' : 'play');
@@ -1172,6 +1379,7 @@ els.loop.addEventListener('click', () => sendAction({ type: 'cycle-loop' }));
 els.layout.addEventListener('click', () => {
     layoutMode = LAYOUT_MODES[(LAYOUT_MODES.indexOf(layoutMode) + 1) % LAYOUT_MODES.length];
     applyLayoutButton();
+    // 排版换了第二行内容也换了：必须整体重渲染（含重新量滚动），不能只改高亮。
     if (lastPayload) render(lastPayload);
     // 记住这次选择，重启后恢复。
     ipcRenderer.send('${IPC_LAYOUT}', layoutMode);
@@ -1227,6 +1435,7 @@ ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
     if (!LAYOUT_MODES.includes(value)) return;
     layoutMode = value;
     applyLayoutButton();
+    // 启动恢复也是走这里，同样要整体重渲染才能量到正确的第二行宽度。
     if (lastPayload) render(lastPayload);
 });
 // 主进程说「该显示了」：先别让旧画面见人，等当下这一帧到了再回信上屏。
@@ -1235,6 +1444,10 @@ ipcRenderer.on('${IPC_SHOW}', () => {
     showMark = { frame: payloadFrame + 1, rendered: false };
     // 先把旧画面压住（窗口还没上屏，这一步是防「万一露出来」和「同步 render 重绘后空一帧」）。
     applyShownStyle();
+    // 上屏后马上会来一帧新快照，那一帧的 render 会重新量滚动；这里先复位，免得旧句的
+    // 平移偏移被带进新画面（隐藏期间滚动循环是停着的，位置可能停在半途）。
+    resetMarquee(marqueeStates.line);
+    resetMarquee(marqueeStates.trans);
     // 控制器标成「显示中」：按钮立刻点亮；同时整窗先穿透（窗口还没上屏，万一在握手期间露出来
     // 也不能吃点击；上屏后主进程会把穿透状态改回真实的，见 ignore-hint）。
     ipcRenderer.send('${IPC_IGNORE_HINT}', true);
@@ -1296,6 +1509,11 @@ const reportPinRect = () => {
     }, 260);
 };
 window.addEventListener('resize', reportPinRect);
+// 窗口宽高变了（改字号 → 主进程 setSize），滚动量要重算；多等一拍让布局稳定。
+const onWindowResize = () => {
+    setTimeout(remeasureLyrics, 0);
+};
+window.addEventListener('resize', onWindowResize);
 const reportPinState = () => {
     ipcRenderer.send('${IPC_PINNED}', isPinned);
 };
@@ -2588,7 +2806,10 @@ module.exports = function activate(api) {
         state.config = next;
         applyWindowSize();
         sendConfigToWindow();
-        api.log.info(LOG_PREFIX + ' 配置已更新', JSON.stringify(next.shared));
+        api.log.info(
+            LOG_PREFIX + ' 配置已更新',
+            JSON.stringify({ shared: next.shared, desktop: next.desktop }),
+        );
         return { changed: true, height: windowHeightFor(next) };
     });
     // 1.5.0：命令面板的「锁定 / 解锁」。和页面上那个固定键走同一套状态，命令回来的结果自带新值。

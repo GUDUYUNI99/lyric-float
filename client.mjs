@@ -866,6 +866,17 @@ const buildSettingsSection = () => ({
             group: L('通用', 'Shared'),
             defaultValue: false,
         },
+        {
+            key: 'marquee',
+            type: 'boolean',
+            label: L('长句滚动', 'Scroll long lines'),
+            description: L(
+                '放不下的长句子横向滚过去，速度跟着这一句剩余时间走。关掉时长的句子尾部省略号截断。',
+                'Scrolls lines that do not fit; speed follows the remaining time of the line. When off, long lines are truncated with an ellipsis.',
+            ),
+            group: L('桌面歌词', 'Desktop lyric'),
+            defaultValue: false,
+        },
     ],
 });
 
@@ -898,7 +909,9 @@ const readConfigFromHandle = (handle) => {
             pausedDim: values.pausedDim === true,
             backdrop: values.backdrop === true,
         },
-        desktop: {},
+        desktop: {
+            marquee: values.marquee === true,
+        },
         window: {},
     };
 };
