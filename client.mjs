@@ -28,7 +28,6 @@
  *       text,                  // 没有当前行时保留最近一句；连最近一句都没有时是「等待播放...」
  *       translation: string | null,
  *       romanization: string | null,
- *       words: { text, startTime, endTime }[] | null,  // 1.5.0 起透传词级时间；没有时为 null
  *       startTime: number | null,
  *       endTime: number | null,
  *     },
@@ -83,7 +82,7 @@ const RPC_CONFIG = 'config';
 // 1.5.1 配置回推：main 的页面每次加载完 / 每次 activate 都发一次这个 action，
 // 让 client 立刻把设置整份重推一遍。起因是宿主「重载模组」只重建主进程 entry：
 // 文件没变时 clientUrl 不变，client 不会重跑（见 clientLoader 的 reconcile），
-// 而配置真源在 client 侧，主进程会一直停在默认值（字号回 38、逐字被关）。
+// 而配置真源在 client 侧，主进程会一直停在默认值（字号回 38）。
 const ACTION_REQUEST_CONFIG = 'request-config';
 const RPC_TOGGLE_PIN = 'toggle-pin';
 // 设置分区 id：设置 → 高级 → 模组 → 展开「独立悬浮歌词」。
@@ -170,8 +169,8 @@ const readLyricOffsetSeconds = (song) => {
     return (readPerSongOffsetMs(song.id) + readGlobalOffsetMs()) / 1000;
 };
 
-// ---- 排查日志开关（往「设置→开发者→运行日志」里打链路日志；定位完改成 false 即可静音，不用删代码） ----
-const DEBUG = true;
+// ---- 排查日志开关（往「设置→开发者→运行日志」里打链路日志；默认关闭，排查时临时改 true） ----
+const DEBUG = false;
 const debugLog = (...args) => {
     if (DEBUG) console.log(...args);
 };
@@ -236,25 +235,7 @@ const findApproximateLineIndex = (lines, time) => {
 };
 
 /**
- * 1.5.0 逐字歌词：把宿主的 words（{text,startTime,endTime,...}）收窄成页面要的最小形状。
- * 没有词级时间的行返回 null，页面按普通文本渲染（和 1.4.2 的观感一致）。
- */
-const projectWords = (words) => {
-    if (!Array.isArray(words) || words.length === 0) return null;
-    const out = [];
-    for (const word of words) {
-        if (!word || typeof word.text !== 'string') continue;
-        const startTime = Number(word.startTime);
-        const endTime = Number(word.endTime);
-        if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) continue;
-        out.push({ text: word.text, startTime, endTime });
-    }
-    return out.length > 0 ? out : null;
-};
-
-/**
  * 当前歌词行；两句之间保留上一句，只有上一句也没有（如歌曲还没开始）时才给「等待播放...」。
- * 1.5.0 起 words 不再是 null：逐字时间由宿主给，没有就是 null。
  */
 const readLine = (folium, lines, index, time) => {
     const safeLines = Array.isArray(lines) ? lines : [];
@@ -270,7 +251,6 @@ const readLine = (folium, lines, index, time) => {
             text: WAITING_LINE_TEXT,
             translation: null,
             romanization: null,
-            words: null,
             startTime: null,
             endTime: null,
         };
@@ -280,8 +260,6 @@ const readLine = (folium, lines, index, time) => {
         text: line.fullText,
         translation: line.translation ?? null,
         romanization: line.romanization ?? null,
-        // 逐字时间：有词级数据的行才给数组，否则 null（页面走普通文本渲染）。
-        words: projectWords(line.words),
         startTime: line.startTime,
         endTime: line.endTime,
     };
@@ -322,8 +300,8 @@ const buildPayload = (folium, view, playSessionId) => {
         loopMode: folium.playback.getLoopMode(),
         line: readLine(folium, view.lines, view.lineIndex, view.time),
         theme: readTheme(folium, view.theme),
-        // 1.5.1：这份 position 是「什么时候」的位置。逐字高亮要自己按时间推进，页面上的旧快照
-        // （去重后句内不再发帧、隐藏期间停发、重开时补发）只有靠它才能换算成「现在」。
+        // 这份 position 是「什么时候」的位置。页面在配置变化后要用旧快照重渲染，只有靠它才能
+        // 把「上次内容变化那一刻的位置」换算成「现在」（见 main.cjs 页面的 positionNowFrom）。
         sentAt: Date.now(),
     };
 };
@@ -470,7 +448,7 @@ const createSyncEngine = (folium) => {
             // 一次变化可能同时触发多个监听；内容相同的快照不必重复发（request-sync 强制重发）。
             // position 每 100ms 都在变但不值得持续推流（主进程自己推进进度条），所以去重时把它固定掉。
             // 1.5.3：sentAt 同理——它是「这份快照是什么时候的」，每次都不一样；不固定的话去重键永远不同，
-            // 快照就会每 100ms 全量重发一次（控制台刷屏、页面每帧重渲染，逐字基准也跟着被反复重置）。
+            // 快照就会每 100ms 全量重发一次（控制台刷屏、页面每帧重渲染）。
             const key = JSON.stringify(payload, (name, value) => (name === 'position' || name === 'sentAt' ? 0 : value));
             if (!force && key === lastSentKey) return;
             lastSentKey = key;
@@ -759,17 +737,6 @@ const buildSettingsSection = () => ({
             options: FONT_SIZE_OPTIONS,
         },
         {
-            key: 'karaoke',
-            type: 'boolean',
-            label: L('逐字歌词（已唱染色 / 未唱变淡）', 'Word-by-word karaoke'),
-            description: L(
-                '需要歌词自带逐字时间；没有逐字时间的行仍按整行显示。',
-                'Needs word-level timing; lines without it are still shown as a whole.',
-            ),
-            group: L('通用', 'Shared'),
-            defaultValue: false,
-        },
-        {
             key: 'fontMode',
             type: 'select',
             label: L('字体来源', 'Font source'),
@@ -842,28 +809,6 @@ const buildSettingsSection = () => ({
             defaultValue: false,
         },
         {
-            key: 'sungColor',
-            type: 'color',
-            label: L('已唱字色', 'Sung word color'),
-            description: L('逐字歌词开启时，唱过的字用这个颜色。', 'Color of words already sung when karaoke is on.'),
-            group: L('通用', 'Shared'),
-            defaultValue: '#7dd3fc',
-        },
-        {
-            key: 'unsungOpacity',
-            type: 'number',
-            label: L('未唱字不透明度', 'Unsung word opacity'),
-            description: L(
-                '逐字歌词开启时，没唱到的字的透明度，0.2–1.0（越小越淡）。',
-                'Opacity of words not sung yet, 0.2-1.0 (lower is fainter).',
-            ),
-            group: L('通用', 'Shared'),
-            defaultValue: 1,
-            min: 0.2,
-            max: 1,
-            step: 0.05,
-        },
-        {
             key: 'pausedDim',
             type: 'boolean',
             label: L('暂停时整体变淡', 'Dim while paused'),
@@ -893,15 +838,12 @@ const readConfigFromHandle = (handle) => {
     return {
         shared: {
             fontSize: toNumber(values.fontSize, FONT_SIZE_DEFAULT),
-            karaoke: values.karaoke === true,
             fontMode: values.fontMode,
             surface: values.surface,
             surfaceOpacity: toNumber(values.surfaceOpacity, 0.58),
             radius: toNumber(values.radius, 16),
             // 布尔项没写过时是 undefined，按「默认开」处理；只有明确 false 才算关。
             border: values.border !== false,
-            sungColor: values.sungColor,
-            unsungOpacity: toNumber(values.unsungOpacity, 1),
             pausedDim: values.pausedDim === true,
             backdrop: values.backdrop === true,
         },

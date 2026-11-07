@@ -220,7 +220,7 @@ const WINDOW_WIDTH = 640;
 // 默认停在工作区底部中间，离底边和左右边这么多像素。
 const WINDOW_MARGIN = 48;
 
-// ---- 1.5.0 可配置项（字号 / 逐字 / 字体 / 外观） ----
+// ---- 1.5.0 可配置项（字号 / 字体 / 外观） ----
 // 这些值的「真源」在宿主的模组设置里（client.mjs 用 settingsSections 声明表单），
 // client 每次变化都通过 folium.rpc.call('config', ...) 推给主进程；主进程只做校验、定尺寸、转给页面。
 const RPC_CONFIG = 'config';
@@ -229,7 +229,7 @@ const RPC_CONFIG = 'config';
 const ACTION_REQUEST_CONFIG = 'request-config';
 // 命令面板「锁定 / 解锁位置」：命令面板没有页面上下文，由主进程翻状态再推回页面。
 const RPC_TOGGLE_PIN = 'toggle-pin';
-// 主进程 → 页面：把配置下发进窗口页面（字号、逐字、外观）。
+// 主进程 → 页面：把配置下发进窗口页面（字号、字体、外观）。
 const IPC_CONFIG = 'my-lyric-widget:config';
 
 const SURFACE_MODES = ['auto', 'dark', 'light', 'transparent'];
@@ -240,7 +240,7 @@ const FONT_SIZE_DEFAULT = 38;
 
 /**
  * 配置按「归属」分段，和设置面板的分组一一对应：
- *  shared  = 通用（外观、字号、逐字）
+ *  shared  = 通用（外观、字号、字体）
  *  desktop = 桌面歌词专属（1.6.x 的长句滚动会落在这里，现在先占位）
  *  window  = 悬浮窗歌词专属（1.7.0 再填）
  * 默认值必须和 1.4.2 的观感完全一致：加设置项不允许改变现有默认样子。
@@ -248,14 +248,11 @@ const FONT_SIZE_DEFAULT = 38;
 const DEFAULT_CONFIG = {
     shared: {
         fontSize: FONT_SIZE_DEFAULT,
-        karaoke: false,
         fontMode: 'system',
         surface: 'auto',
         surfaceOpacity: 0.58,
         radius: 16,
         border: true,
-        sungColor: '#7dd3fc',
-        unsungOpacity: 1,
         pausedDim: false,
         backdrop: false,
     },
@@ -280,7 +277,6 @@ const normalizeConfig = (raw) => {
 
     const fontSize = toFiniteNumber(sharedSource.fontSize);
     if (fontSize !== null) config.shared.fontSize = Math.round(clampNumber(fontSize, FONT_SIZE_MIN, FONT_SIZE_MAX));
-    config.shared.karaoke = sharedSource.karaoke === true;
     if (FONT_MODES.includes(sharedSource.fontMode)) config.shared.fontMode = sharedSource.fontMode;
     if (SURFACE_MODES.includes(sharedSource.surface)) config.shared.surface = sharedSource.surface;
 
@@ -290,16 +286,6 @@ const normalizeConfig = (raw) => {
     const radius = toFiniteNumber(sharedSource.radius);
     if (radius !== null) config.shared.radius = Math.round(clampNumber(radius, 0, 28));
     config.shared.border = sharedSource.border !== false;
-    if (typeof sharedSource.sungColor === 'string') {
-        // 颜色框可能给 #rgb，展开成 #rrggbb；其他格式回落默认。
-        const hex = sharedSource.sungColor.trim().toLowerCase();
-        const expanded = /^#[0-9a-f]{3}$/.test(hex)
-            ? '#' + hex.slice(1).split('').map((ch) => ch + ch).join('')
-            : hex;
-        if (/^#[0-9a-f]{6}$/.test(expanded)) config.shared.sungColor = expanded;
-    }
-    const unsungOpacity = toFiniteNumber(sharedSource.unsungOpacity);
-    if (unsungOpacity !== null) config.shared.unsungOpacity = clampNumber(unsungOpacity, 0.2, 1);
     config.shared.pausedDim = sharedSource.pausedDim === true;
     config.shared.backdrop = sharedSource.backdrop === true;
     return config;
@@ -583,17 +569,6 @@ const WIDGET_HTML = `<!DOCTYPE html>
         text-overflow: ellipsis;
         /* 窗口背景可能是任意壁纸（甚至纯白），所以歌词要自带一圈暗描边保证可读。 */
         text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 2px 12px rgba(0, 0, 0, 0.6);
-    }
-    /* 逐字歌词（1.5.0）：每个词一个 span，已唱染成设定色，未唱按「未唱不透明度」变淡。 */
-    .lyric-text .word {
-        transition: color 0.12s linear, opacity 0.12s linear;
-    }
-    .lyric-text .word.unsung {
-        opacity: var(--unsung-opacity, 1);
-    }
-    .lyric-text .word.sung {
-        color: var(--sung-color, #7dd3fc);
-        opacity: 1;
     }
     /* 双语排版（原文 + 译文）里的大号译文：原文的 0.7 倍。38 * 0.7 = 26.6，向上取整 27px。 */
     .lyric-trans {
@@ -985,7 +960,7 @@ const LAYOUT_TIPS = {
 };
 let layoutMode = 'text';
 let lastPayload = null;
-// 1.5.1：lastPayload 第一次到手时的本地时刻（epoch ms）。重渲染（开关逐字、切排版）沿用它，
+// 1.5.1：lastPayload 第一次到手时的本地时刻（epoch ms）。重渲染（切排版）沿用它，
 // 免得把「同一份旧快照」误当成刚收到的新数据。
 let lastPayloadReceivedAt = 0;
 // 1.5.2：页面收到过几份快照。显示握手要区分「上屏这一刻之前的旧画面」和「之后的新画面」。
@@ -997,14 +972,11 @@ let lastPayloadFrame = 0;
 let config = {
     shared: {
         fontSize: 38,
-        karaoke: false,
         fontMode: 'system',
         surface: 'auto',
         surfaceOpacity: 0.58,
         radius: 16,
         border: true,
-        sungColor: '#7dd3fc',
-        unsungOpacity: 1,
         pausedDim: false,
         backdrop: false,
     },
@@ -1016,8 +988,7 @@ const SYSTEM_FONT_STACK = "'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans CJK S
 
 /**
  * 把配置写成 CSS 变量 / body[data-*]：外观全走 CSS，渲染逻辑不用到处判断。
- * 只有「影响 DOM 结构」的项（逐字开关）才重渲染；字号 / 圆角 / 颜色 / 不透明度都只是变量，
- * 改完浏览器自己重排，重渲染反而会把逐字的高亮基准打回旧快照（看起来像卡一下）。
+ * 字号 / 圆角 / 颜色 / 不透明度都只是变量，改完浏览器自己重排，不需要重渲染。
  */
 /**
  * 字体：system = 现在这套系统无衬线栈；theme = 跟随播放器主题解析出的字体栈。
@@ -1033,7 +1004,6 @@ const applyFontFamily = (theme) => {
 const applyConfig = (next) => {
     if (!next || typeof next !== 'object') return;
     const shared = next.shared && typeof next.shared === 'object' ? next.shared : {};
-    const karaokeChanged = (shared.karaoke === true) !== (config.shared.karaoke === true);
     config = {
         shared: Object.assign({}, config.shared, shared),
         desktop: next.desktop && typeof next.desktop === 'object' ? next.desktop : config.desktop,
@@ -1046,33 +1016,10 @@ const applyConfig = (next) => {
     style.setProperty('--widget-radius', current.radius + 'px');
     style.setProperty('--surface-alpha', String(current.surfaceOpacity));
     style.setProperty('--border-alpha', current.border ? '0.08' : '0');
-    style.setProperty('--sung-color', current.sungColor);
-    style.setProperty('--unsung-opacity', String(current.unsungOpacity));
     document.body.dataset.surface = current.surface;
     document.body.dataset.backdrop = String(current.backdrop === true);
     document.body.dataset.pausedDim = String(current.pausedDim === true);
     applyFontFamily(lastPayload && lastPayload.theme);
-    if (lastPayload && karaokeChanged) render(lastPayload);
-};
-
-// ---- 1.5.0 逐字歌词：只在「已唱 / 未唱」之间切 class，颜色和变淡交给 CSS 变量 ----
-let karaokeKey = '';
-let karaokeState = null;
-
-const stopKaraoke = () => {
-    if (karaokeState && karaokeState.raf) cancelAnimationFrame(karaokeState.raf);
-    karaokeState = null;
-    karaokeKey = '';
-};
-
-/** 按给定时间把每个词刷成已唱 / 未唱（rAF 与「立即刷一次」共用）。 */
-const paintKaraokeAt = (time) => {
-    if (!karaokeState) return;
-    for (const item of karaokeState.spans) {
-        const sung = time >= item.start;
-        item.el.classList.toggle('sung', sung);
-        item.el.classList.toggle('unsung', !sung);
-    }
 };
 
 /** 这份快照里的 position 是「什么时候」的位置：优先用 client 打的 sentAt，缺了才退回收到时刻。 */
@@ -1085,7 +1032,7 @@ const payloadTimeOf = (payload, receivedAt) => {
 /**
  * 把「快照位置」折算成「现在的位置」（1.5.1）。
  * 快照不连续：同一句内 client 去重不发帧、隐藏期间不发、重开/重载时补发的还是旧快照。
- * 直接拿 payload.position 当现在用，逐字就会从旧位置重新起唱（就是用户看到的「闪回」和「重开后高亮滞后」）。
+ * 直接拿 payload.position 当现在用，画面就会「闪回」到旧位置（重开后高亮滞后同理）。
  */
 const positionNowFrom = (payload, receivedAt) => {
     const base = Number(payload && payload.position);
@@ -1096,84 +1043,6 @@ const positionNowFrom = (payload, receivedAt) => {
     if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > 30) return base;
     return base + elapsed;
 };
-
-/** 现在唱到哪儿：快照位置 + 已经过的时间（主进程 100ms 才来一帧，中间靠外推）。 */
-const karaokeTime = () => (karaokeState
-    ? karaokeState.basePosition + (performance.now() - karaokeState.startedAt) / 1000
-    : 0);
-
-const paintKaraoke = () => {
-    if (!karaokeState) return;
-    paintKaraokeAt(karaokeTime());
-    karaokeState.raf = requestAnimationFrame(paintKaraoke);
-};
-
-/** 暂停时只按当前位置刷一遍颜色，然后停掉 rAF（省电，也不会在暂停时继续「唱」）。 */
-const paintKaraokeOnce = () => {
-    if (!karaokeState) return;
-    paintKaraokeAt(karaokeState.basePosition);
-    if (karaokeState.raf) {
-        cancelAnimationFrame(karaokeState.raf);
-        karaokeState.raf = 0;
-    }
-};
-
-/** 逐字行：每个词一个 span，rAF 按「快照位置 + 已经过的时间」推算唱到哪。 */
-const renderKaraokeLine = (line, payload, receivedAt) => {
-    const key = String(line.text || '') + '|' + JSON.stringify(line.words);
-    if (key !== karaokeKey) {
-        stopKaraoke();
-        karaokeKey = key;
-        els.line.textContent = '';
-        const spans = [];
-        for (const word of line.words) {
-            const span = document.createElement('span');
-            span.className = 'word unsung';
-            span.textContent = word.text;
-            els.line.appendChild(span);
-            const start = Number(word.startTime);
-            // 只按 start 染色（「已唱 / 未唱」两态）；end 目前用不上，不留着误导后来人。
-            spans.push({ el: span, start: Number.isFinite(start) ? start : 0 });
-        }
-        karaokeState = {
-            spans,
-            basePosition: positionNowFrom(payload, receivedAt),
-            startedAt: performance.now(),
-            raf: 0,
-        };
-    } else if (karaokeState) {
-        // 同一行只更新基准位置（拖进度、暂停），不重建 DOM。
-        // 配置变化后的重渲染也会走到这里，那时 payload 是旧快照——1.5.1 起用 sentAt 把它折算成
-        // 「现在的位置」再比，所以旧快照不会被误判成 seek；只有真的差出半秒（拖了进度条）才重设基准。
-        const position = positionNowFrom(payload, receivedAt);
-        const estimated = karaokeState.basePosition + (performance.now() - karaokeState.startedAt) / 1000;
-        if (Math.abs(position - estimated) > 0.5) {
-            karaokeState.basePosition = position;
-            karaokeState.startedAt = performance.now();
-        }
-    }
-    if (karaokeState && payload.state === 'playing') {
-        // 先按当前推算时间染一次，再交给 rAF：新行第一帧不该是「整行都没唱」。
-        paintKaraokeAt(karaokeTime());
-        if (!karaokeState.raf) karaokeState.raf = requestAnimationFrame(paintKaraoke);
-    } else {
-        paintKaraokeOnce();
-    }
-};
-
-// 窗口被 × 收起时页面不可见：停掉 rAF，回来再按当前快照接上。
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-        if (karaokeState && karaokeState.raf) {
-            cancelAnimationFrame(karaokeState.raf);
-            karaokeState.raf = 0;
-        }
-        return;
-    }
-    if (karaokeState && lastPayload && lastPayload.state === 'playing' && !karaokeState.raf) {
-        karaokeState.raf = requestAnimationFrame(paintKaraoke);
-    }
-});
 
 /** 排版按钮的三态高亮、提示，以及 lyric 容器上的 data-layout，都跟着当前模式走。 */
 const applyLayoutButton = () => {
@@ -1186,7 +1055,7 @@ const applyLayoutButton = () => {
 
 const render = (payload, receivedAt) => {
     if (!payload || typeof payload !== 'object') return;
-    // 1.5.1：同一个 payload 可能被重渲染多次（开关逐字、切排版、字体变了），第一次见到它时记下
+    // 1.5.1：同一个 payload 可能被重渲染多次（切排版、字体变了），第一次见到它时记下
     // 「主进程什么时候收到它的」，之后重渲染都沿用同一个时刻——这样旧快照不会被当成新数据。
     if (payload !== lastPayload) {
         receivedAt = Date.now();
@@ -1203,21 +1072,8 @@ const render = (payload, receivedAt) => {
         ' title="' + ((payload.song && payload.song.title) || '') + '"',
     );
     // 空字符串是合法的行文本（只有翻译、没有原文的行），不要退回「等待播放...」。
-    // 1.5.0：开了逐字歌词且这一行带词级时间时，走 span 渲染；否则仍是一整段文本（默认路径不变）。
-    // 宿主对「没有词级时间」的行会给一个覆盖整行的单 word（text 与整行相同）：它没有可染色的粒度，
-    // 走 span 只会让整行一出现就变成已唱色，所以这种行按普通文本渲染。
-    const words = Array.isArray(line.words) ? line.words : null;
-    const wholeLineOnly = words !== null && words.length === 1 && words[0] && words[0].text === line.text;
-    const useKaraoke = config.shared.karaoke === true
-        && words !== null && words.length > 0 && !wholeLineOnly
-        && typeof line.text === 'string' && line.text !== '';
-    if (useKaraoke) {
-        renderKaraokeLine(line, payload, receivedAt);
-    } else {
-        stopKaraoke();
-        els.line.textContent = typeof line.text === 'string' ? line.text : WAITING_TEXT;
-    }
-    // 暂停变淡 / 逐字都要知道播放状态；只认 playing，其他都当暂停。
+    els.line.textContent = typeof line.text === 'string' ? line.text : WAITING_TEXT;
+    // 暂停变淡要知道播放状态；只认 playing，其他都当暂停。
     document.body.dataset.playback = typeof payload.state === 'string' ? payload.state : 'paused';
     // 跟随主题字体：冷启动时配置比首帧先到（那时还没有 theme），所以每次快照都再对一次。
     applyFontFamily(payload.theme);
@@ -1465,7 +1321,7 @@ ipcRenderer.on('${IPC_DATA}', (event, payload) => {
         syncShownState();
     }
 });
-// 主进程在页面加载完后推来当前配置（字号 / 逐字 / 外观），之后每次设置变化都会再推。
+// 主进程在页面加载完后推来当前配置（字号 / 字体 / 外观），之后每次设置变化都会再推。
 ipcRenderer.on('${IPC_CONFIG}', (event, payload) => applyConfig(payload));
 window.addEventListener('contextmenu', (event) => event.preventDefault());
 // 防止把文件拖进窗口触发导航（will-navigate 之外再兜一层）。
@@ -1504,7 +1360,7 @@ module.exports = function activate(api) {
         // lastPayload 只在 update-data 处理函数里写，写之前先过 isStaleFrame（它的基准单独放，不进 state）。
         // 形态：1.3.0 只有「桌面歌词」一种，1.7.0 才做「悬浮窗歌词」，这里先留状态位。
         surface: 'desktop',
-        // 1.5.0：显示配置（字号 / 逐字 / 外观）。真源在宿主的模组设置里，client 推过来，
+        // 1.5.0：显示配置（字号 / 字体 / 外观）。真源在宿主的模组设置里，client 推过来，
         // 主进程只做校验（normalizeConfig）、定窗口高度、再整份转给页面。
         config: normalizeConfig(null),
         // 1.4.0：悬浮窗当前是否显示（× / 播放条「词」按钮会改它；落盘在 persisted.open）。
@@ -1783,7 +1639,7 @@ module.exports = function activate(api) {
      * 向 client 要一次配置（1.5.1）。配置真源在 client 侧的宿主设置里，这边可能在没有重跑 client
      * 的情况下被重建：宿主「重载模组」只 loadAll() 主进程 entry，模组文件没变时 clientUrl 不变，
      * client 不会重新 activate，于是它「激活即下发配置」那一次永远不会再发生，主进程只能停在默认值上
-     * （字号回 38、逐字被关）。所以页面每次加载完、每次 activate 都主动要一次，拿回来的配置走 RPC_CONFIG。
+     * （字号回 38）。所以页面每次加载完、每次 activate 都主动要一次，拿回来的配置走 RPC_CONFIG。
      * 显隐无关：窗口隐藏时也要要，下一条快照不会把配置带回来。
      */
     const requestConfigFromClient = () => {
@@ -2229,7 +2085,7 @@ module.exports = function activate(api) {
             api.log.info(LOG_PREFIX + ' 悬浮窗页面 did-finish-load', JSON.stringify({
                 hasLastPayload: !!state.lastPayload,
             }));
-            // 1.5.0：字号 / 逐字 / 外观配置。必须在第一帧快照之前下发，否则页面会按默认 38px
+            // 1.5.0：字号 / 字体 / 外观配置。必须在第一帧快照之前下发，否则页面会按默认 38px
             // 先渲染一次、再跳成用户设的字号（一帧闪烁）。
             widgetWindow.webContents.send(IPC_CONFIG, state.config);
             if (state.lastPayload) sendPayloadToWindow(state.lastPayload);
