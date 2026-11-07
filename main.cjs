@@ -93,8 +93,9 @@ const IPC_LAYOUT = 'my-lyric-widget:layout';
 const IPC_PIN_RECT = 'my-lyric-widget:pin-rect';
 // 命中测试往外放一点：按钮本体 32×32，光标擦边时提前 2px 恢复可点，免得第一下点空。
 const PIN_HIT_PADDING = 2;
-// 页面先把这一帧画完、回信之后才上屏；这么等不到就兜底上屏（页面卡住/被销毁时不能点了没反应）。
-const SHOWN_TIMEOUT_MS = 300;
+// 显示握手：主进程等页面回 IPC_SHOWN 的最长时间（页面 400ms 兜底回信，这里再留余量）。
+// 等不到就照常上屏——宁可闪一下，「词」按钮点了没反应更糟。
+const SHOWN_TIMEOUT_MS = 800;
 // 右上角 ×（1.4.0，页面→主进程）：只隐藏悬浮窗，不停用模组。重新显示走播放条上的「词」按钮。
 const IPC_CLOSE = 'my-lyric-widget:close';
 // 1.5.1 显示握手（解决「× 关掉再打开时先闪一下旧画面」）：
@@ -103,6 +104,8 @@ const IPC_CLOSE = 'my-lyric-widget:close';
 // 隐藏期间主进程照收快照但没转给页面，页面上停的是关闭那一刻的画面（高亮停在旧位置）。
 const IPC_SHOW = 'my-lyric-widget:show';
 const IPC_SHOWN = 'my-lyric-widget:shown';
+// 1.5.2 页面 → 主进程：页面自己改了整窗鼠标穿透（显示握手期间先全窗穿透，上屏后放开）。
+const IPC_IGNORE_HINT = 'my-lyric-widget:ignore-hint';
 // 排版三态（主进程侧只用来校验从页面收到的值，别让坏值写进状态文件）。
 // 第三态 1.3.0 从「原文 + 译文 + 罗马音」(full) 改成「原文 + 罗马音」(roman)；老存档里的 full 在恢复时映射过来。
 const LAYOUT_MODE_IDS = ['text', 'text-trans', 'roman'];
@@ -844,6 +847,20 @@ const WIDGET_HTML = `<!DOCTYPE html>
         background: rgba(8, 22, 36, 0.78);
     }
     /*
+     * 1.5.2 显示握手中（body.showing）：窗口还没上屏，页面正在等当下这一帧。
+     * 控制条按悬停效果提前显出来 —— 上一帧画面里控制条是收起的，上屏时若还没展开，
+     * 看起来就是「先闪一下光秃秃的旧歌词、再浮出控制条」。
+     * 这几十毫秒里整窗是穿透的（见 IPC_IGNORE_HINT），显出来也点不到。
+     */
+    body.showing .widget {
+        background-color: rgba(8, 22, 36, var(--surface-alpha, 0.58));
+        border-color: rgba(125, 211, 252, var(--border-alpha, 0.08));
+    }
+    body.showing .controls {
+        transform: none;
+        opacity: 1;
+    }
+    /*
      * 右上角的关闭按钮（1.4.0）：只隐藏悬浮窗，不停用模组（播放条上的「词」按钮能找回来）。
      * 位置和控制条同一行（top 10px），悬停才露面；固定态不出现 —— 那时整窗忽略鼠标、
      * 只有解锁键那一小块可点，露出来也点不到，反而像个失效的按钮。
@@ -971,6 +988,9 @@ let lastPayload = null;
 // 1.5.1：lastPayload 第一次到手时的本地时刻（epoch ms）。重渲染（开关逐字、切排版）沿用它，
 // 免得把「同一份旧快照」误当成刚收到的新数据。
 let lastPayloadReceivedAt = 0;
+// 1.5.2：页面收到过几份快照。显示握手要区分「上屏这一刻之前的旧画面」和「之后的新画面」。
+let payloadFrame = 0;
+let lastPayloadFrame = 0;
 
 // ---- 1.5.0 配置（主进程下发），结构见 main.cjs 的 DEFAULT_CONFIG ----
 // 默认值与 DEFAULT_CONFIG 一致：主进程还没下发时，页面就按这套渲染，观感等同 1.4.2。
@@ -1273,9 +1293,17 @@ els.layout.addEventListener('click', () => {
     // 记住这次选择，重启后恢复。
     ipcRenderer.send('${IPC_LAYOUT}', layoutMode);
 });
-// 1.5.1：窗口被动显示（× 关掉再打开、隐藏期间被叫回来）时，上屏那一刻要等页面真的画完：
-// 隐藏期间主进程照收快照却没转给页面，页面上停的是关闭前的画面（高亮停在关闭那一刻）。
-// 主进程补发快照、再请 client 强制发一帧，页面收到后回一句「显示好了」，主进程才 showInactive。
+// 1.5.2：窗口被动显示（× 关掉再打开、播放条「词」点回来）时的上屏顺序。
+//
+// 以前的做法是「主进程先 showInactive，再补发快照等纠正」，第一帧上的是页面里残留的旧画面，
+// 所以会闪一下前面的句子 / 当前句的旧高亮。现在改成三段式：
+//   ① 主进程 hide 之后窗口一直保持 ignore-mouse，客户端根本点不到它；
+//   ② 要显示时先发 IPC_SHOW：页面先把控制器标成「显示中」（按钮点亮、鼠标穿透全窗，看见也点不到），
+//      同时请求 client 绕过去重发一帧当下这一句，记下这一刻的帧号；
+//   ③ 页面画完、并且等到一帧不早于「显示中」那一刻的快照之后，才回 IPC_SHOWN，主进程这时才
+//      showInactive：上屏的第一帧就是当下这一句，不会先露出旧的。
+// 兜底：主进程 800ms 等不到回信照常上屏；页面 400ms 等不到新帧就用现有画面回信（结果和旧版一样）。
+let showMark = null;
 let shownPending = false;
 let showTimer = null;
 const flushShown = () => {
@@ -1283,11 +1311,15 @@ const flushShown = () => {
         clearTimeout(showTimer);
         showTimer = null;
     }
+    shownPending = false;
+    document.body.classList.remove('showing');
     ipcRenderer.send('${IPC_SHOWN}');
 };
-const scheduleShown = (delay) => {
-    if (showTimer) clearTimeout(showTimer);
-    showTimer = setTimeout(flushShown, delay);
+const syncShownState = () => {
+    if (!shownPending || !showMark || !showMark.rendered) return;
+    // 还停在「显示中」那一刻之前的快照：等下一帧到了再回信，否则上屏的会是旧画面。
+    if (lastPayloadFrame < showMark.frame) return;
+    flushShown();
 };
 // 主进程在页面加载完后推来上次的排版选择（值不合法就保持默认的 text）。
 ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
@@ -1296,11 +1328,15 @@ ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
     applyLayoutButton();
     if (lastPayload) render(lastPayload);
 });
-// 主进程说「该显示了」：数据其实已经补发过，这里只负责上屏前再确认一次画面。
-// 兜底：内容没变时 client 不去重发帧、或者 request-sync 那条路断了，也不能永远不上屏。
+// 主进程说「该显示了」：先别让旧画面见人，等当下这一帧到了再回信上屏。
 ipcRenderer.on('${IPC_SHOW}', () => {
     shownPending = true;
-    scheduleShown(150);
+    showMark = { frame: payloadFrame + 1, rendered: false };
+    // 控制器标成「显示中」：按钮立刻点亮；同时整窗先穿透（窗口还没上屏，万一在握手期间露出来
+    // 也不能吃点击；上屏后主进程会把穿透状态改回真实的，见 ignore-hint）。
+    document.body.classList.add('showing');
+    ipcRenderer.send('${IPC_IGNORE_HINT}', true);
+    showTimer = setTimeout(flushShown, SHOWN_FRAME_WAIT_MS);
 });
 applyLayoutButton();
 
@@ -1420,11 +1456,13 @@ window.addEventListener('blur', stopVolumeDragging);
 els.volume.addEventListener('lostpointercapture', stopVolumeDragging);
 
 ipcRenderer.on('${IPC_DATA}', (event, payload) => {
+    payloadFrame += 1;
     render(payload, Date.now());
-    // 1.5.1：第一帧已经画上了，才告诉主进程「可以上屏」（冷启动 / 页面重建）。
-    if (shownPending) {
-        shownPending = false;
-        flushShown();
+    lastPayloadFrame = payloadFrame;
+    // 1.5.2：画完了再看这次显示握手能不能回信（要等的是「显示中」那一刻之后的帧）。
+    if (shownPending && showMark) {
+        showMark.rendered = true;
+        syncShownState();
     }
 });
 // 主进程在页面加载完后推来当前配置（字号 / 逐字 / 外观），之后每次设置变化都会再推。
@@ -1476,6 +1514,8 @@ module.exports = function activate(api) {
         reportedOpen: null,
         // 1.5.1：等页面握手再上屏的超时计时器（null = 没在等）。
         shownTimer: null,
+        // 1.5.2：页面自己设过的鼠标穿透值（显示握手期间页面先全窗穿透）。null = 主进程是唯一来源。
+        ignoreHint: null,
     };
 
     // ---- 帧顺序 ----
@@ -1796,8 +1836,10 @@ module.exports = function activate(api) {
     };
 
     /**
-     * 1.4.0：显示 / 隐藏悬浮窗（× 和播放条「词」按钮都走这里）。返回切换后的状态。
+     * 显示 / 隐藏悬浮窗（× 和播放条「词」按钮都走这里）。返回切换后的状态。
      * 隐藏只 hide()，不销毁窗口：模组继续收快照、页面继续存活，重新显示时立刻能画。
+     * 1.5.2：「显示」在这里只是开始——真正上屏要等页面回 IPC_SHOWN（见 showWidgetWindow）。
+     * 函数名保留 setWidgetOpen，因为它同时负责状态、落盘与向 client 汇报（hideWhenCollapsed 用）。
      */
     const setWidgetOpen = (open) => {
         state.widgetOpen = open === true;
@@ -1816,16 +1858,13 @@ module.exports = function activate(api) {
         } else if (widgetWindow && !widgetWindow.isDestroyed()) {
             try {
                 if (state.widgetOpen) {
-                    // 隐藏期间主进程照收数据但没转给页面，页面上停的是关窗前的画面
-                    // （文字还算新，逐字高亮停在关闭那一刻）。所以先补发最后一份快照，再让 client
-                    // 绕过内容去重强制发一帧当下这一句，然后交给页面：它画完回 IPC_SHOWN 才上屏
-                    // （见 onShownFromWindow）。先 showInactive 会先把旧画面闪出来，这就是
-                    // 「× 关掉再打开闪一下」的直接原因。
-                    if (state.lastPayload) sendPayloadToWindow(state.lastPayload);
+                    // 1.5.2：显示分两段。这里只做「让页面先准备好」：请 client 绕过去重发一帧当下这一句，
+                    // 但**不**补发旧快照（旧快照 = 关窗那一刻的画面，闪旧句就是从它来的），
+                    // 也先不上屏。页面画完新帧回 IPC_SHOWN，才由 showWidgetWindow 上屏。
                     sendActionToClient({ action: 'request-sync' });
                     // 隐藏期间可能改过字号：上屏前按当前配置定一次高度。
                     applyWindowSize();
-                    // 先把「显示」这条消息交给页面。页面可能已经销毁 / 没加载完：拿不到握手就兜底。
+                    // 窗口可能已销毁 / 页面没加载完：拿不到握手就兜底上屏。
                     try {
                         widgetWindow.webContents.send(IPC_SHOW);
                     } catch (error) {
@@ -1833,9 +1872,7 @@ module.exports = function activate(api) {
                     }
                     waitForShown();
                 } else {
-                    // 还没上屏就被关掉：作废这次握手，别让迟到的 IPC_SHOWN 把窗口重新弹出来。
-                    cancelShownWait();
-                    widgetWindow.hide();
+                    hideWidgetWindow();
                 }
             } catch (error) {
                 api.log.warn(LOG_PREFIX + (state.widgetOpen ? ' 显示悬浮窗失败' : ' 隐藏悬浮窗失败'), error);
@@ -1850,12 +1887,21 @@ module.exports = function activate(api) {
     /**
      * 1.5.1：真正的上屏。showInactive 而不是 show：悬浮歌词不该把键盘焦点从主窗口 / 别的应用抢走。
      * 用 force 的是「页面没来得及握手」的兜底路径，正常路径由 onShownFromWindow 调用。
+     * 1.5.2：上屏前先把整窗设成忽略鼠标——窗口之所以收不到鼠标，本来就是因为它是「隐藏着」的，
+     * 上屏后要等 client 侧要一轮 widget-state 才放开，这里补上，免得刚上屏那几十毫秒能点到。
      */
     const showWidgetWindow = (force) => {
         const widgetWindow = state.win;
         cancelShownWait();
         // 期间被关掉 / 被销毁 / 模组已停用：不再上屏。
         if (!widgetWindow || widgetWindow.isDestroyed() || !state.widgetOpen || state.disposed) return;
+        try {
+            widgetWindow.setIgnoreMouseEvents(true, { forward: true });
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 上屏前设置鼠标穿透失败', error);
+        }
+        // 上屏后悬停轮询按正常规则接管穿透；它第一次推算出来的值若不是「穿透」，会真的重设一次。
+        state.ignoreHint = null;
         try {
             widgetWindow.showInactive();
             api.log.info(LOG_PREFIX + ' 悬浮窗上屏' + (force ? '（页面未握手，兜底显示）' : ''));
@@ -1879,11 +1925,38 @@ module.exports = function activate(api) {
         state.shownTimer = null;
     };
 
+    /**
+     * 1.5.2：隐藏 = 页面上该收的状态 + 窗口隐藏 + 整窗忽略鼠标。
+     * 忽略鼠标这一条是关键：窗口「看不见」本来就在挡鼠标，不补的话隐藏后窗口还在那儿吃点击。
+     */
+    const hideWidgetWindow = () => {
+        // 还没上屏就又被关掉：作废这次握手，别让迟到的 IPC_SHOWN 把窗口重新弹出来。
+        cancelShownWait();
+        const widgetWindow = state.win;
+        if (!widgetWindow || widgetWindow.isDestroyed()) return;
+        try {
+            if (widgetWindow.isVisible()) widgetWindow.hide();
+            widgetWindow.setIgnoreMouseEvents(true, { forward: true });
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 隐藏悬浮窗失败', error);
+        }
+    };
+
     /** 页面把这一帧画好了（握手第二步）：现在才让窗口上屏。 */
     const onShownFromWindow = (event) => {
         if (!state.win || state.win.isDestroyed() || event.sender !== state.win.webContents) return;
         if (!state.shownTimer) return; // 不是这次握手要的那一句（超时后迟到的重复消息）
         showWidgetWindow(false);
+    };
+
+    /**
+     * 1.5.2：页面在显示握手期间自己把整窗设成穿透（主进程侧的悬停轮询是按帧调用的，赶不上这一下）。
+     * 记进 state.ignoreHint：页面自己已经设过，就不再在「窗口没上屏」那一帧重复调用；
+     * 之后真上屏、进入正常判定时，若要恢复可点会绕开 hint 重新设一次。
+     */
+    const onIgnoreHintFromWindow = (event, value) => {
+        if (!state.win || state.win.isDestroyed() || event.sender !== state.win.webContents) return;
+        state.ignoreHint = value === true;
     };
 
     /** 页面点了右上角 ×：校验来源窗口后隐藏（不停用模组，播放条「词」按钮能找回）。 */
@@ -1940,14 +2013,22 @@ module.exports = function activate(api) {
             }
             if (state.hoverTick === tick) state.hoverTick = null;
         };
+        /**
+         * ignore 传 true/false 表示「希望窗口处于这个鼠标穿透状态」，传 null 表示「这一帧不管」
+         * （1.5.2：页面在显示握手期间已经自己设成穿透了，主进程没必要再设一遍）。
+         * lastIgnore 是「我们最近一次设置过的值」的实际值，state.ignoreHint 是页面改道的值。
+         */
         const setIgnore = (ignore) => {
-            if (ignore === lastIgnore) return;
+            if (ignore === null) return;
+            if (ignore === lastIgnore && state.ignoreHint === null) return;
             try {
                 // forward：忽略鼠标时仍把移动事件转发给页面，让页面里的 mouseleave / hover 不卡在旧状态。
                 widgetWindow.setIgnoreMouseEvents(ignore, { forward: true });
                 // 只有调用成功才算数：失败时把 lastIgnore 置空，下一次 tick 才会真的重试。
                 // （如果先赋值再调用，失败后下一轮会因为这个相等判断直接早退，窗口可能永远解不开。）
                 lastIgnore = ignore;
+                // 页面自己设过的那笔账已经被这次设置覆盖掉了。
+                state.ignoreHint = null;
             } catch (error) {
                 lastIgnore = null;
             }
@@ -1975,7 +2056,11 @@ module.exports = function activate(api) {
                     overPin = point.x >= left && point.x < left + rect.width + PIN_HIT_PADDING * 2
                         && point.y >= top && point.y < top + rect.height + PIN_HIT_PADDING * 2;
                 }
-                setIgnore(state.pinned && !!rect && !overPin);
+                // 1.5.2：窗口没上屏时（显示握手中）整窗忽略鼠标——它随时可能露出来，露出来也不能吃点击。
+                // 页面已经自己设过穿透（ignore-hint）时这一帧跳过，不用多等一次轮询。
+                const wantIgnore = !widgetWindow.isVisible() || (state.pinned && !!rect && !overPin);
+                const pageAlreadySet = !widgetWindow.isVisible() && state.ignoreHint === true;
+                setIgnore(pageAlreadySet ? null : wantIgnore);
                 failCount = 0;
             } catch (error) {
                 // 单次异常（显示器热插拔、会话切换、销毁竞态）不能让窗口卡在「整窗穿透」里出不来：
@@ -2473,6 +2558,7 @@ module.exports = function activate(api) {
     ipcMain.on(IPC_LAYOUT, onLayoutFromWindow);
     ipcMain.on(IPC_CLOSE, onCloseFromWindow);
     ipcMain.on(IPC_SHOWN, onShownFromWindow);
+    ipcMain.on(IPC_IGNORE_HINT, onIgnoreHintFromWindow);
     app.on('browser-window-created', onBrowserWindowCreated);
 
     const dispose = () => {
@@ -2500,6 +2586,7 @@ module.exports = function activate(api) {
             ipcMain.removeListener(IPC_LAYOUT, onLayoutFromWindow);
             ipcMain.removeListener(IPC_CLOSE, onCloseFromWindow);
             ipcMain.removeListener(IPC_SHOWN, onShownFromWindow);
+            ipcMain.removeListener(IPC_IGNORE_HINT, onIgnoreHintFromWindow);
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 移除窗口指令监听失败', error);
         }
