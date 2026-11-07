@@ -1,7 +1,7 @@
 {
   "folium": 1,
   "id": "my-lyric-widget",
-  "name": "独立悬浮歌词",
+  "name": "悬浮窗歌词",
   "version": "1.6.6",
   "description": "",
   "permissions": [

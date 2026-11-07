@@ -85,7 +85,7 @@ const RPC_CONFIG = 'config';
 // 而配置真源在 client 侧，主进程会一直停在默认值（字号回 38）。
 const ACTION_REQUEST_CONFIG = 'request-config';
 const RPC_TOGGLE_PIN = 'toggle-pin';
-// 设置分区 id：设置 → 高级 → 模组 → 展开「独立悬浮歌词」。
+// 设置分区 id：设置 → 高级 → 模组 → 展开「悬浮窗歌词」。
 const SETTINGS_SECTION_ID = 'lyric-widget';
 const FONT_SIZE_MIN = 20;
 const FONT_SIZE_MAX = 50;
@@ -778,7 +778,7 @@ const registerWidgetToggleButton = (folium) => {
 };
 
 /**
- * 1.5.0：模组设置表单（设置 → 高级 → 模组 → 展开「独立悬浮歌词」）。
+ * 1.5.0：模组设置表单（设置 → 高级 → 模组 → 展开「悬浮窗歌词」）。
  *
  * 设置值由宿主持久化（FoliumSettingAccess 读写宿主参数存储），这里只做三件事：
  * 声明表单、读值、把值推给 main.cjs。窗口高度和 CSS 变量都在主进程/窗口页面里算，
@@ -787,7 +787,7 @@ const registerWidgetToggleButton = (folium) => {
  */
 const buildSettingsSection = () => ({
     id: SETTINGS_SECTION_ID,
-    label: L('独立悬浮歌词', 'Floating lyric window'),
+    label: L('悬浮窗歌词', 'Floating lyric window'),
     description: L(
         '所有设置只影响这个悬浮歌词窗口，不影响播放器本身的歌词样式。',
         'These settings only affect the floating lyric window, not the player itself.',
