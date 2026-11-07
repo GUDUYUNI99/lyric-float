@@ -1126,25 +1126,32 @@ const positionNowFrom = (payload, receivedAt) => {
  * - 视口（.lyric-text / .lyric-trans）负责裁切，轨道（.line-track）负责 translateX；
  *   视口必须固定成「一行可用宽度」（width:100%），否则宽度会跟着内容撑开、永远量不出溢出
  *   ——1.6.1 真机上「开不开都不滚」就是这个原因，1.6.2 修的是这里；
- * - 只有溢出（scrollWidth > clientWidth，超过 2px）才滚，短句完全静止，和以前一样；
+ * - 只有溢出（scrollWidth > clientWidth，超过 MARQUEE_MIN_OVERFLOW）才滚，短句完全静止，和以前一样；
  * - 速度按「本句剩余可唱时间」反推：句首留 MARQUEE_LEAD_IN 秒让人读完，句尾留 MARQUEE_TAIL 秒，
- *   速度夹在 MARQUEE_MIN_SPEED~MARQUEE_MAX_SPEED 之间（用户 1.6.2 真机反馈「偏快」，节奏以这里为准）；
+ *   速度 = max(本句剩余可唱时间反推, 保证至少走 MARQUEE_MIN_DURATION 秒)，上限 MARQUEE_MAX_SPEED
+ *   （用户 1.6.2 真机反馈「偏快」，节奏以这里为准；1.6.4 起短溢出不再被最低速度 60px/s 一眨眼送完）；
  * - 需要的速度超过上限时，只对这一句临时缩小字号（最多缩到 80%）把溢出压下来，普通歌词永远原字号；
  * - 换句 = 立刻复位，滚动不排队、不阻塞渲染；暂停时停在原地，继续播放时接着走。
  * - body.marquee-off 时整体不滚：这是「设置里关掉」的兜底，页面拿不到配置也能安全降级。
  */
 const MARQUEE_LEAD_IN = 1.2;
 const MARQUEE_TAIL = 0.15;
-const MARQUEE_MIN_SPEED = 60;
+const MARQUEE_MIN_SPEED = 60;   // 1.6.4 起保留为语义常量，实际速度由下方「最低可读时长」决定
 const MARQUEE_MAX_SPEED = 380;
 const MARQUEE_MIN_SHRINK = 0.8;
 const MARQUEE_DEFAULT_SECONDS = 8;
 /**
  * 溢出少于这么多像素就当作「这一句刚好放得下」，不滚（1.6.3）。
  * 「放得下」要留一点余量：中文行末的字挤在裁切边上很难看，所以阈值不是一个字宽，
- * 而是一点点（6px）—— 差半个字也算溢出，按最低速度平移一下，肉眼能看出在动。
+ * 而是一点点（6px）—— 差半个字也算溢出，会按下面的「最低可读时长」慢慢挪一下，肉眼能看出在动。
  */
 const MARQUEE_MIN_OVERFLOW = 6;
+/**
+ * 短溢出的「最低可读时长」（秒，1.6.4）。
+ * 只看溢出量 ÷ 最低速度，13px 只要 0.22 秒就走完，肉眼等于没动；按这个时长反推速度，
+ * 13px 也能以 ≈26px/s 慢慢挪半秒。只影响「很短的一段」，长句照旧按剩余可唱时间反推，速度不变。
+ */
+const MARQUEE_MIN_DURATION = 0.5;
 
 const marqueeTargets = [];
 let marqueeRaf = 0;
@@ -1251,7 +1258,7 @@ const measureMarquee = (state, availableSeconds) => {
     // 视口自己要是没有宽度（还没布局完、或被 display:none），量出来的「溢出」没有意义。
     if (!viewportWidth) return;
     let overflow = track.scrollWidth - viewportWidth;
-    // 1.6.3：阈值 6px 只当「刚好放得下」的余量用。为负说明根本不长，直接不滚。
+    // 1.6.3：阈值只当「刚好放得下」的余量用。为负说明根本不长，直接不滚。
     if (overflow < MARQUEE_MIN_OVERFLOW) return;
     let needed = overflow / budget;
     if (needed > MARQUEE_MAX_SPEED) {
@@ -1270,7 +1277,11 @@ const measureMarquee = (state, availableSeconds) => {
         needed = overflow / budget;
     }
     state.max = overflow;
-    state.speed = Math.min(MARQUEE_MAX_SPEED, Math.max(MARQUEE_MIN_SPEED, needed));
+    // 1.6.4：很短的一段也要「看得出来」。按 60px/s 走完 13px 只要 0.22 秒，眨眼就结束，
+    // 真机上就是「明明滚了却完全看不出在动」。所以速度取「剩余时间反推」和「最低可读时长反推」的较大者：
+    // 短溢出时后者更大（13px → 26px/s，走半秒），长句时前者更大、速度不变。
+    const neededSlow = overflow / MARQUEE_MIN_DURATION;
+    state.speed = Math.min(MARQUEE_MAX_SPEED, Math.max(needed, neededSlow));
     state.offset = 0;
     state.delay = MARQUEE_LEAD_IN;
     state.done = false;

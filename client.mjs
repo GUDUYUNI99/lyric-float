@@ -114,6 +114,12 @@ const POLL_MS = 100;
 // 每轮轮询拿「上一帧位置 + 这段时间」推算该到哪，偏差超过这个值就当作位置跳变，补发一帧。
 // 0.75 秒：正常播放的推算误差只有几十毫秒，而宿主自己的拖动判定是 1.5 秒，这里留一半余量。
 const POSITION_JUMP_TOLERANCE_SEC = 0.75;
+// 1.6.4：拿去重键判断的那两帧之间超过这么久，就不再做「位置跳变」判断，直接当作内容变化发一帧。
+// 起因：播放中同一句内容不变时，client 只在换句时才发帧，两帧间隔常常接近一句的长度（3–5 秒），
+// 这段时间里「上一帧位置 + 间隔」必然对不上实际位置，于是把正常播放误判成跳变、每秒多发一帧，
+// 主进程那边还会跟着把帧顺序保护的基准每秒重置一次。间隔超过这个值说明去重键本来就挡住了很多帧，
+// 此时的偏差不代表跳变，交给换句/拖动自身的信号处理。
+const POSITION_GUARD_MAX_GAP_SEC = 1.5;
 // ---- 用户歌词偏移（自主路径自己复算） ----
 // 宿主主窗口把「已经算上用户偏移」的歌词时钟交给 mount 的 ctx.lyricTime，但没有对外暴露全局
 // 歌词时钟；不挂载时只能自己补回来。键名与算法严格照抄宿主源码：
@@ -490,13 +496,25 @@ const createSyncEngine = (folium) => {
             // 往前拖、往回拖都要补；是否采纳由主进程按播放状态判断。
             // 播放中位置才会自己往前走：暂停/不在播放时前后两帧位置理应相同，任何偏差都是拖动。
             const now = Date.now();
-            const stepSec = payload.state === 'playing' ? Math.max(0, (now - lastSyncAt) / 1000) : 0;
+            const gapSec = lastSyncAt ? Math.max(0, (now - lastSyncAt) / 1000) : 0;
+            const guardActive = lastSyncAt > 0 && gapSec <= POSITION_GUARD_MAX_GAP_SEC;
+            const stepSec = payload.state === 'playing' ? gapSec : 0;
             const expectedPosition = lastSentPosition === null ? null : lastSentPosition + stepSec;
-            const drifted = lastSentSession === payload.playSessionId
+            const drifted = guardActive
+                && lastSentSession === payload.playSessionId
                 && expectedPosition !== null
                 && Math.abs(payload.position - expectedPosition) > POSITION_JUMP_TOLERANCE_SEC;
             lastSyncAt = now;
-            if (!force && key === lastSentKey && !drifted) return;
+            if (!force && key === lastSentKey && !drifted) {
+                // 1.6.4：被去重挡掉的帧也要更新两条基准：
+                //   · lastSyncAt 必须每帧都更新，否则它和 lastSentPosition 不是同一份快照的一对，
+                //     间隔被算成 3–5 秒 → 必然误判跳变（之前每秒多发一帧就是这个）；
+                //   · lastSentPosition 跟着「内容没变」的那一帧走 —— 位置只是往前挪一点，不影响
+                //     「突然跳变」的判断；拖动之后位置不再变时，这里还能把基准拉回真实值，不会一直误报。
+                lastSentPosition = payload.position;
+                lastSentSession = payload.playSessionId;
+                return;
+            }
             lastSentKey = key;
             lastSentPosition = payload.position;
             lastSentSession = payload.playSessionId;
