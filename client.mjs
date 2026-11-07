@@ -28,10 +28,12 @@
  *       text,                  // 没有当前行时保留最近一句；连最近一句都没有时是「等待播放...」
  *       translation: string | null,
  *       romanization: string | null,
- *       words: null,           // 逐字 / 卡拉 OK 预留字段，当前恒为 null
+ *       words: { text, startTime, endTime }[] | null,  // 1.5.0 起透传词级时间；没有时为 null
  *       startTime: number | null,
  *       endTime: number | null,
  *     },
+ *     sentAt: number,          // 1.5.1：这份快照的发送时刻（epoch ms，和主进程 Date.now() 同源）；
+ *                              // position 只在这一刻成立，页面推算「现在」必须用它
  *     theme: {                 // 宿主没有全局主题读取接口，只有 theme.changed 之后才有值，
  *       name, isDaylight, backgroundColor, primaryColor, accentColor, secondaryColor,
  *       fontStyle, fontStack,  // 否则为 null，由 main.cjs 用默认样式兜底
@@ -67,6 +69,41 @@
 const RPC_UPDATE = 'update-data';
 const RPC_ACTION = 'action';
 const ACTION_REQUEST_SYNC = 'request-sync';
+// 1.4.0 悬浮窗显隐（三条都是 main.cjs 那侧登记的同名 RPC / 推送消息）：
+//   toggle-widget      点播放条的「词」按钮：主进程取反显隐，返回 {visible}
+//   widget-visibility  主进程每次切换后 fire-and-forget 推 {visible}，按钮靠它点亮
+//   widget-state       激活时问一次 {visible}，补齐「main 先推、这里后监听」丢掉的首帧
+const RPC_TOGGLE_WIDGET = 'toggle-widget';
+const RPC_WIDGET_VISIBILITY = 'widget-visibility';
+const RPC_WIDGET_STATE = 'widget-state';
+// 1.5.0 显示配置：
+//   config       把 11 项设置的当前值整份推给 main（main 校验后算窗口高度、再转给页面）
+//   toggle-pin   命令面板的「锁定 / 解锁」，和窗口正中那个图钉同一套状态，返回 {pinned}
+const RPC_CONFIG = 'config';
+// 1.5.1 配置回推：main 的页面每次加载完 / 每次 activate 都发一次这个 action，
+// 让 client 立刻把设置整份重推一遍。起因是宿主「重载模组」只重建主进程 entry：
+// 文件没变时 clientUrl 不变，client 不会重跑（见 clientLoader 的 reconcile），
+// 而配置真源在 client 侧，主进程会一直停在默认值（字号回 38、逐字被关）。
+const ACTION_REQUEST_CONFIG = 'request-config';
+const RPC_TOGGLE_PIN = 'toggle-pin';
+// 设置分区 id：设置 → 高级 → 模组 → 展开「独立悬浮歌词」。
+const SETTINGS_SECTION_ID = 'lyric-widget';
+const FONT_SIZE_MIN = 20;
+const FONT_SIZE_MAX = 50;
+const FONT_SIZE_DEFAULT = 38;
+
+// 宿主的所有文案都是语言映射（FoliumLabel = Record<language, string>）：直接传字符串会被
+// sanitize 整条丢掉、界面回落到 key 名（1.5.0 踩过），所以统一走这个 helper。
+const L = (zh, en) => ({ 'zh-CN': zh, en });
+
+// 20–50 逐级下拉：要的是「一格一字号」，不用滑块（滑块很难精确停在 38）。
+const FONT_SIZE_OPTIONS = Array.from({ length: FONT_SIZE_MAX - FONT_SIZE_MIN + 1 }, (_, offset) => {
+    const size = FONT_SIZE_MIN + offset;
+    return {
+        value: String(size),
+        label: size === FONT_SIZE_DEFAULT ? L(size + '（默认）', size + ' (default)') : L(String(size), String(size)),
+    };
+});
 const WAITING_LINE_TEXT = '等待播放...';
 const LOOP_MODES = ['off', 'all', 'one'];
 
@@ -199,7 +236,25 @@ const findApproximateLineIndex = (lines, time) => {
 };
 
 /**
+ * 1.5.0 逐字歌词：把宿主的 words（{text,startTime,endTime,...}）收窄成页面要的最小形状。
+ * 没有词级时间的行返回 null，页面按普通文本渲染（和 1.4.2 的观感一致）。
+ */
+const projectWords = (words) => {
+    if (!Array.isArray(words) || words.length === 0) return null;
+    const out = [];
+    for (const word of words) {
+        if (!word || typeof word.text !== 'string') continue;
+        const startTime = Number(word.startTime);
+        const endTime = Number(word.endTime);
+        if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) continue;
+        out.push({ text: word.text, startTime, endTime });
+    }
+    return out.length > 0 ? out : null;
+};
+
+/**
  * 当前歌词行；两句之间保留上一句，只有上一句也没有（如歌曲还没开始）时才给「等待播放...」。
+ * 1.5.0 起 words 不再是 null：逐字时间由宿主给，没有就是 null。
  */
 const readLine = (folium, lines, index, time) => {
     const safeLines = Array.isArray(lines) ? lines : [];
@@ -225,8 +280,8 @@ const readLine = (folium, lines, index, time) => {
         text: line.fullText,
         translation: line.translation ?? null,
         romanization: line.romanization ?? null,
-        // 逐字 / 卡拉 OK 预留位置：后续改为 line.words，现在是 null。
-        words: null,
+        // 逐字时间：有词级数据的行才给数组，否则 null（页面走普通文本渲染）。
+        words: projectWords(line.words),
         startTime: line.startTime,
         endTime: line.endTime,
     };
@@ -267,6 +322,9 @@ const buildPayload = (folium, view, playSessionId) => {
         loopMode: folium.playback.getLoopMode(),
         line: readLine(folium, view.lines, view.lineIndex, view.time),
         theme: readTheme(folium, view.theme),
+        // 1.5.1：这份 position 是「什么时候」的位置。逐字高亮要自己按时间推进，页面上的旧快照
+        // （去重后句内不再发帧、隐藏期间停发、重开时补发）只有靠它才能换算成「现在」。
+        sentAt: Date.now(),
     };
 };
 
@@ -350,6 +408,8 @@ const createSyncEngine = (folium) => {
     let hostReady = false;
     let hostNotReadyLogged = false;
     let reportedSyncError = false;
+    // 1.5.1：设置分区注册后挂上来（pushNow 不受 60ms 防抖约束）。request-config 靠它重推配置。
+    let settingsPusher = null;
 
     // rpc 是 Folium 1.7 才有的：老宿主上别让整个模组因为取不到成员而挂掉。
     const canReport = Boolean(folium.rpc && typeof folium.rpc.call === 'function');
@@ -461,6 +521,12 @@ const createSyncEngine = (folium) => {
                 syncData(true);
                 return;
             }
+            if (message && typeof message === 'object' && message.action === ACTION_REQUEST_CONFIG) {
+                // 主进程入口重建 / 页面重载后要的是配置，不是快照；设置分区还没注册时说明
+                // 本次 activate 里接下来会自己 pushNow 一次，这里什么也不用做。
+                if (settingsPusher) settingsPusher();
+                return;
+            }
             handleAction(folium, message);
         } catch (error) {
             // 按钮可能在宿主播放服务注册之前就被点下来：记一条警告即可，不能把异常抛回 rpc 派发。
@@ -495,6 +561,10 @@ const createSyncEngine = (folium) => {
         attachListeners,
         canReport,
         canReceiveActions,
+        /** 设置分区注册后调用：挂上「立刻重推配置」的入口。 */
+        setSettingsPusher: (pusher) => {
+            settingsPusher = typeof pusher === 'function' ? pusher : null;
+        },
     };
 };
 
@@ -513,6 +583,487 @@ const clearStaleVisualizerSelection = (folium) => {
     } catch {
         // localStorage 不可用时不影响同步。
     }
+};
+
+// ---- 播放条上的「词」开关（1.4.0）----
+// 悬浮窗被 × 关掉后，模组还在跑，得留一个能把它叫回来的入口：播放进度条右侧挂一个 22px 圆形小按钮，
+// 造型跟随宿主 currentColor（1.4.2 起不再自绘描边），开启时高亮、关闭时降到 40% 透明度。
+const WIDGET_BUTTON_ID = 'lyric-widget-toggle';
+const WIDGET_BUTTON_STYLE_ID = 'lyric-widget-toggle-style';
+const WIDGET_BUTTON_HTML =
+    '<button type="button" class="lyric-widget-toggle" data-on="false" aria-pressed="false" title="显示悬浮歌词">' +
+    '<span aria-hidden="true">词</span></button>';
+const WIDGET_BUTTON_CSS = `
+.lyric-widget-toggle {
+    all: unset;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    color: inherit;
+    opacity: 0.4;
+    transition: opacity 0.15s ease, background-color 0.15s ease;
+}
+.lyric-widget-toggle:hover {
+    opacity: 0.8;
+    background-color: color-mix(in srgb, currentColor 12%, transparent);
+}
+.lyric-widget-toggle[data-on="true"] {
+    opacity: 1;
+    background-color: color-mix(in srgb, currentColor 18%, transparent);
+}
+.lyric-widget-toggle:focus-visible {
+    opacity: 1;
+    outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);
+    outline-offset: 1px;
+}
+`;
+
+/**
+ * 注册播放条上的「词」按钮。返回 `{ setVisible, dispose }`；宿主没有 progressButtons 时返回 null。
+ * 显隐真源在主进程（它才是真的在 show/hide 窗口），这里只负责画和高亮。
+ */
+const registerWidgetToggleButton = (folium) => {
+    const progressButtons = folium.registries && folium.registries.progressButtons;
+    if (!progressButtons || typeof progressButtons.register !== 'function') {
+        folium.log.warn('[lyric-widget] 当前 Folium 没有 progressButtons 注册表，播放条按钮不可用（需要 1.4+）');
+        return null;
+    }
+    let button = null;
+    let styleNode = null;
+    let visible = true;
+
+    const paint = () => {
+        if (!button) return;
+        button.dataset.on = visible ? 'true' : 'false';
+        button.setAttribute('aria-pressed', visible ? 'true' : 'false');
+        button.title = visible ? '隐藏悬浮歌词' : '显示悬浮歌词';
+    };
+
+    const def = {
+        id: WIDGET_BUTTON_ID,
+        slot: 'progress.trailing',
+        // 480 = 排在宿主内置按钮之后；同一个 order 上再按 id 排序，所以位置稳定。
+        order: 480,
+        // 进度条收起（迷你 / 歌词页折叠）时跟着消失，别在只剩一条细线的地方挤一个按钮。
+        hideWhenCollapsed: true,
+        mount(container) {
+            // 播放条在宿主自己的 ShadowRoot 里：样式必须注入按钮所在的 root，挂到 document.head 不生效。
+            const root = container.getRootNode && container.getRootNode();
+            const styleHost = root && root.nodeType === 11 && root.head ? root.head : root;
+            if (styleHost && typeof styleHost.querySelector === 'function') {
+                styleNode = styleHost.querySelector('#' + WIDGET_BUTTON_STYLE_ID);
+            }
+            if (!styleNode) {
+                styleNode = document.createElement('style');
+                styleNode.id = WIDGET_BUTTON_STYLE_ID;
+                styleNode.textContent = WIDGET_BUTTON_CSS;
+                if (styleHost && typeof styleHost.appendChild === 'function') styleHost.appendChild(styleNode);
+            }
+            container.innerHTML = WIDGET_BUTTON_HTML;
+            button = container.querySelector('.lyric-widget-toggle');
+            paint();
+            if (!button) return undefined;
+            const onClick = () => {
+                // 先本地翻转让手感即时；主进程返回后以它的值对齐（失败则回滚）。
+                visible = !visible;
+                paint();
+                Promise.resolve(folium.rpc.call(RPC_TOGGLE_WIDGET))
+                    .then((result) => {
+                        if (result && typeof result.visible === 'boolean') {
+                            visible = result.visible;
+                            paint();
+                        }
+                    })
+                    .catch((error) => {
+                        visible = !visible;
+                        paint();
+                        folium.log.warn('[lyric-widget] 切换悬浮歌词失败', error);
+                    });
+            };
+            button.addEventListener('click', onClick);
+            // cleanup 用 mount 时这个局部节点：dispose() 会先把 button 置 null 再等 React 卸载，
+            // 直接碰外层 button 会读到 null（停用/重载模组时宿主报一次模组故障）。
+            const mountedButton = button;
+            return () => {
+                mountedButton.removeEventListener('click', onClick);
+                if (button === mountedButton) button = null;
+            };
+        },
+    };
+
+    let handle = null;
+    try {
+        handle = progressButtons.register(def);
+    } catch (error) {
+        // id 重复（模组热重载时旧条目还没被宿主清掉）之类的注册错误：按钮没了不该拖垮数据同步。
+        folium.log.warn('[lyric-widget] 注册播放条「词」按钮失败', error);
+        return null;
+    }
+
+    return {
+        setVisible(next) {
+            const value = next !== false;
+            if (value === visible) return;
+            visible = value;
+            paint();
+        },
+        dispose() {
+            try {
+                if (handle && typeof handle.unregister === 'function') handle.unregister();
+            } catch (error) {
+                folium.log.warn('[lyric-widget] 注销播放条按钮失败', error);
+            }
+            if (styleNode && styleNode.parentNode) styleNode.parentNode.removeChild(styleNode);
+            styleNode = null;
+            button = null;
+        },
+    };
+};
+
+/**
+ * 1.5.0：模组设置表单（设置 → 高级 → 模组 → 展开「独立悬浮歌词」）。
+ *
+ * 设置值由宿主持久化（FoliumSettingAccess 读写宿主参数存储），这里只做三件事：
+ * 声明表单、读值、把值推给 main.cjs。窗口高度和 CSS 变量都在主进程/窗口页面里算，
+ * client 不持有第二份真相，避免两边各存一份后互相覆盖。
+ * defaultValue 必须与 main.cjs 的 DEFAULT_CONFIG 一致（默认观感 = 1.4.2）。
+ */
+const buildSettingsSection = () => ({
+    id: SETTINGS_SECTION_ID,
+    label: L('独立悬浮歌词', 'Floating lyric window'),
+    description: L(
+        '所有设置只影响这个悬浮歌词窗口，不影响播放器本身的歌词样式。',
+        'These settings only affect the floating lyric window, not the player itself.',
+    ),
+    settings: [
+        {
+            key: 'fontSize',
+            type: 'select',
+            label: L('字号', 'Font size'),
+            description: L(
+                '窗口高度会跟着字号一起缩放，歌词始终贴着窗口底部留白。',
+                'The window height follows the font size so the lyric keeps its bottom margin.',
+            ),
+            group: L('通用', 'Shared'),
+            defaultValue: String(FONT_SIZE_DEFAULT),
+            options: FONT_SIZE_OPTIONS,
+        },
+        {
+            key: 'karaoke',
+            type: 'boolean',
+            label: L('逐字歌词（已唱染色 / 未唱变淡）', 'Word-by-word karaoke'),
+            description: L(
+                '需要歌词自带逐字时间；没有逐字时间的行仍按整行显示。',
+                'Needs word-level timing; lines without it are still shown as a whole.',
+            ),
+            group: L('通用', 'Shared'),
+            defaultValue: false,
+        },
+        {
+            key: 'fontMode',
+            type: 'select',
+            label: L('字体来源', 'Font source'),
+            description: L(
+                '「跟随主题字体」用播放器当前主题解析出的字体栈。',
+                '"Theme" follows the player theme font stack.',
+            ),
+            group: L('通用', 'Shared'),
+            defaultValue: 'system',
+            options: [
+                { value: 'system', label: L('系统无衬线（默认）', 'System sans-serif (default)') },
+                { value: 'theme', label: L('跟随主题字体', 'Follow theme font') },
+            ],
+        },
+        {
+            key: 'surface',
+            type: 'select',
+            label: L('底色', 'Background'),
+            description: L(
+                '只在鼠标移到窗口上、且未锁定时出现（锁定穿透时不铺底色）。',
+                'Shown only while the pointer is over the window and it is not locked.',
+            ),
+            group: L('通用', 'Shared'),
+            defaultValue: 'auto',
+            options: [
+                { value: 'auto', label: L('深色（默认，透明度可调）', 'Dark (default)') },
+                { value: 'dark', label: L('深色（更实）', 'Dark, more opaque') },
+                { value: 'light', label: L('浅色毛玻璃', 'Light frosted') },
+                { value: 'transparent', label: L('不显示底色', 'No background') },
+            ],
+        },
+        {
+            key: 'surfaceOpacity',
+            type: 'number',
+            label: L('底色不透明度', 'Background opacity'),
+            description: L('仅对深色底色生效，0.2–1.0。', 'Dark backgrounds only, 0.2-1.0.'),
+            group: L('通用', 'Shared'),
+            defaultValue: 0.58,
+            min: 0.2,
+            max: 1,
+            step: 0.05,
+        },
+        {
+            key: 'radius',
+            type: 'number',
+            label: L('窗口圆角', 'Window radius'),
+            description: L('0–28 像素；0 为直角。', '0-28 px; 0 means square corners.'),
+            group: L('通用', 'Shared'),
+            defaultValue: 16,
+            min: 0,
+            max: 28,
+            step: 1,
+        },
+        {
+            key: 'border',
+            type: 'boolean',
+            label: L('显示细描边', 'Show hairline border'),
+            group: L('通用', 'Shared'),
+            defaultValue: true,
+        },
+        {
+            key: 'backdrop',
+            type: 'boolean',
+            label: L('歌词底衬', 'Lyric backdrop'),
+            description: L(
+                '在歌词块后面垫一层半透明黑，壁纸很花时更容易读。',
+                'Adds a translucent dark plate behind the lyric for busy wallpapers.',
+            ),
+            group: L('通用', 'Shared'),
+            defaultValue: false,
+        },
+        {
+            key: 'sungColor',
+            type: 'color',
+            label: L('已唱字色', 'Sung word color'),
+            description: L('逐字歌词开启时，唱过的字用这个颜色。', 'Color of words already sung when karaoke is on.'),
+            group: L('通用', 'Shared'),
+            defaultValue: '#7dd3fc',
+        },
+        {
+            key: 'unsungOpacity',
+            type: 'number',
+            label: L('未唱字不透明度', 'Unsung word opacity'),
+            description: L(
+                '逐字歌词开启时，没唱到的字的透明度，0.2–1.0（越小越淡）。',
+                'Opacity of words not sung yet, 0.2-1.0 (lower is fainter).',
+            ),
+            group: L('通用', 'Shared'),
+            defaultValue: 1,
+            min: 0.2,
+            max: 1,
+            step: 0.05,
+        },
+        {
+            key: 'pausedDim',
+            type: 'boolean',
+            label: L('暂停时整体变淡', 'Dim while paused'),
+            group: L('通用', 'Shared'),
+            defaultValue: false,
+        },
+    ],
+});
+
+/**
+ * 读当前设置并收窄成 main.cjs 认识的配置对象（三段结构：shared / desktop / window）。
+ * 读不到（注册表没给 handle / 宿主老版本）时返回 null，调用方跳过推送。
+ */
+const readConfigFromHandle = (handle) => {
+    if (!handle || !handle.settings || typeof handle.settings.get !== 'function') return null;
+    let values;
+    try {
+        values = handle.settings.get() || {};
+    } catch (error) {
+        debugLog('[lyric-widget] 读取模组设置失败', error);
+        return null;
+    }
+    const toNumber = (value, fallback) => {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : fallback;
+    };
+    return {
+        shared: {
+            fontSize: toNumber(values.fontSize, FONT_SIZE_DEFAULT),
+            karaoke: values.karaoke === true,
+            fontMode: values.fontMode,
+            surface: values.surface,
+            surfaceOpacity: toNumber(values.surfaceOpacity, 0.58),
+            radius: toNumber(values.radius, 16),
+            // 布尔项没写过时是 undefined，按「默认开」处理；只有明确 false 才算关。
+            border: values.border !== false,
+            sungColor: values.sungColor,
+            unsungOpacity: toNumber(values.unsungOpacity, 1),
+            pausedDim: values.pausedDim === true,
+            backdrop: values.backdrop === true,
+        },
+        desktop: {},
+        window: {},
+    };
+};
+
+/**
+ * 注册设置表单，并在每次改动后把配置推给主进程。
+ * 返回值里的 push 也用于激活时的首帧下发（此时宿主可能还没恢复完设置值）。
+ */
+const registerSettingsSection = (folium) => {
+    const registry = folium.registries && folium.registries.settingsSections;
+    if (!registry || typeof registry.register !== 'function') {
+        debugLog('[lyric-widget] 当前 Folium 没有 settingsSections 注册表，跳过设置表单');
+        return null;
+    }
+    const section = buildSettingsSection();
+    // 连续操作（拖不透明度输入框、连点字号）会一次刷出很多 onChange：逐条推给主进程的话，
+    // 主进程会连着 setSize / 重发配置，窗口跟着抖。这里合并成「最后一次为准」，60ms 后推一次。
+    let pushTimer = null;
+    const pushNow = () => {
+        const config = readConfigFromHandle(handle);
+        if (!config) return;
+        if (!folium.rpc || typeof folium.rpc.call !== 'function') return;
+        try {
+            // 主进程会做一次 normalizeConfig，坏值在那里回落默认，这里不重复校验。
+            Promise.resolve(folium.rpc.call(RPC_CONFIG, config)).catch((error) => {
+                folium.log.warn('[lyric-widget] 下发显示配置失败', error);
+            });
+        } catch (error) {
+            folium.log.warn('[lyric-widget] 下发显示配置失败', error);
+        }
+    };
+    const push = () => {
+        if (pushTimer) clearTimeout(pushTimer);
+        pushTimer = setTimeout(() => {
+            pushTimer = null;
+            pushNow();
+        }, 60);
+    };
+    let handle = null;
+    try {
+        handle = registry.register({
+            id: section.id,
+            label: section.label,
+            description: section.description,
+            settings: section.settings,
+        });
+    } catch (error) {
+        // 注册失败不影响悬浮窗本身，只是没有设置界面（样式走默认）。
+        folium.log.warn('[lyric-widget] 注册模组设置失败（悬浮窗仍用默认样式）', error);
+        return null;
+    }
+    let offChange = null;
+    try {
+        if (handle && handle.settings && typeof handle.settings.onChange === 'function') {
+            offChange = handle.settings.onChange(() => push());
+        }
+    } catch (error) {
+        folium.log.warn('[lyric-widget] 订阅模组设置变化失败', error);
+    }
+    // 激活即下发一次（不走防抖）：宿主重启后会恢复设置值，窗口不能停在默认 38px 上。
+    pushNow();
+    return {
+        handle,
+        push,
+        // 1.5.1：main 的 request-config 走这里——绕开 60ms 防抖立刻推一次。
+        pushNow,
+        dispose: () => {
+            if (pushTimer) {
+                clearTimeout(pushTimer);
+                pushTimer = null;
+            }
+            if (offChange) {
+                try {
+                    offChange();
+                } catch (error) {
+                    // 宿主已经整体回收过，忽略。
+                }
+                offChange = null;
+            }
+            try {
+                if (handle && typeof handle.unregister === 'function') handle.unregister();
+            } catch (error) {
+                // 同上。
+            }
+            handle = null;
+        },
+    };
+};
+
+/**
+ * 1.5.0：命令面板入口（模组页同一块 surface 上也能直接跑）。
+ * 全局快捷键是 Folium 1.7+ 才支持的字段，老宿主上只注册命令本身。
+ */
+const registerWidgetCommands = (folium, settings) => {
+    const registry = folium.registries && folium.registries.commands;
+    if (!registry || typeof registry.register !== 'function') {
+        debugLog('[lyric-widget] 当前 Folium 没有 commands 注册表，跳过命令');
+        return [];
+    }
+    const minor = (folium.host && folium.host.folium && folium.host.folium.minor) || 0;
+    const handles = [];
+    // 返回 Promise 而不是吞掉失败：命令面板会 await run，失败能显示在卡片上，而不是假装成功。
+    const callMain = (method) => {
+        try {
+            return Promise.resolve(folium.rpc.call(method));
+        } catch (error) {
+            folium.log.warn('[lyric-widget] 执行命令失败', error);
+            return Promise.reject(error);
+        }
+    };
+    // 字号 ±1：直接改宿主里的设置值，onChange 会带着新配置推给主进程并触发窗口重算。
+    const stepFontSize = (delta) => {
+        if (!settings || !settings.handle || !settings.handle.settings) return undefined;
+        const current = readConfigFromHandle(settings.handle);
+        if (!current) return undefined;
+        const currentSize = Math.round(current.shared.fontSize);
+        const next = Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, currentSize + delta));
+        if (next === currentSize) return undefined;
+        try {
+            return settings.handle.settings.set({ fontSize: String(next) });
+        } catch (error) {
+            folium.log.warn('[lyric-widget] 调整字号失败', error);
+            return Promise.reject(error);
+        }
+    };
+    const add = (definition) => {
+        try {
+            const registered = registry.register(minor >= 7 ? { ...definition, globalShortcut: true } : definition);
+            if (registered) handles.push(registered);
+        } catch (error) {
+            folium.log.warn('[lyric-widget] 注册命令失败', error);
+        }
+    };
+    add({
+        id: 'lyric-widget-toggle',
+        label: L('桌面歌词：显示 / 隐藏', 'Floating lyrics: show / hide'),
+        description: L('和播放控制条上的「词」按钮同一个开关。', 'Same switch as the 词 button on the player bar.'),
+        keywords: ['歌词', '桌面歌词', '悬浮窗', 'widget', 'lyric'],
+        run: () => callMain(RPC_TOGGLE_WIDGET),
+    });
+    add({
+        id: 'lyric-widget-pin',
+        label: L('桌面歌词：锁定 / 解锁位置', 'Floating lyrics: lock / unlock'),
+        description: L('和悬浮窗正中的图钉按钮同一套状态。', 'Same state as the pin button in the window.'),
+        keywords: ['歌词', '锁定', '固定', 'pin', 'lock'],
+        run: () => callMain(RPC_TOGGLE_PIN),
+    });
+    add({
+        id: 'lyric-widget-font-up',
+        label: L('桌面歌词：字号 +1', 'Floating lyrics: font size +1'),
+        keywords: ['歌词', '字号', '字体大小'],
+        run: () => stepFontSize(1),
+    });
+    add({
+        id: 'lyric-widget-font-down',
+        label: L('桌面歌词：字号 -1', 'Floating lyrics: font size -1'),
+        keywords: ['歌词', '字号', '字体大小'],
+        run: () => stepFontSize(-1),
+    });
+    return handles;
 };
 
 export default function activate(folium) {
@@ -554,6 +1105,48 @@ export default function activate(folium) {
     }
 
     const disposers = engine.attachListeners();
+
+    // 1.4.0：播放条上的「词」开关。显隐真源在 main（它才真的在 show/hide 窗口），
+    // 这里订阅 main 推来的 widget-visibility 点亮按钮，激活时再用 widget-state 对齐一次
+    // （main 首帧那边是 fire-and-forget，早于这里注册监听就会丢）。
+    const widgetButton = registerWidgetToggleButton(folium);
+    if (widgetButton) {
+        disposers.push(() => widgetButton.dispose());
+        if (typeof folium.rpc.on === 'function') {
+            disposers.push(
+                folium.rpc.on(RPC_WIDGET_VISIBILITY, (message) => {
+                    widgetButton.setVisible(message && message.visible);
+                }),
+            );
+        }
+        Promise.resolve(folium.rpc.call(RPC_WIDGET_STATE))
+            .then((initial) => widgetButton.setVisible(initial && initial.visible))
+            .catch((error) => {
+                // 宿主没登记 widget-state（不该发生）时保持默认「显示」，不影响数据同步。
+                folium.log.warn('[lyric-widget] 读取悬浮窗显隐状态失败', error);
+            });
+    }
+
+    // 1.5.0：设置表单。注册成功时 activate 里立刻会把当前配置推一份给 main，
+    // 所以窗口在创建后不久就能拿到真实字号 / 外观，而不是等用户去动设置。
+    const settings = registerSettingsSection(folium);
+    if (settings) {
+        disposers.push(() => settings.dispose());
+        // 1.5.1：主进程「重载模组」不会重跑 client（clientUrl 没变），配置真源又在这里，
+        // 所以留一个口子让它来要：request-config → 立刻重推一次设置。
+        if (engine && typeof engine.setSettingsPusher === 'function') engine.setSettingsPusher(settings.pushNow);
+    }
+    // 1.5.0：命令面板（显隐 / 锁定 / 字号 ±1）。字号走宿主设置，改动会自动流回 main。
+    const commandHandles = registerWidgetCommands(folium, settings);
+    for (const handle of commandHandles) {
+        disposers.push(() => {
+            try {
+                if (handle && typeof handle.unregister === 'function') handle.unregister();
+            } catch (error) {
+                // 宿主已经整体回收过注册表，忽略。
+            }
+        });
+    }
 
     // 自主驱动：每 100ms 读一次全局播放状态，自己算当前行；folium.every 由宿主托管
     // （模组停止时自动清理），不自己 setInterval。

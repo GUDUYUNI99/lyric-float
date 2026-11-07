@@ -17,6 +17,7 @@
  *       { action: 'set-volume', volume: 0–1 }
  *       { action: 'set-loop', mode: 'off' | 'all' | 'one' }
  *       { action: 'request-sync' }
+ *       { action: 'request-config' }   1.5.1：请 client 把设置整份重推一次（走 RPC_CONFIG）
  *
  * payload 字段见 client.mjs 文件头（playSessionId / song / state / position / duration / liked /
  * canLike / volume / muted / loopMode / line / theme）；窗口只用 state、volume、loopMode、line
@@ -35,6 +36,19 @@
  *     内容全部由本文件生成，歌词只经 textContent 写入，不加载任何外部资源。
  *   - api.rpc.send 是 fire-and-forget：client 没挂载时消息直接丢弃。所以窗口加载完会先补发最后一份
  *     快照，再发一次 request-sync。
+ *   - 快照按「帧顺序」挑：同一 playSessionId 内只丢「小幅后退且行号也退回去」的乱序旧帧，
+ *     大幅后退（用户拖进度条）一律当真实跳转接受，且连续丢帧有超时兜底 —— 不会因为跳转而停住
+ *     （见 isStaleFrame）；换歌由 playSessionId 分桶，新会话一律接受。
+ *   - 形态（桌面歌词 / 悬浮窗歌词）：1.3.0 只有桌面歌词，applySurface 是 1.7.0 的接入点，
+ *     状态和 IPC 通道已预留，请求 'window' 目前只记日志、不改行为。
+ *   - 形态切换的调用协议：client.mjs 用 folium.rpc.call('set-surface', 'desktop' | 'window') 请求，
+ *     主进程返回 { ok, code?, surface }。宿主只保留 activate 返回的 dispose 函数，所以不能靠返回值暴露接口。
+ *   - 1.4.0 显隐：窗口不再跟着快照无条件显示。client.mjs 播放条上的「词」按钮用
+ *     folium.rpc.call('toggle-widget') 切显示/隐藏（返回 { visible }），首帧用
+ *     folium.rpc.call('widget-state') 对齐（主进程可能先于 client 推送）；每次显隐变化再用
+ *     api.rpc.send('widget-visibility', { visible }) 推回 client 给按钮高亮。
+ *     窗口右上角的 × 走 ipcRenderer.send('my-lyric-widget:close')，效果同样是隐藏（模组仍启用）。
+ *     隐藏期间照收快照（记 lastPayload）但不转给页面；重新显示时补发最后一份并 request-sync。
  */
 'use strict';
 
@@ -47,12 +61,17 @@ const LOG_PREFIX = '[lyric-widget]';
 // 和 client.mjs 约定的 RPC 名字（那边是 RPC_UPDATE / RPC_ACTION）。
 const RPC_UPDATE = 'update-data';
 const RPC_ACTION = 'action';
+// 1.4.0：播放条「词」开关。client → main 用 folium.rpc.call 请求，main 用返回值回答。
+const RPC_TOGGLE_WIDGET = 'toggle-widget';
+// main → client：显隐变化（fire-and-forget，client 没挂载就丢，所以还有下面的首帧对齐）。
+const RPC_WIDGET_VISIBILITY = 'widget-visibility';
+// client 首帧对齐：问一次当前显隐，避免「main 已经推过、client 才开始监听」造成的按钮高亮错位。
+const RPC_WIDGET_STATE = 'widget-state';
 
 // 窗口页面的 IPC 通道。带上模组 id 前缀：ipcMain 的通道是全应用共用的，
 // 别的模组若也叫 'action-to-client' 就会收到本窗口的消息。
 const IPC_ACTION = 'my-lyric-widget:action-to-client';
-const IPC_DATA = 'my-lyric-widget:data-from-client';
-// 排查用的页面→主进程调试通道（真机定位完连监听一起删掉）。
+const IPC_DATA = 'my-lyric-widget:data-from-client';// 排查用的页面→主进程调试通道（真机定位完连监听一起删掉）。
 const IPC_DEBUG = 'my-lyric-widget:debug';
 // 主进程→页面的悬停状态（true/false）。整窗是拖拽区时渲染进程收不到鼠标事件，
 // 所以「鼠标是否停在窗口上」由主进程轮询光标位置后从这条通道推给页面。
@@ -74,10 +93,32 @@ const IPC_LAYOUT = 'my-lyric-widget:layout';
 const IPC_PIN_RECT = 'my-lyric-widget:pin-rect';
 // 命中测试往外放一点：按钮本体 32×32，光标擦边时提前 2px 恢复可点，免得第一下点空。
 const PIN_HIT_PADDING = 2;
+// 页面先把这一帧画完、回信之后才上屏；这么等不到就兜底上屏（页面卡住/被销毁时不能点了没反应）。
+const SHOWN_TIMEOUT_MS = 300;
+// 右上角 ×（1.4.0，页面→主进程）：只隐藏悬浮窗，不停用模组。重新显示走播放条上的「词」按钮。
+const IPC_CLOSE = 'my-lyric-widget:close';
+// 1.5.1 显示握手（解决「× 关掉再打开时先闪一下旧画面」）：
+//   IPC_SHOW  主进程 → 页面：准备显示了，页面回一句 handled 再让窗口真正上屏
+//   IPC_SHOWN 页面 → 主进程：这一帧已经画好，可以 showInactive
+// 隐藏期间主进程照收快照但没转给页面，页面上停的是关闭那一刻的画面（高亮停在旧位置）。
+const IPC_SHOW = 'my-lyric-widget:show';
+const IPC_SHOWN = 'my-lyric-widget:shown';
 // 排版三态（主进程侧只用来校验从页面收到的值，别让坏值写进状态文件）。
 // 第三态 1.3.0 从「原文 + 译文 + 罗马音」(full) 改成「原文 + 罗马音」(roman)；老存档里的 full 在恢复时映射过来。
 const LAYOUT_MODE_IDS = ['text', 'text-trans', 'roman'];
 const LEGACY_LAYOUT_IDS = { full: 'roman' };
+// 形态切换（1.7.0 落地「桌面歌词 / 悬浮窗歌词」两种形态）：1.3.0 只有桌面歌词，这里先把状态位和
+// IPC 预留出来。页面此刻还不发这条消息，1.7.0 加「切换形态」按钮时直接复用。
+const SURFACE_IDS = ['desktop', 'window'];
+const IPC_SURFACE = 'my-lyric-widget:surface';
+// 形态切换的调用协议：client.mjs（1.7.0 起）用 folium.rpc.call(RPC_SURFACE, 'window') 请求切换，
+// 主进程在主窗口的渲染进程里 answer。宿主只保留 activate 返回的 dispose 函数（electron/modSystem/
+// nodeEntry.cjs:135），所以接口只能走 RPC，不能靠 activate 返回值。
+const RPC_SURFACE = 'set-surface';
+// 1.7.0 起 applySurface 的返回值：ok=false 时 code 说明为什么没切成。
+const SURFACE_INVALID = 'invalid';
+const SURFACE_UNCHANGED = 'unchanged';
+const SURFACE_UNSUPPORTED = 'unsupported';
 // 窗口状态（位置 + 是否固定）存在 userData 下的一个小 JSON 里，重启后恢复。
 // 只记这两个值：尺寸固定、不需要记。
 const STATE_FILE_NAME = 'my-lyric-widget-state.json';
@@ -123,6 +164,8 @@ const ICON_PATHS = {
     // 固定 / 解锁按钮：pin 表示「未固定，可点亮固定」，pin-off 表示「已固定，可点亮解锁」。图标两态共用同一颗按钮。
     pin: '<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>',
     'pin-off': '<path d="M12 17v5"/><path d="M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89"/><path d="m2 2 20 20"/><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h11"/>',
+    // 右上角 ×（1.4.0）：只关悬浮窗、不停用模组。
+    close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
 };
 
 /** 包一层 <svg>：只有 filled 的图标用 currentColor 填实（和播放器的 Pause/Play 一致）。 */
@@ -157,6 +200,7 @@ const ICON_SVG = {
     layout: layoutIcon,
     pin: svgIcon('pin'),
     'pin-off': svgIcon('pin-off'),
+    close: svgIcon('close'),
 };
 
 // ---- 排查日志（真机 IPC 链路定位用，定位完删掉） ----
@@ -168,10 +212,121 @@ console.log(`${LOG_PREFIX} main 模块已求值（main.cjs 被 require）`, {
 
 // 排版最多两行（原文 + 译文 / 罗马音）。窗口按「两行 + 顶部让位 + 底部少量留白」定高：
 // 首行顶 64 + 两行 86.6 + 底部 29.4 ≈ 180；再高底部空白就明显了（用户要求砍掉底部空间）。
+// 1.5.0 起高度跟着字号走（38px 时仍是 180），见下面的 windowHeightFor；宽度始终 640。
 const WINDOW_WIDTH = 640;
-const WINDOW_HEIGHT = 180;
 // 默认停在工作区底部中间，离底边和左右边这么多像素。
 const WINDOW_MARGIN = 48;
+
+// ---- 1.5.0 可配置项（字号 / 逐字 / 字体 / 外观） ----
+// 这些值的「真源」在宿主的模组设置里（client.mjs 用 settingsSections 声明表单），
+// client 每次变化都通过 folium.rpc.call('config', ...) 推给主进程；主进程只做校验、定尺寸、转给页面。
+const RPC_CONFIG = 'config';
+// 1.5.1：主进程 → client 的「重发一次配置」指令（和 request-sync 一样走 action 通道）。
+// 配置真源在 client 侧，而宿主「重载模组」在模组文件没变时不会重跑 client，只能由这边主动去要。
+const ACTION_REQUEST_CONFIG = 'request-config';
+// 命令面板「锁定 / 解锁位置」：命令面板没有页面上下文，由主进程翻状态再推回页面。
+const RPC_TOGGLE_PIN = 'toggle-pin';
+// 主进程 → 页面：把配置下发进窗口页面（字号、逐字、外观）。
+const IPC_CONFIG = 'my-lyric-widget:config';
+
+const SURFACE_MODES = ['auto', 'dark', 'light', 'transparent'];
+const FONT_MODES = ['system', 'theme'];
+const FONT_SIZE_MIN = 20;
+const FONT_SIZE_MAX = 50;
+const FONT_SIZE_DEFAULT = 38;
+
+/**
+ * 配置按「归属」分段，和设置面板的分组一一对应：
+ *  shared  = 通用（外观、字号、逐字）
+ *  desktop = 桌面歌词专属（1.6.x 的长句滚动会落在这里，现在先占位）
+ *  window  = 悬浮窗歌词专属（1.7.0 再填）
+ * 默认值必须和 1.4.2 的观感完全一致：加设置项不允许改变现有默认样子。
+ */
+const DEFAULT_CONFIG = {
+    shared: {
+        fontSize: FONT_SIZE_DEFAULT,
+        karaoke: false,
+        fontMode: 'system',
+        surface: 'auto',
+        surfaceOpacity: 0.58,
+        radius: 16,
+        border: true,
+        sungColor: '#7dd3fc',
+        unsungOpacity: 1,
+        pausedDim: false,
+        backdrop: false,
+    },
+    desktop: {},
+    window: {},
+};
+
+const clampNumber = (value, min, max) => Math.min(max, Math.max(min, value));
+
+/**
+ * 校验一份配置；坏值一律回落到默认值，绝不把非法数据传给页面。
+ * 只认 shared 段；flat 结构（1.5.0 早期写法）把顶层当 shared 读，方便以后拆分。
+ */
+const normalizeConfig = (raw) => {
+    const config = {
+        shared: { ...DEFAULT_CONFIG.shared },
+        desktop: { ...DEFAULT_CONFIG.desktop },
+        window: { ...DEFAULT_CONFIG.window },
+    };
+    if (!raw || typeof raw !== 'object') return config;
+    const sharedSource = raw.shared && typeof raw.shared === 'object' ? raw.shared : raw;
+
+    const fontSize = toFiniteNumber(sharedSource.fontSize);
+    if (fontSize !== null) config.shared.fontSize = Math.round(clampNumber(fontSize, FONT_SIZE_MIN, FONT_SIZE_MAX));
+    config.shared.karaoke = sharedSource.karaoke === true;
+    if (FONT_MODES.includes(sharedSource.fontMode)) config.shared.fontMode = sharedSource.fontMode;
+    if (SURFACE_MODES.includes(sharedSource.surface)) config.shared.surface = sharedSource.surface;
+
+    const opacity = toFiniteNumber(sharedSource.surfaceOpacity);
+    // 和表单声明对齐（min 0.2）：0 会让悬停底色彻底消失，用户会以为是 bug。
+    if (opacity !== null) config.shared.surfaceOpacity = clampNumber(opacity, 0.2, 1);
+    const radius = toFiniteNumber(sharedSource.radius);
+    if (radius !== null) config.shared.radius = Math.round(clampNumber(radius, 0, 28));
+    config.shared.border = sharedSource.border !== false;
+    if (typeof sharedSource.sungColor === 'string') {
+        // 颜色框可能给 #rgb，展开成 #rrggbb；其他格式回落默认。
+        const hex = sharedSource.sungColor.trim().toLowerCase();
+        const expanded = /^#[0-9a-f]{3}$/.test(hex)
+            ? '#' + hex.slice(1).split('').map((ch) => ch + ch).join('')
+            : hex;
+        if (/^#[0-9a-f]{6}$/.test(expanded)) config.shared.sungColor = expanded;
+    }
+    const unsungOpacity = toFiniteNumber(sharedSource.unsungOpacity);
+    if (unsungOpacity !== null) config.shared.unsungOpacity = clampNumber(unsungOpacity, 0.2, 1);
+    config.shared.pausedDim = sharedSource.pausedDim === true;
+    config.shared.backdrop = sharedSource.backdrop === true;
+    return config;
+};
+
+/**
+ * 1.5.1：启动时先落一份默认配置，拿到 client 推来的真配置之前先用它建窗口。
+ * 高度沿用上次的实际窗口高度（见 savePersistedState），字号 >38px 的用户重启不会先矮一截再变高；
+ * 真配置一到就走 RPC_CONFIG → applyWindowSize，与这里无关。宽度始终 640。
+ */
+const prepareConfig = (persisted) => {
+    const config = normalizeConfig(null);
+    const savedHeight = persisted && persisted.height;
+    if (Number.isFinite(savedHeight) && savedHeight >= 60 && savedHeight <= 600) {
+        config.window.height = Math.round(savedHeight);
+    }
+    return config;
+};
+
+/**
+ * 字号 ↔ 窗口高度：主行 1.25 倍行高、副行 0.71 × 1.3 倍（和页面 CSS 的比例一致），
+ * 上下留白按同一比例缩放。38px + 两行正好是 180，保证默认配置下窗口尺寸和 1.4.x 一样。
+ * 1.3.0 的窗口高度是写死的 180；1.5.0 起由字号推算，宽度仍固定 640。
+ */
+const lyricBlockHeight = (config) => {
+    const size = config.shared.fontSize;
+    return size * 1.25 + size * 0.71 * 1.3 + 4;
+};
+
+const windowHeightFor = (config) => Math.round(55 + lyricBlockHeight(config) * 1.4435);
 
 const LOOP_MODES = ['off', 'all', 'one'];
 const DIRECT_ACTIONS = ['next', 'prev', 'toggle', 'request-sync'];
@@ -184,6 +339,66 @@ const MAX_CRASH_RELOADS = 2;
 const CRASH_RELOAD_WINDOW_MS = 60 * 1000;
 // 创建悬浮窗失败时最多尝试重建几次（用户手动关闭后的重建不计入）；宿主出现新窗口时重新计数。
 const MAX_WIDGET_RECREATES = 3;
+
+// ---- 主进程侧的帧顺序保护（1.3.0 之前只有页面自己按行号兜底，换歌时会串帧） ----
+// 目标：拦掉「同一会话里乱序到达的旧帧」，同时绝不能因为用户拖进度条而卡住。
+// client 每 100ms 轮询一次，乱序造成的迟到帧只可能小幅后退，所以按后退幅度分档：
+//   - 后退 > REORDER_MAX_BACKSTEP：只可能是真实跳转（用户拖进度条、单曲循环回到开头），
+//     立刻接受并重定基准；
+//   - 小幅后退且行号也退到更前面：可能是乱序旧帧，先丢，但最多丢 STALE_GUARD_MS，
+//     超时说明是真实后退（往回拖了不到 1 秒、跨句拖），立刻接受并重定基准 —— 兜底保证不会停住；
+//   - 同一句内的小幅后退一律接受（事件时刻快照、播放器抖动都落在这里）。
+const REORDER_MAX_BACKSTEP = 1;
+const STALE_GUARD_MS = 800;
+/** 行号：只认 ≥0 的整数，其余（句间、没有歌词行、字段缺失）一律按 -1 处理。 */
+const lineIndexOf = (payload) => {
+    const line = payload && payload.line;
+    return line && Number.isFinite(line.index) ? line.index : -1;
+};
+/** 播放位置（秒）：缺失或非数字时返回 null，表示这一帧不参与位置比较。 */
+const positionOf = (payload) => {
+    const position = payload && payload.position;
+    return Number.isFinite(position) ? position : null;
+};
+/**
+ * 判断这一帧是不是「同一会话里乱序到达的旧帧」。
+ * 判据只看「后退幅度 + 行号是否也退回去 + 已经丢了多久」：
+ *   - 换会话（playSessionId 变了）一律接受并重置基准 —— 换歌时行号、position 都从头上重来；
+ *   - position 前进、不动、或同一句内小幅后退 → 接受；
+ *   - 后退超过 REORDER_MAX_BACKSTEP → 真实跳转，接受并重定基准（用户拖进度条不能卡住）；
+ *   - 小幅后退且行号后退 → 可能是旧帧，先丢；丢满 STALE_GUARD_MS 还在后退就认作真实后退，接受并重定基准。
+ * 被丢的帧不写回基准；一旦接受，基准就重定到这一帧（不会永久停在旧的高位置上）。
+ */
+const isStaleFrame = (gate, payload) => {
+    const session = payload && typeof payload.playSessionId === 'string' ? payload.playSessionId : '';
+    const position = positionOf(payload);
+    const lineIndex = lineIndexOf(payload);
+    const accept = () => {
+        gate.session = session;
+        gate.position = position;
+        gate.lineIndex = lineIndex;
+        gate.droppingSince = null;
+        return false;
+    };
+    if (gate.session !== session) return accept();
+    // 缺 position 的帧不参与位置比较，顺便别让基准卡在 null 上。
+    if (position === null || gate.position === null) {
+        gate.position = position;
+        gate.lineIndex = lineIndex;
+        gate.droppingSince = null;
+        return false;
+    }
+    const regression = gate.position - position;
+    if (regression <= 0) return accept();
+    // 大幅后退只可能是真实跳转，立刻接受。
+    if (regression > REORDER_MAX_BACKSTEP) return accept();
+    // 小幅后退：行号没退（同一句或更靠后）就是抖动，接受；行号也退回去才怀疑是旧帧。
+    const looksReordered = gate.lineIndex >= 0 && lineIndex >= 0 && lineIndex < gate.lineIndex;
+    if (!looksReordered) return accept();
+    if (gate.droppingSince === null) gate.droppingSince = Date.now();
+    if (Date.now() - gate.droppingSince > STALE_GUARD_MS) return accept();
+    return true;
+};
 
 const clampVolume = (volume) => Math.min(1, Math.max(0, volume));
 
@@ -298,13 +513,32 @@ const WIDGET_HTML = `<!DOCTYPE html>
         padding: 12px 16px 10px;
         background: transparent;
         border: 1px solid transparent;
-        border-radius: 16px;
+        border-radius: var(--widget-radius, 16px);
         overflow: hidden;
-        transition: background-color 0.22s ease, border-color 0.22s ease;
+        transition: background-color 0.22s ease, border-color 0.22s ease, opacity 0.2s ease;
     }
     body.hover:not(.pinned) .widget {
-        background: rgba(0, 0, 0, 0.58);
-        border-color: rgba(255, 255, 255, 0.08);
+        background: rgba(0, 0, 0, var(--surface-alpha, 0.58));
+        border-color: rgba(255, 255, 255, var(--border-alpha, 0.08));
+    }
+    /* 1.5.0 外观自定义：底色四态，都只在「悬停且未锁定」时出现（锁定穿透时不铺底色，
+       和设置项说明一致）。auto = 深色半透明（默认，和以前一样）；dark = 深色更实；
+       light = 浅色毛玻璃（固定 18% 白，不跟深色的不透明度滑块走）；transparent = 不铺。 */
+    body.hover:not(.pinned)[data-surface="dark"] .widget {
+        background: rgba(0, 0, 0, min(1, calc(var(--surface-alpha, 0.58) + 0.22)));
+        border-color: rgba(255, 255, 255, var(--border-alpha, 0.08));
+    }
+    body.hover:not(.pinned)[data-surface="light"] .widget {
+        background: rgba(255, 255, 255, var(--surface-light-alpha, 0.18));
+        border-color: rgba(255, 255, 255, calc(var(--border-alpha, 0.08) * 4));
+    }
+    body.hover:not(.pinned)[data-surface="transparent"] .widget {
+        background: transparent;
+        border-color: transparent;
+    }
+    /* 暂停变淡：只压歌词块，播放中不跟着忽明忽暗。 */
+    body[data-paused-dim="true"][data-playback="paused"] .widget {
+        opacity: 0.55;
     }
     /* 固定态悬停只露解锁按钮，不铺底色、不描边：用户要求「固定时悬停没有阴影背景和边框」。 */
     body.hover.pinned .widget {
@@ -330,9 +564,14 @@ const WIDGET_HTML = `<!DOCTYPE html>
         min-height: 0;
         padding: 33px 0 0;
     }
+    /* 1.5.0 外观自定义：歌词底衬（壁纸太花时给歌词块垫一层半透明黑）。默认关，开了才铺。 */
+    body[data-backdrop="true"] .lyric {
+        background: rgba(0, 0, 0, 0.35);
+        padding: 33px 10px 0;
+    }
     .lyric-text {
         max-width: 100%;
-        font-size: 38px;
+        font-size: var(--lyric-size, 38px);
         font-weight: 600;
         line-height: 1.25;
         text-align: center;
@@ -342,10 +581,21 @@ const WIDGET_HTML = `<!DOCTYPE html>
         /* 窗口背景可能是任意壁纸（甚至纯白），所以歌词要自带一圈暗描边保证可读。 */
         text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 2px 12px rgba(0, 0, 0, 0.6);
     }
+    /* 逐字歌词（1.5.0）：每个词一个 span，已唱染成设定色，未唱按「未唱不透明度」变淡。 */
+    .lyric-text .word {
+        transition: color 0.12s linear, opacity 0.12s linear;
+    }
+    .lyric-text .word.unsung {
+        opacity: var(--unsung-opacity, 1);
+    }
+    .lyric-text .word.sung {
+        color: var(--sung-color, #7dd3fc);
+        opacity: 1;
+    }
     /* 双语排版（原文 + 译文）里的大号译文：原文的 0.7 倍。38 * 0.7 = 26.6，向上取整 27px。 */
     .lyric-trans {
         max-width: 100%;
-        font-size: 27px;
+        font-size: var(--trans-size, 27px);
         font-weight: 500;
         line-height: 1.3;
         text-align: center;
@@ -429,9 +679,18 @@ const WIDGET_HTML = `<!DOCTYPE html>
         gap: 8px;
         flex: 1;
         min-width: 0;
+        /* border-box：下面右组的内边距才算「盒内」，否则 padding 会把右组撑宽、把正中的固定键挤偏。 */
+        box-sizing: border-box;
     }
+    /*
+     * 右组：靠右排布，并恒定留出 44px 给右上角 ×（按钮 32 + 间隙 12）。
+     * 恒定而不是悬停时才留 —— 否则鼠标一进窗，右组会整体左移 44px，看着像跳了一下。
+     * 两侧都是 flex: 1 + border-box，内边距只吃自己的内容宽，正中的固定键严格居中；
+     * 右组内部只有音量条可伸缩（flex: 1），空间不够时先被压短的是它，胶囊和按钮都不缩。
+     */
     .controls-side.right {
         justify-content: flex-end;
+        padding-right: 44px;
     }
     button {
         -webkit-app-region: no-drag;
@@ -552,18 +811,64 @@ const WIDGET_HTML = `<!DOCTYPE html>
     .volume {
         -webkit-app-region: no-drag;
         flex: 1;
-        min-width: 60px;
+        /* 右侧空间优先砍这里：44px 的 × 让位 + 百分比胶囊加宽都从音量条身上让出来。 */
+        min-width: 40px;
         height: 4px;
         margin: 0 2px;
         accent-color: #7dd3fc;
         cursor: pointer;
     }
+    /*
+     * 音量百分比：窗口底是桌面壁纸，浅色壁纸上 55% 白几乎看不见（用户反馈「显示不明显」）。
+     * 改成和固定态按钮同款的深底小胶囊 + 更亮的字色，任何壁纸上都读得清；
+     * 拖动滑块时字色变蓝，给一点「正在调音量」的反馈。
+     */
     .volume-value {
         flex: none;
-        width: 34px;
-        font-size: 11px;
-        color: rgba(255, 255, 255, 0.55);
-        text-align: right;
+        /* 百分比胶囊宽度固定：数字位数变化时胶囊不跟着抖（tabular-nums 保证字形等宽）。 */
+        min-width: 42px;
+        box-sizing: border-box;
+        padding: 2px 4px;
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1.4;
+        font-variant-numeric: tabular-nums;
+        color: #eaf6ff;
+        /* 居中对齐：2% / 5% 这种一位数也落在胶囊正中，和两位数的读数位置一致（tabular-nums 保证不跳）。 */
+        text-align: center;
+        background: rgba(8, 22, 36, 0.55);
+        border-radius: 6px;
+    }
+    body.volume-dragging .volume-value {
+        color: #7dd3fc;
+        background: rgba(8, 22, 36, 0.78);
+    }
+    /*
+     * 右上角的关闭按钮（1.4.0）：只隐藏悬浮窗，不停用模组（播放条上的「词」按钮能找回来）。
+     * 位置和控制条同一行（top 10px），悬停才露面；固定态不出现 —— 那时整窗忽略鼠标、
+     * 只有解锁键那一小块可点，露出来也点不到，反而像个失效的按钮。
+     */
+    #close {
+        -webkit-app-region: no-drag;
+        position: absolute;
+        top: 10px;
+        right: 16px;
+        z-index: 3;
+        opacity: 0;
+        /* 透明但可点会变成隐形点击陷阱（正好压在右侧按钮组上），显隐和可点性一起切。 */
+        pointer-events: none;
+        transition: opacity 0.18s ease;
+    }
+    body.hover:not(.pinned) #close,
+    body:not(.pinned) #close:focus-visible {
+        opacity: 1;
+        pointer-events: auto;
+    }
+    /* 气泡贴右边缘，向右对齐，免得被窗口右边缘裁掉。 */
+    #close::after {
+        left: auto;
+        right: 0;
+        transform: none;
     }
 </style>
 </head>
@@ -589,6 +894,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
         <div class="lyric-trans" id="trans" hidden></div>
         <div class="lyric-sub" id="sub"></div>
     </div>
+    <button id="close" type="button" data-tip="关闭悬浮歌词（模组仍启用）" aria-label="关闭悬浮歌词">${ICON_SVG.close}</button>
 </div>
 <script>
 const { ipcRenderer } = require('electron');
@@ -613,6 +919,7 @@ const els = {
     volume: document.getElementById('volume'),
     volumeIcon: document.getElementById('volume-icon'),
     volumeValue: document.getElementById('volume-value'),
+    close: document.getElementById('close'),
 };
 
 // 图标整段字符串由主进程生成后塞进来（形状见 main.cjs 的 ICON_PATHS）。
@@ -661,6 +968,192 @@ const LAYOUT_TIPS = {
 };
 let layoutMode = 'text';
 let lastPayload = null;
+// 1.5.1：lastPayload 第一次到手时的本地时刻（epoch ms）。重渲染（开关逐字、切排版）沿用它，
+// 免得把「同一份旧快照」误当成刚收到的新数据。
+let lastPayloadReceivedAt = 0;
+
+// ---- 1.5.0 配置（主进程下发），结构见 main.cjs 的 DEFAULT_CONFIG ----
+// 默认值与 DEFAULT_CONFIG 一致：主进程还没下发时，页面就按这套渲染，观感等同 1.4.2。
+let config = {
+    shared: {
+        fontSize: 38,
+        karaoke: false,
+        fontMode: 'system',
+        surface: 'auto',
+        surfaceOpacity: 0.58,
+        radius: 16,
+        border: true,
+        sungColor: '#7dd3fc',
+        unsungOpacity: 1,
+        pausedDim: false,
+        backdrop: false,
+    },
+    desktop: {},
+    window: {},
+};
+
+const SYSTEM_FONT_STACK = "'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans CJK SC', system-ui, sans-serif";
+
+/**
+ * 把配置写成 CSS 变量 / body[data-*]：外观全走 CSS，渲染逻辑不用到处判断。
+ * 只有「影响 DOM 结构」的项（逐字开关）才重渲染；字号 / 圆角 / 颜色 / 不透明度都只是变量，
+ * 改完浏览器自己重排，重渲染反而会把逐字的高亮基准打回旧快照（看起来像卡一下）。
+ */
+/**
+ * 字体：system = 现在这套系统无衬线栈；theme = 跟随播放器主题解析出的字体栈。
+ * 以后要加「指定字体」只需扩这项和 main.cjs 的 FONT_MODES，别处不用动。
+ * 注意：配置先于首帧到达时 lastPayload 还是 null，光在 applyConfig 里设会在启动时写死成系统字体，
+ * 所以 render() 每次拿到带 theme 的快照也要再调一次（主题切换、冷启动、页面重载都会经过 render）。
+ */
+const applyFontFamily = (theme) => {
+    const themeStack = theme && typeof theme.fontStack === 'string' ? theme.fontStack : '';
+    document.body.style.fontFamily = config.shared.fontMode === 'theme' && themeStack ? themeStack : SYSTEM_FONT_STACK;
+};
+
+const applyConfig = (next) => {
+    if (!next || typeof next !== 'object') return;
+    const shared = next.shared && typeof next.shared === 'object' ? next.shared : {};
+    const karaokeChanged = (shared.karaoke === true) !== (config.shared.karaoke === true);
+    config = {
+        shared: Object.assign({}, config.shared, shared),
+        desktop: next.desktop && typeof next.desktop === 'object' ? next.desktop : config.desktop,
+        window: next.window && typeof next.window === 'object' ? next.window : config.window,
+    };
+    const current = config.shared;
+    const style = document.documentElement.style;
+    style.setProperty('--lyric-size', current.fontSize + 'px');
+    style.setProperty('--trans-size', Math.round(current.fontSize * 0.71) + 'px');
+    style.setProperty('--widget-radius', current.radius + 'px');
+    style.setProperty('--surface-alpha', String(current.surfaceOpacity));
+    style.setProperty('--border-alpha', current.border ? '0.08' : '0');
+    style.setProperty('--sung-color', current.sungColor);
+    style.setProperty('--unsung-opacity', String(current.unsungOpacity));
+    document.body.dataset.surface = current.surface;
+    document.body.dataset.backdrop = String(current.backdrop === true);
+    document.body.dataset.pausedDim = String(current.pausedDim === true);
+    applyFontFamily(lastPayload && lastPayload.theme);
+    if (lastPayload && karaokeChanged) render(lastPayload);
+};
+
+// ---- 1.5.0 逐字歌词：只在「已唱 / 未唱」之间切 class，颜色和变淡交给 CSS 变量 ----
+let karaokeKey = '';
+let karaokeState = null;
+
+const stopKaraoke = () => {
+    if (karaokeState && karaokeState.raf) cancelAnimationFrame(karaokeState.raf);
+    karaokeState = null;
+    karaokeKey = '';
+};
+
+/** 按给定时间把每个词刷成已唱 / 未唱（rAF 与「立即刷一次」共用）。 */
+const paintKaraokeAt = (time) => {
+    if (!karaokeState) return;
+    for (const item of karaokeState.spans) {
+        const sung = time >= item.start;
+        item.el.classList.toggle('sung', sung);
+        item.el.classList.toggle('unsung', !sung);
+    }
+};
+
+/** 这份快照里的 position 是「什么时候」的位置：优先用 client 打的 sentAt，缺了才退回收到时刻。 */
+const payloadTimeOf = (payload, receivedAt) => {
+    const sentAt = Number(payload && payload.sentAt);
+    if (Number.isFinite(sentAt) && sentAt > 0) return sentAt;
+    return Number.isFinite(receivedAt) ? receivedAt : Date.now();
+};
+
+/**
+ * 把「快照位置」折算成「现在的位置」（1.5.1）。
+ * 快照不连续：同一句内 client 去重不发帧、隐藏期间不发、重开/重载时补发的还是旧快照。
+ * 直接拿 payload.position 当现在用，逐字就会从旧位置重新起唱（就是用户看到的「闪回」和「重开后高亮滞后」）。
+ */
+const positionNowFrom = (payload, receivedAt) => {
+    const base = Number(payload && payload.position);
+    if (!Number.isFinite(base)) return 0;
+    if (!payload || payload.state !== 'playing') return base;
+    const elapsed = (Date.now() - payloadTimeOf(payload, receivedAt)) / 1000;
+    // 时钟异常（负数或离谱的大）就不外推，宁可少走一点，也不要一下子跳到后面。
+    if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > 30) return base;
+    return base + elapsed;
+};
+
+/** 现在唱到哪儿：快照位置 + 已经过的时间（主进程 100ms 才来一帧，中间靠外推）。 */
+const karaokeTime = () => (karaokeState
+    ? karaokeState.basePosition + (performance.now() - karaokeState.startedAt) / 1000
+    : 0);
+
+const paintKaraoke = () => {
+    if (!karaokeState) return;
+    paintKaraokeAt(karaokeTime());
+    karaokeState.raf = requestAnimationFrame(paintKaraoke);
+};
+
+/** 暂停时只按当前位置刷一遍颜色，然后停掉 rAF（省电，也不会在暂停时继续「唱」）。 */
+const paintKaraokeOnce = () => {
+    if (!karaokeState) return;
+    paintKaraokeAt(karaokeState.basePosition);
+    if (karaokeState.raf) {
+        cancelAnimationFrame(karaokeState.raf);
+        karaokeState.raf = 0;
+    }
+};
+
+/** 逐字行：每个词一个 span，rAF 按「快照位置 + 已经过的时间」推算唱到哪。 */
+const renderKaraokeLine = (line, payload, receivedAt) => {
+    const key = String(line.text || '') + '|' + JSON.stringify(line.words);
+    if (key !== karaokeKey) {
+        stopKaraoke();
+        karaokeKey = key;
+        els.line.textContent = '';
+        const spans = [];
+        for (const word of line.words) {
+            const span = document.createElement('span');
+            span.className = 'word unsung';
+            span.textContent = word.text;
+            els.line.appendChild(span);
+            const start = Number(word.startTime);
+            // 只按 start 染色（「已唱 / 未唱」两态）；end 目前用不上，不留着误导后来人。
+            spans.push({ el: span, start: Number.isFinite(start) ? start : 0 });
+        }
+        karaokeState = {
+            spans,
+            basePosition: positionNowFrom(payload, receivedAt),
+            startedAt: performance.now(),
+            raf: 0,
+        };
+    } else if (karaokeState) {
+        // 同一行只更新基准位置（拖进度、暂停），不重建 DOM。
+        // 配置变化后的重渲染也会走到这里，那时 payload 是旧快照——1.5.1 起用 sentAt 把它折算成
+        // 「现在的位置」再比，所以旧快照不会被误判成 seek；只有真的差出半秒（拖了进度条）才重设基准。
+        const position = positionNowFrom(payload, receivedAt);
+        const estimated = karaokeState.basePosition + (performance.now() - karaokeState.startedAt) / 1000;
+        if (Math.abs(position - estimated) > 0.5) {
+            karaokeState.basePosition = position;
+            karaokeState.startedAt = performance.now();
+        }
+    }
+    if (karaokeState && payload.state === 'playing') {
+        // 先按当前推算时间染一次，再交给 rAF：新行第一帧不该是「整行都没唱」。
+        paintKaraokeAt(karaokeTime());
+        if (!karaokeState.raf) karaokeState.raf = requestAnimationFrame(paintKaraoke);
+    } else {
+        paintKaraokeOnce();
+    }
+};
+
+// 窗口被 × 收起时页面不可见：停掉 rAF，回来再按当前快照接上。
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+        if (karaokeState && karaokeState.raf) {
+            cancelAnimationFrame(karaokeState.raf);
+            karaokeState.raf = 0;
+        }
+        return;
+    }
+    if (karaokeState && lastPayload && lastPayload.state === 'playing' && !karaokeState.raf) {
+        karaokeState.raf = requestAnimationFrame(paintKaraoke);
+    }
+});
 
 /** 排版按钮的三态高亮、提示，以及 lyric 容器上的 data-layout，都跟着当前模式走。 */
 const applyLayoutButton = () => {
@@ -671,8 +1164,16 @@ const applyLayoutButton = () => {
     }
 };
 
-const render = (payload) => {
+const render = (payload, receivedAt) => {
     if (!payload || typeof payload !== 'object') return;
+    // 1.5.1：同一个 payload 可能被重渲染多次（开关逐字、切排版、字体变了），第一次见到它时记下
+    // 「主进程什么时候收到它的」，之后重渲染都沿用同一个时刻——这样旧快照不会被当成新数据。
+    if (payload !== lastPayload) {
+        receivedAt = Date.now();
+        lastPayloadReceivedAt = receivedAt;
+    } else if (!Number.isFinite(receivedAt)) {
+        receivedAt = lastPayloadReceivedAt;
+    }
     lastPayload = payload;
 
     const line = payload.line || {};
@@ -682,7 +1183,24 @@ const render = (payload) => {
         ' title="' + ((payload.song && payload.song.title) || '') + '"',
     );
     // 空字符串是合法的行文本（只有翻译、没有原文的行），不要退回「等待播放...」。
-    els.line.textContent = typeof line.text === 'string' ? line.text : WAITING_TEXT;
+    // 1.5.0：开了逐字歌词且这一行带词级时间时，走 span 渲染；否则仍是一整段文本（默认路径不变）。
+    // 宿主对「没有词级时间」的行会给一个覆盖整行的单 word（text 与整行相同）：它没有可染色的粒度，
+    // 走 span 只会让整行一出现就变成已唱色，所以这种行按普通文本渲染。
+    const words = Array.isArray(line.words) ? line.words : null;
+    const wholeLineOnly = words !== null && words.length === 1 && words[0] && words[0].text === line.text;
+    const useKaraoke = config.shared.karaoke === true
+        && words !== null && words.length > 0 && !wholeLineOnly
+        && typeof line.text === 'string' && line.text !== '';
+    if (useKaraoke) {
+        renderKaraokeLine(line, payload, receivedAt);
+    } else {
+        stopKaraoke();
+        els.line.textContent = typeof line.text === 'string' ? line.text : WAITING_TEXT;
+    }
+    // 暂停变淡 / 逐字都要知道播放状态；只认 playing，其他都当暂停。
+    document.body.dataset.playback = typeof payload.state === 'string' ? payload.state : 'paused';
+    // 跟随主题字体：冷启动时配置比首帧先到（那时还没有 theme），所以每次快照都再对一次。
+    applyFontFamily(payload.theme);
 
     // 三种排版：只原文 / 原文 + 译文 / 原文 + 罗马音。第二行只有一个槽位：
     // «roman» 优先放罗马音，行里没有罗马音时回退成译文（两者都没有就整行隐藏）。
@@ -755,6 +1273,22 @@ els.layout.addEventListener('click', () => {
     // 记住这次选择，重启后恢复。
     ipcRenderer.send('${IPC_LAYOUT}', layoutMode);
 });
+// 1.5.1：窗口被动显示（× 关掉再打开、隐藏期间被叫回来）时，上屏那一刻要等页面真的画完：
+// 隐藏期间主进程照收快照却没转给页面，页面上停的是关闭前的画面（高亮停在关闭那一刻）。
+// 主进程补发快照、再请 client 强制发一帧，页面收到后回一句「显示好了」，主进程才 showInactive。
+let shownPending = false;
+let showTimer = null;
+const flushShown = () => {
+    if (showTimer) {
+        clearTimeout(showTimer);
+        showTimer = null;
+    }
+    ipcRenderer.send('${IPC_SHOWN}');
+};
+const scheduleShown = (delay) => {
+    if (showTimer) clearTimeout(showTimer);
+    showTimer = setTimeout(flushShown, delay);
+};
 // 主进程在页面加载完后推来上次的排版选择（值不合法就保持默认的 text）。
 ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
     if (!LAYOUT_MODES.includes(value)) return;
@@ -762,7 +1296,21 @@ ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
     applyLayoutButton();
     if (lastPayload) render(lastPayload);
 });
+// 主进程说「该显示了」：数据其实已经补发过，这里只负责上屏前再确认一次画面。
+// 兜底：内容没变时 client 不去重发帧、或者 request-sync 那条路断了，也不能永远不上屏。
+ipcRenderer.on('${IPC_SHOW}', () => {
+    shownPending = true;
+    scheduleShown(150);
+});
 applyLayoutButton();
+
+// 右上角 ×：只隐藏窗口（主进程 setWidgetOpen(false)，模组照常运行、快照照收），
+// 重新显示靠播放条上的「词」按钮。窗口没有销毁，隐藏期间页面仍活着。
+if (els.close) {
+    els.close.addEventListener('click', () => {
+        ipcRenderer.send('${IPC_CLOSE}');
+    });
+}
 
 // ---- 悬停显示 / 固定位置 ----
 // 未固定：整窗可拖拽（body 是 drag 区），鼠标离开后只剩透明歌词，悬停时浮出半透明底 + 完整控制条。
@@ -840,23 +1388,30 @@ window.addEventListener('blur', () => {
     if (!isPinned) setHovered(false);
 });
 
+// volumeDragging 为真时不信主进程回推的音量（否则拖动会被上一帧拽回去）；
+// 同时给百分比胶囊挂 body.volume-dragging，拖动中高亮，松手复原。
+const setVolumeDragging = (dragging) => {
+    volumeDragging = dragging;
+    document.body.classList.toggle('volume-dragging', dragging);
+};
+
 els.volume.addEventListener('pointerdown', () => {
-    volumeDragging = true;
+    setVolumeDragging(true);
 });
 els.volume.addEventListener('input', () => {
-    volumeDragging = true;
+    setVolumeDragging(true);
     els.volumeValue.textContent = els.volume.value + '%';
     setIcon(els.volumeIcon, volumeIconName(Number(els.volume.value)));
     scheduleVolume();
 });
 els.volume.addEventListener('change', () => {
-    volumeDragging = false;
+    setVolumeDragging(false);
     sendVolume();
 });
 // 拖动被打断（指针取消、窗口失焦、指针捕获丢失）时也要收尾，否则滑块会一直不再跟随主进程。
 const stopVolumeDragging = () => {
     if (!volumeDragging) return;
-    volumeDragging = false;
+    setVolumeDragging(false);
     sendVolume();
 };
 window.addEventListener('pointerup', stopVolumeDragging);
@@ -864,7 +1419,16 @@ window.addEventListener('pointercancel', stopVolumeDragging);
 window.addEventListener('blur', stopVolumeDragging);
 els.volume.addEventListener('lostpointercapture', stopVolumeDragging);
 
-ipcRenderer.on('${IPC_DATA}', (event, payload) => render(payload));
+ipcRenderer.on('${IPC_DATA}', (event, payload) => {
+    render(payload, Date.now());
+    // 1.5.1：第一帧已经画上了，才告诉主进程「可以上屏」（冷启动 / 页面重建）。
+    if (shownPending) {
+        shownPending = false;
+        flushShown();
+    }
+});
+// 主进程在页面加载完后推来当前配置（字号 / 逐字 / 外观），之后每次设置变化都会再推。
+ipcRenderer.on('${IPC_CONFIG}', (event, payload) => applyConfig(payload));
 window.addEventListener('contextmenu', (event) => event.preventDefault());
 // 防止把文件拖进窗口触发导航（will-navigate 之外再兜一层）。
 window.addEventListener('dragover', (event) => event.preventDefault());
@@ -899,7 +1463,25 @@ module.exports = function activate(api) {
         pinRect: null,
         // 悬停 / 穿透判定的轮询 tick，固定状态或按钮矩形变化时立刻重算一次。
         hoverTick: null,
+        // lastPayload 只在 update-data 处理函数里写，写之前先过 isStaleFrame（它的基准单独放，不进 state）。
+        // 形态：1.3.0 只有「桌面歌词」一种，1.7.0 才做「悬浮窗歌词」，这里先留状态位。
+        surface: 'desktop',
+        // 1.5.0：显示配置（字号 / 逐字 / 外观）。真源在宿主的模组设置里，client 推过来，
+        // 主进程只做校验（normalizeConfig）、定窗口高度、再整份转给页面。
+        config: normalizeConfig(null),
+        // 1.4.0：悬浮窗当前是否显示（× / 播放条「词」按钮会改它；落盘在 persisted.open）。
+        // 隐藏 ≠ 销毁：窗口还在，照收快照，只是不显示、不转发数据给页面。
+        widgetOpen: true,
+        // 上次成功推给 client 的显隐真值，用来给 reportWidgetVisibility 去重（null = 还没推过）。
+        reportedOpen: null,
+        // 1.5.1：等页面握手再上屏的超时计时器（null = 没在等）。
+        shownTimer: null,
     };
+
+    // ---- 帧顺序 ----
+    // 快照在进 state 之前先过 isStaleFrame：迟到帧直接丢掉，state.lastPayload 只记真正更新的那一帧，
+    // 页面重载 / 重建时补发也就不会补到旧句。换歌由 playSessionId 分桶，新会话一律接受并重置基准。
+    const frameGate = { session: undefined, position: null, lineIndex: -1, droppingSince: null };
 
     // ---- 窗口状态持久化（位置 + 是否固定） ----
     // 以前每次启动都把窗口摆回「主屏底部居中」，用户拖到的位置一重启就丢；
@@ -921,6 +1503,15 @@ module.exports = function activate(api) {
 
     const savePersistedState = () => {
         if (!state.persisted) return;
+        // 1.5.0：高度跟着字号走，而建窗那一刻只有默认配置（38px/180）。这里把窗口的实际高度也记下来，
+        // 否则字号 >38px 的用户每次启动都要经历「先按 180 建窗、再变高」，见 createWidgetWindow。
+        if (state.win && !state.win.isDestroyed()) {
+            try {
+                state.persisted.height = state.win.getSize()[1];
+            } catch (error) {
+                // 读不到就算了，下次启动按默认字号的高度建窗。
+            }
+        }
         try {
             fs.mkdirSync(path.dirname(stateFilePath()), { recursive: true });
             fs.writeFileSync(stateFilePath(), JSON.stringify(state.persisted));
@@ -963,7 +1554,7 @@ module.exports = function activate(api) {
                 const area = areaOf(display);
                 return position.x + WINDOW_WIDTH > area.x + 40
                     && position.x < area.x + area.width - 40
-                    && position.y + WINDOW_HEIGHT > area.y + 20
+                    && position.y + windowHeightFor(state.config) > area.y + 20
                     && position.y < area.y + area.height - 20;
             });
         } catch (error) {
@@ -972,6 +1563,10 @@ module.exports = function activate(api) {
     };
 
     state.persisted = readPersistedState();
+    // 1.4.0：显隐也持久化。老存档没有 open 字段 → 默认显示（不能因为升级就把歌词藏起来）。
+    state.widgetOpen = state.persisted.open !== false;
+    // 1.5.1：建窗用的初始配置（之后由 client 推来的真配置覆盖）。
+    state.config = prepareConfig(state.persisted);
     api.log.info(LOG_PREFIX + ' 窗口状态', JSON.stringify({
         file: stateFilePath(),
         saved: state.persisted,
@@ -1074,8 +1669,11 @@ module.exports = function activate(api) {
         }
     };
 
-    /** 把最新快照交给窗口页面（窗口不在 / 已销毁时丢弃）。 */
+    /** 把最新快照交给窗口页面（窗口不在 / 已销毁 / 被 × 隐藏时丢弃）。 */
     const sendPayloadToWindow = (payload) => {
+        // 1.4.0：隐藏期间不往页面推数据（页面还在，但没必要逐帧重绘不可见的内容）；
+        // 重新显示时 setWidgetOpen 会补发最后一份快照 + request-sync，不会停在旧句。
+        if (!state.widgetOpen) return;
         const widgetWindow = state.win;
         if (!widgetWindow || widgetWindow.isDestroyed()) {
             api.log.info(LOG_PREFIX + ' 转发中止：没有可用悬浮窗');
@@ -1096,6 +1694,62 @@ module.exports = function activate(api) {
         }
     };
 
+    /** 1.5.0：字号变了就改窗口高度（宽度固定 640；底部贴边时向上让位，别掉出屏幕）。 */
+    const applyWindowSize = () => {
+        const widgetWindow = state.win;
+        if (!widgetWindow || widgetWindow.isDestroyed()) return;
+        // 1.5.1：启动初期只有默认配置，先用落盘的窗口高度顶着，免得第一帧矮一截；
+        // client 把共享段里的真字号推来之后（config.window.height 被清掉）才按字号算。
+        const saved = state.config.window && state.config.window.height;
+        const height = Number.isFinite(saved) ? saved : windowHeightFor(state.config);
+        try {
+            const [width, currentHeight] = widgetWindow.getSize();
+            if (width === WINDOW_WIDTH && currentHeight === height) return;
+            const bounds = widgetWindow.getBounds();
+            widgetWindow.setSize(WINDOW_WIDTH, height, false);
+            // 变高时，只有底边本来就贴着工作区底才向上让位（保持底边不动）；
+            // 停在屏幕上半部时应当向下长，否则顶边会莫名其妙往上跑。
+            try {
+                const area = screen.getDisplayMatching(bounds).workArea;
+                const bottom = bounds.y + currentHeight;
+                const atBottom = bottom >= area.y + area.height - 2;
+                let nextY = bounds.y;
+                if (atBottom) {
+                    nextY = Math.min(Math.max(bounds.y, area.y), Math.max(area.y, bottom - height));
+                } else if (bounds.y + height > area.y + area.height) {
+                    nextY = Math.max(area.y, area.y + area.height - height);
+                }
+                if (nextY !== bounds.y) widgetWindow.setPosition(bounds.x, Math.round(nextY));
+            } catch (error) {
+                // 位置调不动就只改高度，不影响主流程。
+            }
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 调整窗口尺寸失败', error);
+        }
+    };
+
+    /** 把当前配置下发给页面（页面加载完后调用一次，配置变化时再调用）。 */
+    const sendConfigToWindow = () => {
+        const widgetWindow = state.win;
+        if (!widgetWindow || widgetWindow.isDestroyed()) return;
+        try {
+            widgetWindow.webContents.send(IPC_CONFIG, state.config);
+        } catch (error) {
+            // 页面还没加载完：did-finish-load 里会再发一次。
+        }
+    };
+
+    /**
+     * 向 client 要一次配置（1.5.1）。配置真源在 client 侧的宿主设置里，这边可能在没有重跑 client
+     * 的情况下被重建：宿主「重载模组」只 loadAll() 主进程 entry，模组文件没变时 clientUrl 不变，
+     * client 不会重新 activate，于是它「激活即下发配置」那一次永远不会再发生，主进程只能停在默认值上
+     * （字号回 38、逐字被关）。所以页面每次加载完、每次 activate 都主动要一次，拿回来的配置走 RPC_CONFIG。
+     * 显隐无关：窗口隐藏时也要要，下一条快照不会把配置带回来。
+     */
+    const requestConfigFromClient = () => {
+        sendActionToClient({ action: ACTION_REQUEST_CONFIG });
+    };
+
     /** 窗口页面点了按钮：校验来源窗口，归一化后转发给 client.mjs。 */
     const onActionFromWindow = (event, raw) => {
         const widgetWindow = state.win;
@@ -1110,6 +1764,135 @@ module.exports = function activate(api) {
             return;
         }
         sendActionToClient(action);
+    };
+
+    /** 显隐落盘（只在真的切换时才动状态，写盘合并到 scheduleSave 的防抖里）。 */
+    const persistWidgetOpen = (open) => {
+        if (!state.persisted) state.persisted = {};
+        state.persisted.open = open;
+        scheduleSave();
+    };
+
+    /**
+     * 1.4.0：把「悬浮窗现在开着 / 关着」告诉 client.mjs，播放条上的「词」按钮靠它高亮。
+     * api.rpc.send 是 fire-and-forget：client 还没挂载时这条消息直接丢，所以 client 激活时
+     * 还会用 widget-state 主动问一次对齐。去重记「上次推成功时的值」，推送失败保持旧值。
+     */
+    const reportWidgetVisibility = (force) => {
+        if (!force && state.reportedOpen === state.widgetOpen) return;
+        if (typeof api.rpc.send !== 'function') {
+            if (!state.warnedNoRpcSend) {
+                state.warnedNoRpcSend = true;
+                api.log.warn(LOG_PREFIX + ' 需要 Folium 1.7+ 的 api.rpc.send，播放条按钮无法同步显隐状态');
+            }
+            return;
+        }
+        try {
+            api.rpc.send(RPC_WIDGET_VISIBILITY, { visible: state.widgetOpen });
+            state.reportedOpen = state.widgetOpen;
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 向 client 推送悬浮窗可见性失败', error);
+        }
+    };
+
+    /**
+     * 1.4.0：显示 / 隐藏悬浮窗（× 和播放条「词」按钮都走这里）。返回切换后的状态。
+     * 隐藏只 hide()，不销毁窗口：模组继续收快照、页面继续存活，重新显示时立刻能画。
+     */
+    const setWidgetOpen = (open) => {
+        state.widgetOpen = open === true;
+        const widgetWindow = state.win;
+        if (!state.disposed && (!widgetWindow || widgetWindow.isDestroyed())) {
+            // 关着的时候窗口可能被别的路径销毁了：要显示就现在重建。
+            if (state.widgetOpen) {
+                ensureWidgetWindow();
+                // 重建可能被「重试上限 / 没有宿主窗口」拦下：如实回到关闭态，
+                // 否则会先 log「已显示」、把按钮点亮，用户却看不到窗口。
+                if (!state.win || state.win.isDestroyed()) {
+                    state.widgetOpen = false;
+                    api.log.warn(LOG_PREFIX + ' 悬浮窗无法重建，仍保持隐藏');
+                }
+            }
+        } else if (widgetWindow && !widgetWindow.isDestroyed()) {
+            try {
+                if (state.widgetOpen) {
+                    // 隐藏期间主进程照收数据但没转给页面，页面上停的是关窗前的画面
+                    // （文字还算新，逐字高亮停在关闭那一刻）。所以先补发最后一份快照，再让 client
+                    // 绕过内容去重强制发一帧当下这一句，然后交给页面：它画完回 IPC_SHOWN 才上屏
+                    // （见 onShownFromWindow）。先 showInactive 会先把旧画面闪出来，这就是
+                    // 「× 关掉再打开闪一下」的直接原因。
+                    if (state.lastPayload) sendPayloadToWindow(state.lastPayload);
+                    sendActionToClient({ action: 'request-sync' });
+                    // 隐藏期间可能改过字号：上屏前按当前配置定一次高度。
+                    applyWindowSize();
+                    // 先把「显示」这条消息交给页面。页面可能已经销毁 / 没加载完：拿不到握手就兜底。
+                    try {
+                        widgetWindow.webContents.send(IPC_SHOW);
+                    } catch (error) {
+                        api.log.warn(LOG_PREFIX + ' 通知页面准备显示失败', error);
+                    }
+                    waitForShown();
+                } else {
+                    // 还没上屏就被关掉：作废这次握手，别让迟到的 IPC_SHOWN 把窗口重新弹出来。
+                    cancelShownWait();
+                    widgetWindow.hide();
+                }
+            } catch (error) {
+                api.log.warn(LOG_PREFIX + (state.widgetOpen ? ' 显示悬浮窗失败' : ' 隐藏悬浮窗失败'), error);
+            }
+        }
+        persistWidgetOpen(state.widgetOpen);
+        reportWidgetVisibility();
+        api.log.info(LOG_PREFIX + ' 悬浮窗' + (state.widgetOpen ? '已显示' : '已隐藏（模组仍在运行）'));
+        return state.widgetOpen;
+    };
+
+    /**
+     * 1.5.1：真正的上屏。showInactive 而不是 show：悬浮歌词不该把键盘焦点从主窗口 / 别的应用抢走。
+     * 用 force 的是「页面没来得及握手」的兜底路径，正常路径由 onShownFromWindow 调用。
+     */
+    const showWidgetWindow = (force) => {
+        const widgetWindow = state.win;
+        cancelShownWait();
+        // 期间被关掉 / 被销毁 / 模组已停用：不再上屏。
+        if (!widgetWindow || widgetWindow.isDestroyed() || !state.widgetOpen || state.disposed) return;
+        try {
+            widgetWindow.showInactive();
+            api.log.info(LOG_PREFIX + ' 悬浮窗上屏' + (force ? '（页面未握手，兜底显示）' : ''));
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 显示悬浮窗失败', error);
+        }
+    };
+
+    /** 等页面回 IPC_SHOWN；超时就兜底上屏，宁可闪一下也不能让「词」按钮点了没反应。 */
+    const waitForShown = () => {
+        cancelShownWait();
+        state.shownTimer = setTimeout(() => {
+            state.shownTimer = null;
+            showWidgetWindow(true);
+        }, SHOWN_TIMEOUT_MS);
+    };
+
+    const cancelShownWait = () => {
+        if (!state.shownTimer) return;
+        clearTimeout(state.shownTimer);
+        state.shownTimer = null;
+    };
+
+    /** 页面把这一帧画好了（握手第二步）：现在才让窗口上屏。 */
+    const onShownFromWindow = (event) => {
+        if (!state.win || state.win.isDestroyed() || event.sender !== state.win.webContents) return;
+        if (!state.shownTimer) return; // 不是这次握手要的那一句（超时后迟到的重复消息）
+        showWidgetWindow(false);
+    };
+
+    /** 页面点了右上角 ×：校验来源窗口后隐藏（不停用模组，播放条「词」按钮能找回）。 */
+    const onCloseFromWindow = (event) => {
+        if (!state.win || state.win.isDestroyed() || event.sender !== state.win.webContents) {
+            api.log.warn(LOG_PREFIX + ' 收到非本悬浮窗的关闭请求，已忽略');
+            return;
+        }
+        setWidgetOpen(false);
     };
 
     /** 默认位置：主显示器工作区底部中间。 */
@@ -1130,7 +1913,7 @@ module.exports = function activate(api) {
         try {
             const { workArea } = screen.getPrimaryDisplay();
             const x = Math.round(workArea.x + (workArea.width - WINDOW_WIDTH) / 2);
-            const y = Math.round(workArea.y + workArea.height - WINDOW_HEIGHT - WINDOW_MARGIN);
+            const y = Math.round(workArea.y + workArea.height - windowHeightFor(state.config) - WINDOW_MARGIN);
             widgetWindow.setPosition(x, y);
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 读取屏幕尺寸失败，窗口使用默认位置', error);
@@ -1286,9 +2069,14 @@ module.exports = function activate(api) {
         state.creatingWidget = true;
         let widgetWindow;
         try {
+            // 1.5.0：上次的实际高度存在状态文件里（见 savePersistedState），这里优先用它建窗。
+            // 只按默认 38px 建窗的话，大字号用户启动时会「先 180、再变高」，而变高又动顶边 → 位置每次上漂。
+            // 1.5.1：同一份高度已经放进 state.config.window.height（见 prepareConfig），这里直接复用。
+            const startHeight = (state.config.window && state.config.window.height) || windowHeightFor(state.config);
             widgetWindow = new BrowserWindow({
                 width: WINDOW_WIDTH,
-                height: WINDOW_HEIGHT,
+                // 1.5.0：高度跟着字号走（默认 38px 时仍是 180），见 windowHeightFor。
+                height: startHeight,
                 useContentSize: true,
                 frame: false,
                 transparent: true,
@@ -1345,7 +2133,8 @@ module.exports = function activate(api) {
 
         widgetWindow.once('ready-to-show', () => {
             // showInactive：悬浮歌词不该把键盘焦点从主窗口/别的应用抢走。
-            if (!widgetWindow.isDestroyed()) widgetWindow.showInactive();
+            // 1.4.0：上次退出时是「关掉」状态就别显示，窗口建好先留着（播放条「词」按钮随时叫醒）。
+            if (!widgetWindow.isDestroyed() && state.widgetOpen) widgetWindow.showInactive();
             // 恢复的坐标可能正好压在任务栏上：立刻提升一次，别等 500ms 后的第一次轮询。
             if (taskbarGuard && !widgetWindow.isDestroyed()) taskbarGuard.tick();
         });
@@ -1355,8 +2144,14 @@ module.exports = function activate(api) {
             api.log.info(LOG_PREFIX + ' 悬浮窗页面 did-finish-load', JSON.stringify({
                 hasLastPayload: !!state.lastPayload,
             }));
+            // 1.5.0：字号 / 逐字 / 外观配置。必须在第一帧快照之前下发，否则页面会按默认 38px
+            // 先渲染一次、再跳成用户设的字号（一帧闪烁）。
+            widgetWindow.webContents.send(IPC_CONFIG, state.config);
             if (state.lastPayload) sendPayloadToWindow(state.lastPayload);
             sendActionToClient({ action: 'request-sync' });
+            // 1.5.1：页面准备好之后再要一次配置——reconcile 时页面与 client 的加载顺序无保证，
+            // 只要要晚了、RPC 已经登记，这一趟就能把 main 从默认配置拉回用户的真实设置。
+            requestConfigFromClient();
             // 恢复上次的固定状态。放在页面加载完之后推，页面收到才切 body.pinned（改拖拽区）。
             // 主进程这边也记一份：固定态整窗忽略鼠标（部分点击穿透）要靠它判断。
             state.pinned = !!(state.persisted && state.persisted.pinned);
@@ -1370,6 +2165,8 @@ module.exports = function activate(api) {
             if (LAYOUT_MODE_IDS.includes(savedLayout)) {
                 widgetWindow.webContents.send(IPC_LAYOUT, savedLayout);
             }
+            // 形态在 1.3.0 只有 desktop 一种，页面收到后无处可去；1.7.0 的悬浮窗视图直接消费这条消息。
+            widgetWindow.webContents.send(IPC_SURFACE, state.surface);
         });
 
         widgetWindow.webContents.on('render-process-gone', (event, details) => {
@@ -1491,6 +2288,9 @@ module.exports = function activate(api) {
     /** 悬浮窗被用户关掉、或宿主换过窗口之后，需要时把它重新创建出来。 */
     const ensureWidgetWindow = () => {
         if (state.disposed || state.win) return;
+        // 1.4.0：被 × 隐藏着的时候不重建 —— 隐藏是「不显示」，不是「不存在」；
+        // 否则下一条快照到达就会把用户刚关掉的窗口又拉回来。
+        if (!state.widgetOpen) return;
         if (state.hostWindows.size === 0) return;
         if (state.recreateAttempts >= MAX_WIDGET_RECREATES) {
             if (!state.warnedRecreateLimit) {
@@ -1530,6 +2330,16 @@ module.exports = function activate(api) {
         }));
         if (!payload || typeof payload !== 'object') {
             api.log.warn(LOG_PREFIX + ' update-data 收到非对象载荷，已忽略', describeForLog(payload));
+            return;
+        }
+        // 迟到帧在进 state 之前就丢掉：lastPayload 只记真正更新的那一帧，页面重载补发也不会补到旧句。
+        if (isStaleFrame(frameGate, payload)) {
+            api.log.info(LOG_PREFIX + ' 丢弃迟到的旧帧', JSON.stringify({
+                session: payload.playSessionId,
+                position: payload.position,
+                lineIndex: payload.line && payload.line.index,
+                text: payload.line && payload.line.text,
+            }));
             return;
         }
         state.lastPayload = payload;
@@ -1600,11 +2410,69 @@ module.exports = function activate(api) {
         savePersistedState();
     };
 
+    /**
+     * 形态切换的落点（1.7.0 的「桌面歌词 / 悬浮窗歌词」从这里接）。
+     * 调用方是 client.mjs 的 `folium.rpc.call(RPC_SURFACE, 'desktop' | 'window')`；
+     * 1.3.0 只有桌面歌词：请求 'window' 时状态不动，返回 { ok: false, code: 'unsupported' }。
+     * 1.7.0 在这里加：切 window 时隐藏桌面窗口并打开悬浮窗视图，切回 desktop 反过来，
+     * 两边都要重新上报可见性并落盘，然后返回 { ok: true, surface }。
+     */
+    const applySurface = (next) => {
+        if (!SURFACE_IDS.includes(next)) return { ok: false, code: SURFACE_INVALID, surface: state.surface };
+        if (next === state.surface) return { ok: false, code: SURFACE_UNCHANGED, surface: state.surface };
+        if (next === 'window') {
+            api.log.info(LOG_PREFIX + ' 请求切到悬浮窗歌词：1.3.0 只有桌面歌词，已忽略');
+            return { ok: false, code: SURFACE_UNSUPPORTED, surface: state.surface };
+        }
+        state.surface = next;
+        if (state.win && !state.win.isDestroyed()) {
+            state.win.webContents.send(IPC_SURFACE, next);
+        }
+        return { ok: true, surface: state.surface };
+    };
+    // 形态切换的 RPC 入口：1.7.0 的窗口按钮 / 设置项 / 命令面板都经 client.mjs 调到这里。
+    api.rpc.handle(RPC_SURFACE, (next) => applySurface(next));
+
+    // 1.4.0：播放条「词」按钮。client 每点一次问一次显隐，主进程按当前状态取反，
+    // 返回切换后的真值让按钮对齐（不信任 client 的本地翻转，避免两边跑偏）。
+    api.rpc.handle(RPC_TOGGLE_WIDGET, () => ({ visible: setWidgetOpen(!state.widgetOpen) }));
+    // 首帧对齐：client 激活时问一次。因为 widget-visibility 是 fire-and-forget，
+    // main 先发、client 后监听的那一帧会丢，只靠推送按钮高亮会错。
+    api.rpc.handle(RPC_WIDGET_STATE, () => ({ visible: state.widgetOpen }));
+    // 1.5.0：配置真源在宿主的模组设置里，client 每次变化后整份推过来。
+    // 这里只做校验与生效：改窗口高度、把整份配置转给页面；没变化就不动，免得每帧都重设尺寸。
+    api.rpc.handle(RPC_CONFIG, (raw) => {
+        const next = normalizeConfig(raw);
+        // 启动占位高度（prepareConfig）只影响建窗那一刻，真配置一到就丢掉，之后一律按字号算。
+        next.window = {};
+        if (JSON.stringify(next) === JSON.stringify(state.config)) return { changed: false };
+        state.config = next;
+        applyWindowSize();
+        sendConfigToWindow();
+        api.log.info(LOG_PREFIX + ' 配置已更新', JSON.stringify(next.shared));
+        return { changed: true, height: windowHeightFor(next) };
+    });
+    // 1.5.0：命令面板的「锁定 / 解锁」。和页面上那个固定键走同一套状态，命令回来的结果自带新值。
+    api.rpc.handle(RPC_TOGGLE_PIN, () => {
+        state.pinned = !state.pinned;
+        if (state.hoverTick) state.hoverTick();
+        if (state.persisted) {
+            state.persisted.pinned = state.pinned;
+            savePersistedState();
+        }
+        if (state.win && !state.win.isDestroyed()) {
+            state.win.webContents.send(IPC_PINNED, state.pinned);
+        }
+        return { pinned: state.pinned };
+    });
+
     ipcMain.on(IPC_ACTION, onActionFromWindowDebug);
     ipcMain.on(IPC_DEBUG, onDebugFromWindow);
     ipcMain.on(IPC_PINNED, onPinnedFromWindow);
     ipcMain.on(IPC_PIN_RECT, onPinRectFromWindow);
     ipcMain.on(IPC_LAYOUT, onLayoutFromWindow);
+    ipcMain.on(IPC_CLOSE, onCloseFromWindow);
+    ipcMain.on(IPC_SHOWN, onShownFromWindow);
     app.on('browser-window-created', onBrowserWindowCreated);
 
     const dispose = () => {
@@ -1618,6 +2486,8 @@ module.exports = function activate(api) {
             clearTimeout(state.persistTimer);
             state.persistTimer = null;
         }
+        // 1.5.1：停用时不留下「等握手」的计时器，否则 300ms 后会去 show 一个已销毁的窗口。
+        cancelShownWait();
         // 停用模组时窗口可能还活着：把当前位置落盘再关。
         if (state.win && !state.win.isDestroyed()) rememberWindowPosition(state.win);
         savePersistedState();
@@ -1628,6 +2498,8 @@ module.exports = function activate(api) {
             ipcMain.removeListener(IPC_PINNED, onPinnedFromWindow);
             ipcMain.removeListener(IPC_PIN_RECT, onPinRectFromWindow);
             ipcMain.removeListener(IPC_LAYOUT, onLayoutFromWindow);
+            ipcMain.removeListener(IPC_CLOSE, onCloseFromWindow);
+            ipcMain.removeListener(IPC_SHOWN, onShownFromWindow);
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 移除窗口指令监听失败', error);
         }
@@ -1642,6 +2514,11 @@ module.exports = function activate(api) {
         state.win = createWidgetWindow();
         // 悬浮窗之外、此刻已存在的窗口都算宿主窗口（宿主主窗口在模组启动前就已建好）。
         collectHostWindows();
+        // 首帧无条件推一次显隐真值：client 可能已经挂载完毕在等状态，也可能稍后用 widget-state 拉。
+        reportWidgetVisibility(true);
+        // 1.5.1：入口（重新）建起来就要配置。这条覆盖「主进程重载、client 没重跑」和
+        // 「页面比 client 先加载完所以那次要早了」两种情况；client 侧做了合并，重复要不会抖动。
+        requestConfigFromClient();
     } catch (error) {
         dispose();
         api.log.error(LOG_PREFIX + ' 创建悬浮窗失败，模组已停止', error);
