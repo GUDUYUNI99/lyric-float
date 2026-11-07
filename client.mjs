@@ -469,7 +469,9 @@ const createSyncEngine = (folium) => {
 
             // 一次变化可能同时触发多个监听；内容相同的快照不必重复发（request-sync 强制重发）。
             // position 每 100ms 都在变但不值得持续推流（主进程自己推进进度条），所以去重时把它固定掉。
-            const key = JSON.stringify(payload, (name, value) => (name === 'position' ? 0 : value));
+            // 1.5.3：sentAt 同理——它是「这份快照是什么时候的」，每次都不一样；不固定的话去重键永远不同，
+            // 快照就会每 100ms 全量重发一次（控制台刷屏、页面每帧重渲染，逐字基准也跟着被反复重置）。
+            const key = JSON.stringify(payload, (name, value) => (name === 'position' || name === 'sentAt' ? 0 : value));
             if (!force && key === lastSentKey) return;
             lastSentKey = key;
 
