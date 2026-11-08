@@ -67,6 +67,9 @@
  *   - 真正的悬浮窗由 main.cjs 在 activate 时创建，这里只负责搬数据。
  *   - 句间也带行号（1.5.5）：resolveLineIndex 把「上一句已唱完」解析成那一句的下标，文本仍是上一句；
  *     连上一句都没有（如歌曲还没开始）时才发 index -1 +「等待播放...」。
+ *   - 插曲行不是歌词（1.6.8）：宿主给前奏与每个超过 3 秒的停顿插一条 fullText 为六个点的行，
+ *     按宿主自己的规则这只是「空隙」——间奏期间继续显示最后一句真正唱过的行，
+ *     只有前奏（还没有上一句）才留空，由页面显示「……」。见 resolveLineIndex 的说明。
  *   - 导出窗口里没有播放页：只注册事件也不轮询，直接返回。
  */
 
@@ -112,6 +115,12 @@ const WAITING_LINE_TEXT = '等待播放...';
 // 1.6.7：「这首歌没有歌词」的防抖。宿主刚切歌时 getLines() 会有一小会儿是空数组（歌词还在加载），
 // 直接判「没有歌词」会让慢加载的歌先闪一下错误文案。空数组要持续这么久才认定为「确实没有歌词」。
 const EMPTY_LYRIC_DEBOUNCE_MS = 1500;
+// 1.6.8：宿主的「插曲行」标记。宿主解析歌词时会往数组里塞这种行 —— 前奏一条、每个超过 3 秒的
+// 停顿一条（src/utils/lyrics/parserCore.ts 的 attachInterludes），fullText 就是这六个点。
+// 它不是要显示的歌词：宿主自己的歌词显示也是先判 isInterludeLine 再当空隙处理
+// （src/components/remote/remoteLyricLine.ts：「here that is a gap, never a line to show」）。
+// 宿主没有把这个判定开放给模组（folium.d.ts 里没有），只能按这个哨兵值认。
+const INTERLUDE_FULL_TEXT = '......';
 const LOOP_MODES = ['off', 'all', 'one'];
 
 // 轮询周期：驱动「句内换行」这类没有事件的状态变化。100ms 足够让换句看起来是即时的，
@@ -258,24 +267,45 @@ const findApproximateLineIndex = (lines, time) => {
 };
 
 /**
- * 真正要显示的那一行（1.5.5）。
+ * 这一行是不是宿主塞进来的插曲行（前奏 / 超过 3 秒的停顿）。
+ * 它只有时间、没有真正要显示的文本。
+ */
+const isInterludeLine = (line) => Boolean(line) && line.fullText === INTERLUDE_FULL_TEXT;
+
+/**
+ * 最后一句真正唱过的行（1.6.8，对应宿主 remoteLyricLine.ts 的 findLastHeardLine）。
+ * 跳过插曲行；time 之后才开始的行不算。句间、插曲期间都停在这一句上。
+ */
+const findLastRealLineIndex = (lines, time) => {
+    if (!Array.isArray(lines) || lines.length === 0) return -1;
+    let index = -1;
+    let latestStart = -Infinity;
+    for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        if (!line || isInterludeLine(line)) continue;
+        const start = line.startTime;
+        if (typeof start === 'number' && Number.isFinite(start) && start <= time && start >= latestStart) {
+            latestStart = start;
+            index = i;
+        }
+    }
+    return index;
+};
+
+/**
+ * 真正要显示的那一行（1.5.5 起按行号解析，1.6.8 起跳过插曲行）。
  * 之前句间帧在 payload 里带的是 index -1 + 上一句的文本，主进程与页面都分辨不出「这一帧说的是哪一句」，
  * 于是同一句会在句间、下一句开始时、往回拖时反复顶掉画面（日志里表现为某一句出现频率明显不对）。
  * 现在统一解析成「有行号的那一行」：
  *   - 该句已唱完（句间）时保留上一句，但 index 仍指向它，让上下游能按时间判断新旧；
- *   - 只有什么都没得显示（第一句之前 / 无歌词）时才是 index -1 +「等待播放...」。
+ *   - 命中的是插曲行时，说明此刻是前奏或间奏：间奏沿用最后一句真正唱过的行，
+ *     前奏没有上一句 → index -1（页面显示「……」）；
+ *   - 只有什么都没得显示时才是 index -1。
  */
-const resolveLineIndex = (folium, lines, index, time) => {
-    if (index >= 0) return index;
-    const previous = folium.lyrics.getRecentCompletedLine(lines, index, time);
-    if (!previous) return -1;
-    if (typeof previous.index === 'number' && Number.isFinite(previous.index)) return previous.index;
-    // 宿主没给下标就自己找一次：取还没唱完、startTime 最大的那一句。
-    for (let i = lines.length - 1; i >= 0; i -= 1) {
-        const start = lines[i] && lines[i].startTime;
-        if (typeof start === 'number' && Number.isFinite(start) && start <= time) return i;
-    }
-    return -1;
+const resolveLineIndex = (lines, time) => {
+    const active = findApproximateLineIndex(lines, time);
+    if (active >= 0 && !isInterludeLine(lines[active])) return active;
+    return findLastRealLineIndex(lines, time);
 };
 
 /**
@@ -288,7 +318,7 @@ const readLine = (folium, lines, index, time) => {
     const line = index >= 0 ? safeLines[index] : null;
     if (!line) {
         // 没有当前行、也没有最近一句（第一句开始前 / 无歌词）时统一给等待文案；
-        // 注意最后一句结束后 getRecentCompletedLine 仍返回最后一句，不会走到这里。
+        // 注意最后一句结束后 resolveLineIndex 仍指向最后一句，不会走到这里。
         return {
             index: -1,
             text: WAITING_LINE_TEXT,
@@ -487,7 +517,7 @@ const createSyncEngine = (folium) => {
             : [];
         const offsetSec = readLyricOffsetSeconds(playback.song);
         const lyricTime = playback.position - offsetSec;
-        const lineIndex = resolveLineIndex(folium, lines, findApproximateLineIndex(lines, lyricTime), lyricTime);
+        const lineIndex = resolveLineIndex(lines, lyricTime);
         // 歌词回来了就把防抖计时清零，下一首从零开始算。
         if (lines.length > 0) {
             emptyLyricSince = 0;
