@@ -2081,7 +2081,16 @@ body[data-desktop="true"][data-pointer="true"] #desktop-exit { opacity: 1; }
             <div class="rows" id="rows"></div>
         </div>
 
-        <div class="rail right" id="rail-right"></div>
+        <div class="rail right" id="rail-right">
+            <button id="desktop" class="icon-btn" type="button" title="桌面模式（隐藏控件并让鼠标穿透）" aria-label="桌面模式">${ICON_SVG.monitor}</button>
+            <button id="surface" class="icon-btn" type="button" title="切换到桌面歌词" aria-label="切换到桌面歌词">${ICON_SVG.popup}</button>
+            <button id="layout" class="icon-btn" type="button" data-mode="text" title="歌词排版：原文" aria-label="歌词排版">${ICON_SVG.layout}</button>
+            <button id="playlist" class="icon-btn" type="button" title="播放列表" aria-label="播放列表">${ICON_SVG['list-music']}</button>
+            <button id="loop" class="icon-btn" type="button" title="循环模式：不循环" aria-label="循环模式">${ICON_SVG['loop-off']}</button>
+            <button id="prev" class="icon-btn" type="button" title="上一首" aria-label="上一首">${ICON_SVG.prev}</button>
+            <button id="toggle" class="icon-btn" type="button" title="播放/暂停" aria-label="播放/暂停">${ICON_SVG.play}</button>
+            <button id="next" class="icon-btn" type="button" title="下一首" aria-label="下一首">${ICON_SVG.next}</button>
+        </div>
     </div>
 
     <button id="desktop-exit" class="icon-btn" type="button" title="退出桌面模式" aria-label="退出桌面模式">${ICON_SVG.monitor}</button>
@@ -2361,16 +2370,21 @@ const render = (payload) => {
     lastLineIndex = payload.line && Number.isFinite(payload.line.index) ? payload.line.index : -1;
 };
 
-/** 按可用高度把 8 颗按钮分配到右列 / 左列（放不下先缩音量条的空间）。 */
+/** 按可用高度把 8 颗按钮分配到右列 / 左列（放不下时先缩音量条的空间）。 */
 const BUTTON_ORDER = ['desktop', 'surface', 'layout', 'playlist', 'loop', 'prev', 'toggle', 'next'];
 const packRails = () => {
     if (!els.railRight || !els.railExtra) return;
     const stageHeight = els.stage ? els.stage.clientHeight : 0;
-    const buttonSize = 26;
-    const gap = 8;
-    const rightCapacity = Math.max(0, Math.floor((stageHeight + gap) / (buttonSize + gap)));
+    if (stageHeight <= 0) return;
+    const rightStep = 34; // 26px 按钮 + 8px 间距
+    const extraStep = 30; // 24px 按钮 + 6px 间距
+    const rightCapacity = Math.max(0, Math.min(BUTTON_ORDER.length, Math.floor((stageHeight - 2 + 8) / rightStep)));
     const rightKeys = BUTTON_ORDER.slice(0, rightCapacity);
     const leftKeys = BUTTON_ORDER.slice(rightCapacity);
+    // 左列：音量图标 16 + 间距 + 百分比 14 + 间距 + 溢出按钮 + 间距，剩下的才是音量条能占的高度。
+    const extrasHeight = leftKeys.length * extraStep;
+    const volumeMax = Math.max(24, Math.min(150, stageHeight - 16 - 14 - extrasHeight - 24));
+    if (els.volume) els.volume.style.maxHeight = volumeMax + 'px';
     for (const key of BUTTON_ORDER) {
         const button = els[key];
         if (!button) continue;
