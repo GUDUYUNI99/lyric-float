@@ -117,6 +117,20 @@ const FONT_SIZE_OPTIONS = Array.from({ length: FONT_SIZE_MAX - FONT_SIZE_MIN + 1
     };
 });
 
+// 12–48 逐级下拉：悬浮窗歌词的排版更紧凑，字号档位独立。
+const POPUP_FONT_SIZE_OPTIONS = Array.from(
+    { length: POPUP_FONT_SIZE_MAX - POPUP_FONT_SIZE_MIN + 1 },
+    (_, offset) => {
+        const size = POPUP_FONT_SIZE_MIN + offset;
+        return {
+            value: String(size),
+            label: size === POPUP_FONT_SIZE_DEFAULT
+                ? L(size + '（默认）', size + ' (default)')
+                : L(String(size), String(size)),
+        };
+    },
+);
+
 // ---- 1.7.0：两个歌词形态（桌面歌词 / 悬浮窗歌词）----
 // 形态真源在主进程（它才真的在 show/hide 两个窗口）。这里只负责发起切换、点亮按钮。
 //   desktop  桌面歌词：1.x 一路的那个固定尺寸窗口（单行/两行，固定 + 局部穿透）
@@ -925,13 +939,15 @@ const registerProgressButton = (folium, options) => {
 };
 
 /**
- * 1.7.0：三颗播放条按钮（词 / 窗 / 透）+ 状态订阅。
- * 状态全部以主进程为准：激活时问一次 widget-state，之后靠三条推送消息更新。
- * 返回 `{ dispose }`；宿主没有 rpc.on 时按钮仍能点，只是不会自动跟随外部改动。
+ * 1.7.0：播放条按钮（只保留「词」）+ 显隐状态订阅。
+ * 形态切换（桌面歌词 / 悬浮窗歌词）改成两侧窗口里的按钮自己的事：
+ * 桌面歌词窗口的固定键左边有一颗「窗」图标键，悬浮窗歌词窗口里也有一颗切回键，
+ * 都走 main.cjs 的 `set-surface` / `toggle-surface`，播放条不再重复放按钮。
+ * 状态以主进程为准：激活时问一次 widget-state，之后靠推送消息更新。
  */
 const registerProgressButtons = (folium) => {
     const callMain = (method, ...args) => Promise.resolve(folium.rpc.call(method, ...args));
-    const state = { visible: true, surface: SURFACE_DESKTOP, desktopMode: false };
+    const state = { visible: true };
 
     const widgetButton = registerProgressButton(folium, {
         id: 'lyric-widget-toggle',
@@ -946,37 +962,8 @@ const registerProgressButtons = (folium) => {
         },
     });
 
-    const surfaceButton = registerProgressButton(folium, {
-        id: 'lyric-widget-surface',
-        text: '窗',
-        order: 481,
-        titleOf: (active) => (active ? '切回桌面歌词' : '切到悬浮窗歌词'),
-        onClick: async () => {
-            const next = state.surface === SURFACE_POPUP ? SURFACE_DESKTOP : SURFACE_POPUP;
-            const result = await callMain(RPC_SURFACE, next);
-            if (result && typeof result.surface === 'string') state.surface = result.surface;
-            updateButtons();
-            return state.surface === SURFACE_POPUP;
-        },
-    });
-
-    const desktopButton = registerProgressButton(folium, {
-        id: 'lyric-widget-desktop-mode',
-        text: '透',
-        order: 482,
-        titleOf: (active) => (active ? '关闭桌面模式（窗口正在穿透）' : '桌面模式：隐藏控件并让鼠标穿透'),
-        onClick: async () => {
-            const result = await callMain(RPC_TOGGLE_DESKTOP_MODE);
-            if (result && typeof result.desktopMode === 'boolean') state.desktopMode = result.desktopMode;
-            updateButtons();
-            return state.desktopMode;
-        },
-    });
-
     const updateButtons = () => {
         if (widgetButton) widgetButton.setActive(state.visible);
-        if (surfaceButton) surfaceButton.setActive(state.surface === SURFACE_POPUP);
-        if (desktopButton) desktopButton.setActive(state.desktopMode);
     };
 
     const disposers = [];
@@ -989,18 +976,6 @@ const registerProgressButtons = (folium) => {
                     updateButtons();
                 }),
             );
-            disposers.push(
-                folium.rpc.on(RPC_SURFACE_CHANGED, (message) => {
-                    if (message && typeof message.surface === 'string') state.surface = message.surface;
-                    updateButtons();
-                }),
-            );
-            disposers.push(
-                folium.rpc.on(RPC_DESKTOP_MODE, (message) => {
-                    state.desktopMode = Boolean(message && message.desktopMode);
-                    updateButtons();
-                }),
-            );
         } catch (error) {
             folium.log.warn('[lyric-widget] 订阅歌词窗口状态失败', error);
         }
@@ -1009,8 +984,6 @@ const registerProgressButtons = (folium) => {
         .then((initial) => {
             if (!initial || typeof initial !== 'object') return;
             if (typeof initial.visible === 'boolean') state.visible = initial.visible;
-            if (typeof initial.surface === 'string') state.surface = initial.surface;
-            if (typeof initial.desktopMode === 'boolean') state.desktopMode = initial.desktopMode;
             updateButtons();
         })
         .catch((error) => {
@@ -1030,8 +1003,6 @@ const registerProgressButtons = (folium) => {
                 }
             }
             if (widgetButton) widgetButton.dispose();
-            if (surfaceButton) surfaceButton.dispose();
-            if (desktopButton) desktopButton.dispose();
         },
     };
 };
@@ -1066,17 +1037,26 @@ const buildSettingsSection = () => ({
         },
         {
             key: 'popupFontSize',
-            type: 'number',
+            type: 'select',
             label: L('悬浮窗歌词字号', 'Popup lyric font size'),
             description: L(
-                '12–48 像素，只影响悬浮窗歌词的五行动排版。',
-                '12-48 px; only affects the five-line layout of the popup lyric window.',
+                '12–48 像素，只影响悬浮窗歌词的三行排版；窗口拉大时字号会跟着略有放大。',
+                '12-48 px; only affects the popup lyric layout and scales slightly with the window.',
             ),
             group: L('悬浮窗歌词', 'Popup lyric'),
-            defaultValue: POPUP_FONT_SIZE_DEFAULT,
-            min: POPUP_FONT_SIZE_MIN,
-            max: POPUP_FONT_SIZE_MAX,
-            step: 1,
+            defaultValue: String(POPUP_FONT_SIZE_DEFAULT),
+            options: POPUP_FONT_SIZE_OPTIONS,
+        },
+        {
+            key: 'popupColor',
+            type: 'color',
+            label: L('悬浮窗歌词当前句颜色', 'Popup current line color'),
+            description: L(
+                '只给悬浮窗歌词的当前句整句着色，不做逐字。',
+                'Colors the whole current line in the popup lyric window; no per-word coloring.',
+            ),
+            group: L('悬浮窗歌词', 'Popup lyric'),
+            defaultValue: '#f4fbff',
         },
         {
             key: 'fontMode',
@@ -1192,6 +1172,8 @@ const readConfigFromHandle = (handle) => {
         shared: {
             fontSize: toNumber(values.fontSize, FONT_SIZE_DEFAULT),
             popupFontSize: toNumber(values.popupFontSize, POPUP_FONT_SIZE_DEFAULT),
+            // 颜色交给 main.cjs 的 normalizeConfig 校验（只认 #rrggbb），这里原样透传。
+            popupColor: typeof values.popupColor === 'string' ? values.popupColor : '#f4fbff',
             fontMode: values.fontMode,
             surface: values.surface,
             surfaceOpacity: toNumber(values.surfaceOpacity, 0.58),
