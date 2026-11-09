@@ -95,9 +95,14 @@ const ACTION_REQUEST_CONFIG = 'request-config';
 const RPC_TOGGLE_PIN = 'toggle-pin';
 // 设置分区 id：设置 → 高级 → 模组 → 展开「悬浮窗歌词」。
 const SETTINGS_SECTION_ID = 'lyric-widget';
+// 桌面歌词的字号范围（1.4.2 起就是这个范围，默认 38 不能动）。
 const FONT_SIZE_MIN = 20;
 const FONT_SIZE_MAX = 50;
 const FONT_SIZE_DEFAULT = 38;
+// 1.7.0：悬浮窗歌词是独立功能，字号单独一套（12–48，默认 24）。
+const POPUP_FONT_SIZE_MIN = 12;
+const POPUP_FONT_SIZE_MAX = 48;
+const POPUP_FONT_SIZE_DEFAULT = 24;
 
 // 宿主的所有文案都是语言映射（FoliumLabel = Record<language, string>）：直接传字符串会被
 // sanitize 整条丢掉、界面回落到 key 名（1.5.0 踩过），所以统一走这个 helper。
@@ -111,6 +116,21 @@ const FONT_SIZE_OPTIONS = Array.from({ length: FONT_SIZE_MAX - FONT_SIZE_MIN + 1
         label: size === FONT_SIZE_DEFAULT ? L(size + '（默认）', size + ' (default)') : L(String(size), String(size)),
     };
 });
+
+// ---- 1.7.0：两个歌词形态（桌面歌词 / 悬浮窗歌词）----
+// 形态真源在主进程（它才真的在 show/hide 两个窗口）。这里只负责发起切换、点亮按钮。
+//   desktop  桌面歌词：1.x 一路的那个固定尺寸窗口（单行/两行，固定 + 局部穿透）
+//   window   悬浮窗歌词：可缩放、五行、带完整控制栏的独立窗口
+const SURFACE_DESKTOP = 'desktop';
+const SURFACE_POPUP = 'window';
+//   set-surface            切换形态，参数 'desktop' / 'window'，返回 { ok, surface, code? }
+//   surface-changed        主进程每次切换后 fire-and-forget 推 { surface }
+//   toggle-desktop-mode    悬浮窗歌词的「桌面（穿透）模式」开关，返回 { desktopMode }
+//   desktop-mode           主进程每次切换后推 { desktopMode }
+const RPC_SURFACE = 'set-surface';
+const RPC_SURFACE_CHANGED = 'surface-changed';
+const RPC_TOGGLE_DESKTOP_MODE = 'toggle-desktop-mode';
+const RPC_DESKTOP_MODE = 'desktop-mode';
 const WAITING_LINE_TEXT = '等待播放...';
 // 1.6.7：「这首歌没有歌词」的防抖。宿主刚切歌时 getLines() 会有一小会儿是空数组（歌词还在加载），
 // 直接判「没有歌词」会让慢加载的歌先闪一下错误文案。空数组要持续这么久才认定为「确实没有歌词」。
@@ -309,7 +329,48 @@ const resolveLineIndex = (lines, time) => {
 };
 
 /**
- * 当前歌词行；两句之间保留上一句，只有上一句也没有（如歌曲还没开始）时才给「等待播放...」。
+ * 1.7.0：当前句前后各两句（悬浮窗歌词的五行排版用）。
+ * 行号是 resolveLineIndex 解析过的那一句的真实下标，所以这里直接从它往上/往下数，
+ * 跳过插曲行与空文本——宿主那六个点不是歌词，不参与显示。
+ * 返回 `{ before: [上上句, 上句], after: [下句, 下下句] }`，缺失的位置是 null。
+ */
+const readContext = (lines, lineIndex) => {
+    const safeLines = Array.isArray(lines) ? lines : [];
+    const textOf = (line) => {
+        if (!line || isInterludeLine(line)) return null;
+        const text = typeof line.fullText === 'string' ? line.fullText : '';
+        return text === '' ? null : { text, translation: line.translation ?? null };
+    };
+    const collect = (from, step, count) => {
+        const out = [];
+        let cursor = from;
+        while (out.length < count && cursor >= 0 && cursor < safeLines.length) {
+            const entry = textOf(safeLines[cursor]);
+            if (entry) out.push(entry);
+            cursor += step;
+        }
+        while (out.length < count) out.push(null);
+        return out;
+    };
+    if (lineIndex < 0) {
+        return { before: [null, null], after: collect(0, 1, 2) };
+    }
+    // before 需要「从近到远」倒着找：先 -1 再 -2，最终排成 [上上, 上]。
+    const back = [];
+    let cursor = lineIndex - 1;
+    while (back.length < 2 && cursor >= 0) {
+        const entry = textOf(safeLines[cursor]);
+        if (entry) back.push(entry);
+        cursor -= 1;
+    }
+    while (back.length < 2) back.push(null);
+    return {
+        before: [back[1], back[0]],
+        after: collect(lineIndex + 1, 1, 2),
+    };
+};
+
+/**
  * 调用方传进来的 index 已经是 resolveLineIndex 解析过的行号（句间也指向上一句），
  * 只有「什么都没得显示」时才是 -1。
  */
@@ -372,6 +433,8 @@ const buildPayload = (folium, view, playSessionId) => {
         muted,
         loopMode: folium.playback.getLoopMode(),
         line: readLine(folium, view.lines, view.lineIndex, view.time),
+        // 1.7.0：前后各两句，悬浮窗歌词的五行排版用；桌面歌词不看这个字段。
+        context: readContext(view.lines, view.lineIndex),
         // 1.6.7：页面据此区分「等待播放 / 歌词还在加载 / 这首歌没歌词 / 还没到第一句」。
         lineStatus: view.lineStatus,
         theme: readTheme(folium, view.theme),
@@ -440,6 +503,19 @@ const handleAction = (folium, message) => {
                 break;
             }
             folium.playback.setLoopMode(message.mode);
+            break;
+        case 'open-playlist':
+            // 1.7.0：悬浮窗歌词底部的「播放列表」按钮。宿主原生播放面板只能在渲染进程里开，
+            // 主进程没有对应 API，所以由这里代劳（folium.ui 是 1.6+ 的 UI 服务）。
+            try {
+                if (folium.ui && typeof folium.ui.openPlayerPanel === 'function') {
+                    folium.ui.openPlayerPanel();
+                } else {
+                    folium.log.warn('[lyric-widget] 当前 Folium 没有 folium.ui.openPlayerPanel，无法打开播放面板');
+                }
+            } catch (error) {
+                folium.log.warn('[lyric-widget] 打开播放面板失败', error);
+            }
             break;
         default:
             folium.log.warn('[lyric-widget] 收到未知 action，已忽略', message.action);
@@ -705,16 +781,19 @@ const clearStaleVisualizerSelection = (folium) => {
     }
 };
 
-// ---- 播放条上的「词」开关（1.4.0）----
-// 悬浮窗被 × 关掉后，模组还在跑，得留一个能把它叫回来的入口：播放进度条右侧挂一个 22px 圆形小按钮，
-// 造型跟随宿主 currentColor（1.4.2 起不再自绘描边），开启时高亮、关闭时降到 40% 透明度。
-const WIDGET_BUTTON_ID = 'lyric-widget-toggle';
-const WIDGET_BUTTON_STYLE_ID = 'lyric-widget-toggle-style';
-const WIDGET_BUTTON_HTML =
-    '<button type="button" class="lyric-widget-toggle" data-on="false" aria-pressed="false" title="显示悬浮歌词">' +
-    '<span aria-hidden="true">词</span></button>';
-const WIDGET_BUTTON_CSS = `
-.lyric-widget-toggle {
+// ---- 播放条上的模组按钮（1.4.0 起；1.7.0 扩成三颗）----
+// 播放条右侧挂一排 22px 圆形小按钮，造型跟随宿主 currentColor：
+//   「词」 显示 / 隐藏当前形态的歌词窗口（隐藏后模组仍在跑，靠它叫回来）
+//   「窗」 切换形态：桌面歌词 ↔ 悬浮窗歌词
+//   「透」 悬浮窗歌词的桌面（点击穿透）模式开关——开启后窗口整块不接收鼠标，这里是唯一出口，
+//          所以它必须留在播放条上（命令面板 / 全局快捷键是第二条路径）。
+const PROGRESS_BUTTON_STYLE_ID = 'lyric-widget-progress-style';
+const PROGRESS_BUTTON_CLASS = 'lyric-widget-btn';
+const progressButtonHtml = (text) =>
+    '<button type="button" class="' + PROGRESS_BUTTON_CLASS + '" data-on="false" aria-pressed="false">' +
+    '<span aria-hidden="true">' + text + '</span></button>';
+const PROGRESS_BUTTON_CSS = `
+.lyric-widget-btn {
     all: unset;
     box-sizing: border-box;
     display: inline-flex;
@@ -731,15 +810,15 @@ const WIDGET_BUTTON_CSS = `
     opacity: 0.4;
     transition: opacity 0.15s ease, background-color 0.15s ease;
 }
-.lyric-widget-toggle:hover {
+.lyric-widget-btn:hover {
     opacity: 0.8;
     background-color: color-mix(in srgb, currentColor 12%, transparent);
 }
-.lyric-widget-toggle[data-on="true"] {
+.lyric-widget-btn[data-on="true"] {
     opacity: 1;
     background-color: color-mix(in srgb, currentColor 18%, transparent);
 }
-.lyric-widget-toggle:focus-visible {
+.lyric-widget-btn:focus-visible {
     opacity: 1;
     outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);
     outline-offset: 1px;
@@ -747,10 +826,11 @@ const WIDGET_BUTTON_CSS = `
 `;
 
 /**
- * 注册播放条上的「词」按钮。返回 `{ setVisible, dispose }`；宿主没有 progressButtons 时返回 null。
- * 显隐真源在主进程（它才是真的在 show/hide 窗口），这里只负责画和高亮。
+ * 注册一颗播放条按钮。返回 `{ setActive, dispose }`；宿主没有 progressButtons 时返回 null。
+ * 按钮「亮 / 灭」的真源在主进程（它才是真的在切窗口、切形态、切穿透），这里只负责画和转发点击。
  */
-const registerWidgetToggleButton = (folium) => {
+const registerProgressButton = (folium, options) => {
+    const { id, text, order, titleOf, onClick } = options;
     const progressButtons = folium.registries && folium.registries.progressButtons;
     if (!progressButtons || typeof progressButtons.register !== 'function') {
         folium.log.warn('[lyric-widget] 当前 Folium 没有 progressButtons 注册表，播放条按钮不可用（需要 1.4+）');
@@ -758,62 +838,59 @@ const registerWidgetToggleButton = (folium) => {
     }
     let button = null;
     let styleNode = null;
-    let visible = true;
+    let active = false;
 
     const paint = () => {
         if (!button) return;
-        button.dataset.on = visible ? 'true' : 'false';
-        button.setAttribute('aria-pressed', visible ? 'true' : 'false');
-        button.title = visible ? '隐藏悬浮歌词' : '显示悬浮歌词';
+        button.dataset.on = active ? 'true' : 'false';
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+        button.title = typeof titleOf === 'function' ? titleOf(active) : text;
     };
 
     const def = {
-        id: WIDGET_BUTTON_ID,
+        id,
         slot: 'progress.trailing',
-        // 480 = 排在宿主内置按钮之后；同一个 order 上再按 id 排序，所以位置稳定。
-        order: 480,
-        // 进度条收起（迷你 / 歌词页折叠）时跟着消失，别在只剩一条细线的地方挤一个按钮。
+        // 同 order 时宿主按 id 排序，所以三颗按钮的顺序是稳定的：词(480) → 窗(481) → 透(482)。
+        order,
+        // 进度条收起（迷你 / 歌词页折叠）时跟着消失，别在只剩一条细线的地方挤按钮。
         hideWhenCollapsed: true,
         mount(container) {
             // 播放条在宿主自己的 ShadowRoot 里：样式必须注入按钮所在的 root，挂到 document.head 不生效。
             const root = container.getRootNode && container.getRootNode();
             const styleHost = root && root.nodeType === 11 && root.head ? root.head : root;
             if (styleHost && typeof styleHost.querySelector === 'function') {
-                styleNode = styleHost.querySelector('#' + WIDGET_BUTTON_STYLE_ID);
+                styleNode = styleHost.querySelector('#' + PROGRESS_BUTTON_STYLE_ID);
             }
             if (!styleNode) {
                 styleNode = document.createElement('style');
-                styleNode.id = WIDGET_BUTTON_STYLE_ID;
-                styleNode.textContent = WIDGET_BUTTON_CSS;
+                styleNode.id = PROGRESS_BUTTON_STYLE_ID;
+                styleNode.textContent = PROGRESS_BUTTON_CSS;
                 if (styleHost && typeof styleHost.appendChild === 'function') styleHost.appendChild(styleNode);
             }
-            container.innerHTML = WIDGET_BUTTON_HTML;
-            button = container.querySelector('.lyric-widget-toggle');
+            container.innerHTML = progressButtonHtml(text);
+            button = container.querySelector('.' + PROGRESS_BUTTON_CLASS);
             paint();
             if (!button) return undefined;
-            const onClick = () => {
-                // 先本地翻转让手感即时；主进程返回后以它的值对齐（失败则回滚）。
-                visible = !visible;
-                paint();
-                Promise.resolve(folium.rpc.call(RPC_TOGGLE_WIDGET))
-                    .then((result) => {
-                        if (result && typeof result.visible === 'boolean') {
-                            visible = result.visible;
+            const onClickHandler = () => {
+                // 不在本地翻转：点击只转发给主进程，亮的与灭的都以它返回的真值为准，
+                // 免得两个窗口 / 命令面板同时改状态时按钮和实际不一致。
+                Promise.resolve(onClick())
+                    .then((next) => {
+                        if (typeof next === 'boolean') {
+                            active = next;
                             paint();
                         }
                     })
                     .catch((error) => {
-                        visible = !visible;
-                        paint();
-                        folium.log.warn('[lyric-widget] 切换悬浮歌词失败', error);
+                        folium.log.warn('[lyric-widget] 播放条按钮操作失败', error);
                     });
             };
-            button.addEventListener('click', onClick);
+            button.addEventListener('click', onClickHandler);
             // cleanup 用 mount 时这个局部节点：dispose() 会先把 button 置 null 再等 React 卸载，
             // 直接碰外层 button 会读到 null（停用/重载模组时宿主报一次模组故障）。
             const mountedButton = button;
             return () => {
-                mountedButton.removeEventListener('click', onClick);
+                mountedButton.removeEventListener('click', onClickHandler);
                 if (button === mountedButton) button = null;
             };
         },
@@ -824,15 +901,15 @@ const registerWidgetToggleButton = (folium) => {
         handle = progressButtons.register(def);
     } catch (error) {
         // id 重复（模组热重载时旧条目还没被宿主清掉）之类的注册错误：按钮没了不该拖垮数据同步。
-        folium.log.warn('[lyric-widget] 注册播放条「词」按钮失败', error);
+        folium.log.warn('[lyric-widget] 注册播放条按钮失败：' + id, error);
         return null;
     }
 
     return {
-        setVisible(next) {
-            const value = next !== false;
-            if (value === visible) return;
-            visible = value;
+        setActive(next) {
+            const value = next === true;
+            if (value === active) return;
+            active = value;
             paint();
         },
         dispose() {
@@ -841,9 +918,120 @@ const registerWidgetToggleButton = (folium) => {
             } catch (error) {
                 folium.log.warn('[lyric-widget] 注销播放条按钮失败', error);
             }
-            if (styleNode && styleNode.parentNode) styleNode.parentNode.removeChild(styleNode);
             styleNode = null;
             button = null;
+        },
+    };
+};
+
+/**
+ * 1.7.0：三颗播放条按钮（词 / 窗 / 透）+ 状态订阅。
+ * 状态全部以主进程为准：激活时问一次 widget-state，之后靠三条推送消息更新。
+ * 返回 `{ dispose }`；宿主没有 rpc.on 时按钮仍能点，只是不会自动跟随外部改动。
+ */
+const registerProgressButtons = (folium) => {
+    const callMain = (method, ...args) => Promise.resolve(folium.rpc.call(method, ...args));
+    const state = { visible: true, surface: SURFACE_DESKTOP, desktopMode: false };
+
+    const widgetButton = registerProgressButton(folium, {
+        id: 'lyric-widget-toggle',
+        text: '词',
+        order: 480,
+        titleOf: (active) => (active ? '隐藏歌词窗口（模组仍在运行）' : '显示歌词窗口'),
+        onClick: async () => {
+            const result = await callMain(RPC_TOGGLE_WIDGET);
+            if (result && typeof result.visible === 'boolean') state.visible = result.visible;
+            updateButtons();
+            return state.visible;
+        },
+    });
+
+    const surfaceButton = registerProgressButton(folium, {
+        id: 'lyric-widget-surface',
+        text: '窗',
+        order: 481,
+        titleOf: (active) => (active ? '切回桌面歌词' : '切到悬浮窗歌词'),
+        onClick: async () => {
+            const next = state.surface === SURFACE_POPUP ? SURFACE_DESKTOP : SURFACE_POPUP;
+            const result = await callMain(RPC_SURFACE, next);
+            if (result && typeof result.surface === 'string') state.surface = result.surface;
+            updateButtons();
+            return state.surface === SURFACE_POPUP;
+        },
+    });
+
+    const desktopButton = registerProgressButton(folium, {
+        id: 'lyric-widget-desktop-mode',
+        text: '透',
+        order: 482,
+        titleOf: (active) => (active ? '关闭桌面模式（窗口正在穿透）' : '桌面模式：隐藏控件并让鼠标穿透'),
+        onClick: async () => {
+            const result = await callMain(RPC_TOGGLE_DESKTOP_MODE);
+            if (result && typeof result.desktopMode === 'boolean') state.desktopMode = result.desktopMode;
+            updateButtons();
+            return state.desktopMode;
+        },
+    });
+
+    const updateButtons = () => {
+        if (widgetButton) widgetButton.setActive(state.visible);
+        if (surfaceButton) surfaceButton.setActive(state.surface === SURFACE_POPUP);
+        if (desktopButton) desktopButton.setActive(state.desktopMode);
+    };
+
+    const disposers = [];
+    if (typeof folium.rpc.on === 'function') {
+        try {
+            // main 的推送是 fire-and-forget，激活首帧可能早于这里注册监听，所以下面还要主动问一次。
+            disposers.push(
+                folium.rpc.on(RPC_WIDGET_VISIBILITY, (message) => {
+                    state.visible = !message || message.visible !== false;
+                    updateButtons();
+                }),
+            );
+            disposers.push(
+                folium.rpc.on(RPC_SURFACE_CHANGED, (message) => {
+                    if (message && typeof message.surface === 'string') state.surface = message.surface;
+                    updateButtons();
+                }),
+            );
+            disposers.push(
+                folium.rpc.on(RPC_DESKTOP_MODE, (message) => {
+                    state.desktopMode = Boolean(message && message.desktopMode);
+                    updateButtons();
+                }),
+            );
+        } catch (error) {
+            folium.log.warn('[lyric-widget] 订阅歌词窗口状态失败', error);
+        }
+    }
+    Promise.resolve(callMain(RPC_WIDGET_STATE))
+        .then((initial) => {
+            if (!initial || typeof initial !== 'object') return;
+            if (typeof initial.visible === 'boolean') state.visible = initial.visible;
+            if (typeof initial.surface === 'string') state.surface = initial.surface;
+            if (typeof initial.desktopMode === 'boolean') state.desktopMode = initial.desktopMode;
+            updateButtons();
+        })
+        .catch((error) => {
+            // 宿主没登记 widget-state（不该发生）时保持默认状态，不影响数据同步。
+            folium.log.warn('[lyric-widget] 读取歌词窗口状态失败', error);
+        });
+
+    updateButtons();
+
+    return {
+        dispose() {
+            for (const dispose of disposers) {
+                try {
+                    dispose();
+                } catch (error) {
+                    // 宿主已经整体回收过，忽略。
+                }
+            }
+            if (widgetButton) widgetButton.dispose();
+            if (surfaceButton) surfaceButton.dispose();
+            if (desktopButton) desktopButton.dispose();
         },
     };
 };
@@ -867,14 +1055,28 @@ const buildSettingsSection = () => ({
         {
             key: 'fontSize',
             type: 'select',
-            label: L('字号', 'Font size'),
+            label: L('桌面歌词字号', 'Desktop lyric font size'),
             description: L(
-                '窗口高度会跟着字号一起缩放，歌词始终贴着窗口底部留白。',
-                'The window height follows the font size so the lyric keeps its bottom margin.',
+                '桌面歌词的窗口高度会跟着字号一起缩放，歌词始终贴着窗口底部留白。',
+                'The desktop lyric window height follows the font size so the lyric keeps its bottom margin.',
             ),
-            group: L('通用', 'Shared'),
+            group: L('桌面歌词', 'Desktop lyric'),
             defaultValue: String(FONT_SIZE_DEFAULT),
             options: FONT_SIZE_OPTIONS,
+        },
+        {
+            key: 'popupFontSize',
+            type: 'number',
+            label: L('悬浮窗歌词字号', 'Popup lyric font size'),
+            description: L(
+                '12–48 像素，只影响悬浮窗歌词的五行动排版。',
+                '12-48 px; only affects the five-line layout of the popup lyric window.',
+            ),
+            group: L('悬浮窗歌词', 'Popup lyric'),
+            defaultValue: POPUP_FONT_SIZE_DEFAULT,
+            min: POPUP_FONT_SIZE_MIN,
+            max: POPUP_FONT_SIZE_MAX,
+            step: 1,
         },
         {
             key: 'fontMode',
@@ -989,6 +1191,7 @@ const readConfigFromHandle = (handle) => {
     return {
         shared: {
             fontSize: toNumber(values.fontSize, FONT_SIZE_DEFAULT),
+            popupFontSize: toNumber(values.popupFontSize, POPUP_FONT_SIZE_DEFAULT),
             fontMode: values.fontMode,
             surface: values.surface,
             surfaceOpacity: toNumber(values.surfaceOpacity, 0.58),
@@ -1120,6 +1323,7 @@ const registerWidgetCommands = (folium, settings) => {
         const next = Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, currentSize + delta));
         if (next === currentSize) return undefined;
         try {
+            // 桌面歌词的字号是 select，写字符串；悬浮窗字号是 number，命令先只动桌面歌词这一项。
             return settings.handle.settings.set({ fontSize: String(next) });
         } catch (error) {
             folium.log.warn('[lyric-widget] 调整字号失败', error);
@@ -1143,10 +1347,36 @@ const registerWidgetCommands = (folium, settings) => {
     });
     add({
         id: 'lyric-widget-pin',
-        label: L('桌面歌词：锁定 / 解锁位置', 'Floating lyrics: lock / unlock'),
-        description: L('和悬浮窗正中的图钉按钮同一套状态。', 'Same state as the pin button in the window.'),
+        label: L('歌词窗口：锁定 / 解锁位置', 'Lyric window: lock / unlock'),
+        description: L('和窗口正中那个图钉按钮同一套状态。', 'Same state as the pin button in the window.'),
         keywords: ['歌词', '锁定', '固定', 'pin', 'lock'],
         run: () => callMain(RPC_TOGGLE_PIN),
+    });
+    // 1.7.0：形态切换与桌面（穿透）模式。穿透开启后窗口不接收鼠标，命令面板 / 这里是唯一出口，
+    // 所以 minor >= 7 时顺带挂全局快捷键（见下面的 add）。
+    add({
+        id: 'lyric-widget-surface',
+        label: L('歌词窗口：切换桌面歌词 / 悬浮窗歌词', 'Lyric window: switch desktop / popup'),
+        description: L(
+            '和播放控制条上的「窗」按钮同一个切换。',
+            'Same switch as the 窗 button on the player bar.',
+        ),
+        keywords: ['歌词', '悬浮窗', '桌面歌词', '形态', 'switch', 'surface'],
+        run: async () => {
+            const current = await callMain(RPC_WIDGET_STATE).catch(() => null);
+            const surface = current && current.surface === SURFACE_POPUP ? SURFACE_DESKTOP : SURFACE_POPUP;
+            return callMain(RPC_SURFACE, surface);
+        },
+    });
+    add({
+        id: 'lyric-widget-desktop-mode',
+        label: L('歌词窗口：桌面模式（点击穿透）', 'Lyric window: desktop mode (click-through)'),
+        description: L(
+            '隐藏所有控件并让鼠标穿透；再执行一次退出。',
+            'Hides all controls and lets clicks pass through; run again to exit.',
+        ),
+        keywords: ['歌词', '穿透', '桌面模式', 'desktop', 'click-through'],
+        run: () => callMain(RPC_TOGGLE_DESKTOP_MODE),
     });
     add({
         id: 'lyric-widget-font-up',
@@ -1203,26 +1433,12 @@ export default function activate(folium) {
 
     const disposers = engine.attachListeners();
 
-    // 1.4.0：播放条上的「词」开关。显隐真源在 main（它才真的在 show/hide 窗口），
-    // 这里订阅 main 推来的 widget-visibility 点亮按钮，激活时再用 widget-state 对齐一次
-    // （main 首帧那边是 fire-and-forget，早于这里注册监听就会丢）。
-    const widgetButton = registerWidgetToggleButton(folium);
-    if (widgetButton) {
-        disposers.push(() => widgetButton.dispose());
-        if (typeof folium.rpc.on === 'function') {
-            disposers.push(
-                folium.rpc.on(RPC_WIDGET_VISIBILITY, (message) => {
-                    widgetButton.setVisible(message && message.visible);
-                }),
-            );
-        }
-        Promise.resolve(folium.rpc.call(RPC_WIDGET_STATE))
-            .then((initial) => widgetButton.setVisible(initial && initial.visible))
-            .catch((error) => {
-                // 宿主没登记 widget-state（不该发生）时保持默认「显示」，不影响数据同步。
-                folium.log.warn('[lyric-widget] 读取悬浮窗显隐状态失败', error);
-            });
-    }
+    // 1.7.0：播放条三颗按钮（词 = 显隐、窗 = 切形态、透 = 桌面穿透）。
+    // 三者的真值都在 main：激活时问一次 widget-state，之后靠 widget-visibility /
+    // surface-changed / desktop-mode 三条推送更新（main 的推送是 fire-and-forget，
+    // 可能早于这里注册监听，所以首帧那次主动问是必须的）。
+    const progressButtons = registerProgressButtons(folium);
+    if (progressButtons) disposers.push(() => progressButtons.dispose());
 
     // 1.5.0：设置表单。注册成功时 activate 里立刻会把当前配置推一份给 main，
     // 所以窗口在创建后不久就能拿到真实字号 / 外观，而不是等用户去动设置。
