@@ -99,10 +99,10 @@ const SETTINGS_SECTION_ID = 'lyric-widget';
 const FONT_SIZE_MIN = 20;
 const FONT_SIZE_MAX = 50;
 const FONT_SIZE_DEFAULT = 38;
-// 1.7.0：悬浮窗歌词是独立功能，字号单独一套（12–48，默认 24）。
-const POPUP_FONT_SIZE_MIN = 12;
-const POPUP_FONT_SIZE_MAX = 48;
-const POPUP_FONT_SIZE_DEFAULT = 24;
+// 1.7.5：悬浮窗歌词字号收窄到 20–40（默认 32）—— 窗口尺寸固定，字号再大就只能靠滚动。
+const POPUP_FONT_SIZE_MIN = 20;
+const POPUP_FONT_SIZE_MAX = 40;
+const POPUP_FONT_SIZE_DEFAULT = 32;
 
 // 宿主的所有文案都是语言映射（FoliumLabel = Record<language, string>）：直接传字符串会被
 // sanitize 整条丢掉、界面回落到 key 名（1.5.0 踩过），所以统一走这个 helper。
@@ -117,11 +117,11 @@ const FONT_SIZE_OPTIONS = Array.from({ length: FONT_SIZE_MAX - FONT_SIZE_MIN + 1
     };
 });
 
-// 12–48 逐级下拉：悬浮窗歌词的排版更紧凑，字号档位独立。
+// 20–40 逐级下拉：悬浮窗歌词的排版更紧凑，字号档位独立。
 const POPUP_FONT_SIZE_OPTIONS = Array.from(
-    { length: POPUP_FONT_SIZE_MAX - POPUP_FONT_SIZE_MIN + 1 },
+    { length: (POPUP_FONT_SIZE_MAX - POPUP_FONT_SIZE_MIN) / 2 + 1 },
     (_, offset) => {
-        const size = POPUP_FONT_SIZE_MIN + offset;
+        const size = POPUP_FONT_SIZE_MIN + offset * 2;
         return {
             value: String(size),
             label: size === POPUP_FONT_SIZE_DEFAULT
@@ -353,8 +353,24 @@ const readContext = (lines, lineIndex) => {
     const textOf = (line) => {
         if (!line || isInterludeLine(line)) return null;
         const text = typeof line.fullText === 'string' ? line.fullText : '';
-        return text === '' ? null : { text, translation: line.translation ?? null };
+        return text === '' ? null : {
+            text,
+            translation: line.translation ?? null,
+            romanization: line.romanization ?? null,
+        };
     };
+    // 1.7.8：滚动歌词要高窗口一屏放十几句，所以额外带一个以当前句为中心的窗口（±20 句）。
+    // index 用真实行号，页面靠它判断哪一行是「当前句」；插曲行与空行在这里就被滤掉。
+    const CONTEXT_RADIUS = 20;
+    const anchor = lineIndex >= 0 ? lineIndex : 0;
+    const windowFrom = Math.max(0, anchor - CONTEXT_RADIUS);
+    const windowTo = Math.min(safeLines.length - 1, anchor + CONTEXT_RADIUS);
+    const windowLines = [];
+    for (let i = windowFrom; i <= windowTo; i += 1) {
+        const entry = textOf(safeLines[i]);
+        if (entry) windowLines.push({ index: i, ...entry });
+    }
+    const withWindow = (value) => ({ ...value, lines: windowLines });
     const collect = (from, step, count) => {
         const out = [];
         let cursor = from;
@@ -367,7 +383,7 @@ const readContext = (lines, lineIndex) => {
         return out;
     };
     if (lineIndex < 0) {
-        return { before: [null, null], after: collect(0, 1, 2) };
+        return withWindow({ before: [null, null], after: collect(0, 1, 2) });
     }
     // before 需要「从近到远」倒着找：先 -1 再 -2，最终排成 [上上, 上]。
     const back = [];
@@ -378,10 +394,10 @@ const readContext = (lines, lineIndex) => {
         cursor -= 1;
     }
     while (back.length < 2) back.push(null);
-    return {
+    return withWindow({
         before: [back[1], back[0]],
         after: collect(lineIndex + 1, 1, 2),
-    };
+    });
 };
 
 /**
@@ -1040,8 +1056,8 @@ const buildSettingsSection = () => ({
             type: 'select',
             label: L('悬浮窗歌词字号', 'Popup lyric font size'),
             description: L(
-                '12–48 像素，只影响悬浮窗歌词的三行排版；窗口拉大时字号会跟着略有放大。',
-                '12-48 px; only affects the popup lyric layout and scales slightly with the window.',
+                '20–40 像素，只影响悬浮窗歌词；字号不随窗口大小变化，窗口拉宽只是每行能多放几个字。',
+                '20-40 px; only affects the popup lyric. The size never follows the window: widening shows more characters per line.',
             ),
             group: L('悬浮窗歌词', 'Popup lyric'),
             defaultValue: String(POPUP_FONT_SIZE_DEFAULT),
@@ -1056,7 +1072,7 @@ const buildSettingsSection = () => ({
                 'Colors the whole current line in the popup lyric window; no per-word coloring.',
             ),
             group: L('悬浮窗歌词', 'Popup lyric'),
-            defaultValue: '#f4fbff',
+            defaultValue: '#eaf6ff',
         },
         {
             key: 'fontMode',
@@ -1173,7 +1189,7 @@ const readConfigFromHandle = (handle) => {
             fontSize: toNumber(values.fontSize, FONT_SIZE_DEFAULT),
             popupFontSize: toNumber(values.popupFontSize, POPUP_FONT_SIZE_DEFAULT),
             // 颜色交给 main.cjs 的 normalizeConfig 校验（只认 #rrggbb），这里原样透传。
-            popupColor: typeof values.popupColor === 'string' ? values.popupColor : '#f4fbff',
+            popupColor: typeof values.popupColor === 'string' ? values.popupColor : '#eaf6ff',
             fontMode: values.fontMode,
             surface: values.surface,
             surfaceOpacity: toNumber(values.surfaceOpacity, 0.58),

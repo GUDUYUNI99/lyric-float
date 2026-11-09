@@ -99,16 +99,29 @@ const IPC_TOGGLE_SURFACE = 'my-lyric-widget:toggle-surface';
 // 主进程 → 悬浮窗歌词页面：固定状态、桌面（穿透）模式。
 const IPC_POPUP_PINNED = 'my-lyric-widget:popup-pinned';
 const IPC_POPUP_DESKTOP = 'my-lyric-widget:popup-desktop';
+// 1.7.1：穿透态的悬停取消。页面报「退出穿透」键的矩形（页面 → 主进程），
+// 主进程把光标是否落在该矩形里告诉页面（主进程 → 页面），穿透态下只有这块矩形放行点击。
+const IPC_POPUP_POINTER_RECT = 'my-lyric-widget:popup-pointer-rect';
+const IPC_POPUP_POINTER = 'my-lyric-widget:popup-pointer';
+const IPC_POPUP_HOVER = 'my-lyric-widget:popup-hover';
+// 1.7.6：悬浮窗歌词自己的排版三态（只显示原文 / 原文+译文 / 原文+罗马音）。
+const IPC_POPUP_LAYOUT = 'my-lyric-widget:popup-layout';
+// 穿透态下「退出穿透」键的命中外扩（和桌面歌词固定键同一口径）。
+const POPUP_POINTER_PADDING = 2;
 
 // 悬浮窗歌词的默认尺寸与缩放范围。
-// 1.7.0：最小尺寸按「三行歌词 + 顶部固定键 + 左侧音量 + 底部六个功能键都不挤」估出来的，
-// 正式发布前还会再细调，所以先给一个能用的值。
+// 1.7.8：窗口结构改成「左音量列 + 中歌词区 + 右按钮列」，宽度因此变宽：
+//   宽度 520（最小）～920（最大），默认 560；默认高度 220（最小也是 220）。
+//   高度上限在 createPopupWindow 里取显示器工作区高（用户要求），不吸附整行。
+//   字号只跟设置走，不随窗口缩放；窗口拉宽/拉高只是多显示几个字/几行。
 const POPUP_DEFAULT_WIDTH = 560;
-const POPUP_DEFAULT_HEIGHT = 300;
-const POPUP_MIN_WIDTH = 420;
-const POPUP_MIN_HEIGHT = 240;
-const POPUP_MAX_WIDTH = 1400;
-const POPUP_MAX_HEIGHT = 900;
+const POPUP_DEFAULT_HEIGHT = 220;
+const POPUP_MIN_WIDTH = 520;
+const POPUP_MIN_HEIGHT = 220;
+const POPUP_MAX_WIDTH = 920;
+const POPUP_MAX_HEIGHT = 2160;
+// 1.7.6：真正的硬上限由显示器工作区高决定（见 createPopupWindow），这里只做一个绝对上限。
+const POPUP_MAX_HEIGHT_CAP = 4000;
 
 // main → client：桌面（穿透）模式开关 + 首帧对齐用的查询。
 const RPC_DESKTOP_MODE = 'desktop-mode';
@@ -314,10 +327,11 @@ const FONT_MODES = ['system', 'theme'];
 const FONT_SIZE_MIN = 20;
 const FONT_SIZE_MAX = 50;
 const FONT_SIZE_DEFAULT = 38;
-// 1.7.0：悬浮窗歌词是独立功能，字号单独一套（12–48，默认 24）。
-const POPUP_FONT_SIZE_MIN = 12;
-const POPUP_FONT_SIZE_MAX = 48;
-const POPUP_FONT_SIZE_DEFAULT = 24;
+// 1.7.5：悬浮窗歌词的字号范围收紧到 20–40、默认 32 —— 窗口尺寸是固定的，
+// 字号再大就一定会滚动，不如把可用区间收窄到「都能看全」的范围内。
+const POPUP_FONT_SIZE_MIN = 20;
+const POPUP_FONT_SIZE_MAX = 40;
+const POPUP_FONT_SIZE_DEFAULT = 32;
 
 /**
  * 配置按「归属」分段，和设置面板的分组一一对应：
@@ -332,7 +346,7 @@ const DEFAULT_CONFIG = {
         // 1.7.0：悬浮窗歌词的字号（和桌面歌词分开，互不影响）。
         popupFontSize: POPUP_FONT_SIZE_DEFAULT,
         // 1.7.0：悬浮窗歌词「当前句」的自定义颜色（整句着色，不做逐字）。
-        popupColor: '#f4fbff',
+        popupColor: '#eaf6ff',
         fontMode: 'system',
         surface: 'auto',
         surfaceOpacity: 0.58,
@@ -788,12 +802,11 @@ const WIDGET_HTML = `<!DOCTYPE html>
            页面这层不再做第二道门：只要窗口放行，按钮就一定是可点的目标，避免「窗口可点但按钮不可点」。 */
         pointer-events: auto;
     }
-    /* 1.7.0：形态切换键不占布局流，绝对定位到正中固定键的左边 56px（32 宽 + 8 间距 + 16 半宽），
-       这样正中固定键仍然严格居中，切换键也不会把右侧音量区挤走。 */
+    /* 1.7.2：形态切换键和其它按钮一样，是左组里的一个普通 flex 子项，靠 margin-left: auto 贴到左组最右边；
+       垂直对齐、水平间距全部由 .controls-side 的 align-items / gap 决定，不再绝对定位。
+       左侧两组仍然是 flex: 1 等宽，所以正中的固定键依旧严格居中。 */
     #surface {
-        position: absolute;
-        top: 4px;
-        left: calc(50% - 56px);
+        margin-left: auto;
         visibility: hidden;
         pointer-events: none;
     }
@@ -801,15 +814,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
         visibility: visible;
         pointer-events: auto;
     }
-    body.pinned #surface {
-        visibility: visible;
-        pointer-events: auto;
-        opacity: 0;
-    }
-    body.pinned.hover #surface,
-    body.pinned #surface:focus-visible {
-        opacity: 1;
-    }
+    /* 固定态（按需求）切换键不出现：控制条整条都收起来了，这里也不给任何显示条件。 */
     body.pinned.hover #pin,
     /* 键盘用户靠 Tab 过来时窗口没有 hover，焦点必须能把胶囊露出来。 */
     body.pinned #pin:focus-visible {
@@ -1035,8 +1040,8 @@ const WIDGET_HTML = `<!DOCTYPE html>
             <button id="prev" type="button" data-tip="上一首" aria-label="上一首">${ICON_SVG.prev}</button>
             <button id="toggle" type="button" data-tip="播放" aria-label="播放">${ICON_SVG.play}</button>
             <button id="next" type="button" data-tip="下一首" aria-label="下一首">${ICON_SVG.next}</button>
+            <button id="surface" type="button" data-tip="切换到悬浮窗歌词" aria-label="切换到悬浮窗歌词">${ICON_SVG.popup}</button>
         </div>
-        <button id="surface" type="button" data-tip="切换到悬浮窗歌词" aria-label="切换到悬浮窗歌词">${ICON_SVG.popup}</button>
         <button id="pin" type="button" data-tip="固定位置" aria-label="固定位置" data-mode="floating">${ICON_SVG.pin}</button>
         <div class="controls-side right">
             <button id="loop" type="button" data-tip="循环模式：不循环" aria-label="循环模式：不循环" data-mode="off">${ICON_SVG['loop-off']}</button>
@@ -1075,6 +1080,7 @@ const els = {
     loop: document.getElementById('loop'),
     layout: document.getElementById('layout'),
     surface: document.getElementById('surface'),
+    layout: document.getElementById('layout'),
     pin: document.getElementById('pin'),
     volume: document.getElementById('volume'),
     volumeIcon: document.getElementById('volume-icon'),
@@ -1720,16 +1726,11 @@ const sendPinRect = (rect) => {
 };
 // 1.7.0：固定态下可点的是「形态切换键 + 固定键」两个按钮，命中区按两者的并集上报。
 const pinHitRect = () => {
-    const rects = [els.pin, els.surface]
-        .filter((node) => node && typeof node.getBoundingClientRect === 'function')
-        .map((node) => node.getBoundingClientRect())
-        .filter((rect) => rect.width > 0 && rect.height > 0);
-    if (rects.length === 0) return els.pin.getBoundingClientRect();
-    const left = Math.min(...rects.map((rect) => rect.left));
-    const top = Math.min(...rects.map((rect) => rect.top));
-    const right = Math.max(...rects.map((rect) => rect.right));
-    const bottom = Math.max(...rects.map((rect) => rect.bottom));
-    return { left, top, width: right - left, height: bottom - top };
+    // 固定态只有「取消锁定」这一颗按钮是活的（形态切换键按需求在固定态不显示），
+    // 所以命中区只报它自己的矩形，不再并上切换键。
+    if (!els.pin) return { left: 0, top: 0, width: 0, height: 0 };
+    const rect = els.pin.getBoundingClientRect();
+    return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
 };
 const reportPinRect = () => {
     if (!els.pin) return;
@@ -1902,127 +1903,27 @@ button { all: unset; }
     padding: 10px 14px 8px;
     gap: 8px;
     border-radius: 16px;
-    border: 1px solid rgba(125, 211, 252, 0.14);
-    background: rgba(8, 22, 36, 0.58);
+    border: 1px solid transparent;
+    background: transparent;
     transition: background 0.18s ease, border-color 0.18s ease;
     overflow: hidden;
 }
+/* 1.7.8：默认全透明；鼠标悬停（主进程轮询出来的 .hover）才铺底。桌面模式下永远透明。 */
+body.hover .shell {
+    background: rgba(8, 22, 36, 0.58);
+    border-color: rgba(125, 211, 252, 0.14);
+}
+body[data-desktop="true"] .shell { background: transparent; border-color: transparent; }
 
-/* 顶部：固定键居中、关闭键靠右 */
 .topbar {
     position: relative;
     flex: 0 0 auto;
     height: 26px;
     display: flex;
     align-items: center;
-    justify-content: center;
-    opacity: 0;
-    transition: opacity 0.18s ease;
+    justify-content: flex-end;
 }
-.topbar .icon-btn { opacity: 0.8; }
-#close { position: absolute; right: 0; top: 0; }
-/* 形态切换键：同样绝对定位到正中固定键左边，固定键保持严格居中。 */
-#surface { position: absolute; left: calc(50% - 47px); top: 0; }
-
-/* 主体：左侧音量 + 右侧五行歌词 */
-.stage {
-    flex: 1 1 auto;
-    min-height: 0;
-    display: flex;
-    align-items: stretch;
-    gap: 14px;
-}
-
-.rail {
-    flex: 0 0 auto;
-    width: 34px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    opacity: 0;
-    transition: opacity 0.18s ease;
-    -webkit-app-region: no-drag;
-}
-.rail .volume-icon { color: #eaf6ff; opacity: 0.8; display: block; }
-#volume {
-    flex: 1 1 auto;
-    width: 6px;
-    max-height: 120px;
-    /* 竖着放：range 旋转 90°，轨道长度就是高度。 */
-    writing-mode: vertical-lr;
-    direction: rtl;
-    accent-color: #7dd3fc;
-    background: transparent;
-    cursor: pointer;
-}
-#volume-value {
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
-    color: #cfe9ff;
-    min-width: 32px;
-    text-align: center;
-}
-
-.lyrics {
-    position: relative;
-    flex: 1 1 auto;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    overflow: hidden;
-}
-.rows {
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    width: 100%;
-    /* 1.7.0：只放「上一句 / 当前句 / 下一句」三行，间距放大，避免挤成一坨。 */
-    gap: calc(var(--popup-size, 24px) * 0.5);
-    padding: 4px 0;
-    will-change: transform, opacity;
-}
-.row {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    text-align: center;
-    line-height: 1.4;
-    transition: opacity 0.2s ease, color 0.2s ease;
-}
-.row.far { font-size: calc(var(--popup-size, 24px) * 0.6); opacity: 0.38; }
-.row.near { font-size: calc(var(--popup-size, 24px) * 0.76); opacity: 0.55; }
-/* 1.7.0：当前句颜色可由设置（悬浮窗歌词 → 当前句颜色）改写，只整句着色，不做逐字。 */
-.row.current {
-    font-size: var(--popup-size, 24px);
-    font-weight: 600;
-    opacity: 1;
-    color: var(--popup-color, #f4fbff);
-}
-.row.current .current-track { display: block; }
-.row.current .current-sub {
-    display: block;
-    margin-top: 2px;
-    font-size: calc(var(--popup-size, 24px) * 0.62);
-    font-weight: 400;
-    color: #a9d8f5;
-    opacity: 0.9;
-}
-.row.current .current-sub[hidden] { display: none; }
-.row .row-text { display: block; }
-
-/* 底部控制栏 */
-.bottombar {
-    flex: 0 0 auto;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 14px;
-    padding: 6px 0 0;
-    opacity: 0;
-    transition: opacity 0.18s ease;
-}
+#close { -webkit-app-region: no-drag; }
 
 .icon-btn {
     -webkit-app-region: no-drag;
@@ -2036,65 +1937,154 @@ button { all: unset; }
     cursor: pointer;
     transition: background 0.16s ease, opacity 0.16s ease, color 0.16s ease;
 }
-.icon-btn:hover { background: rgba(125, 211, 252, 0.16); opacity: 1; }
-.icon-btn:focus-visible { outline: 1px solid #7dd3fc; }
+.icon-btn:hover { background: rgba(125, 211, 252, 0.14); opacity: 1; }
 .icon-btn[data-on="true"] { color: #7dd3fc; opacity: 1; }
-.icon-btn svg { pointer-events: none; }
+#layout .icon-zh, #layout .icon-a { transition: color 0.18s ease; }
+#layout[data-mode="text-trans"] .icon-zh { color: #7dd3fc; }
+#layout[data-mode="roman"] .icon-a { color: #7dd3fc; }
 
-/* 悬停 / 固定时才露控件；固定后常驻 */
-body:hover .topbar, body.pinned .topbar,
-body:hover .rail, body.pinned .rail,
-body:hover .bottombar, body.pinned .bottombar { opacity: 1; }
-
-/* 固定：取消拖拽，避免手一滑把窗口带跑 */
-body.pinned { -webkit-app-region: no-drag; }
-
-/* 桌面（穿透）模式：控件全隐藏、底子全透明（此时整窗 ignore mouse，悬停也不会触发） */
-body[data-desktop="true"] .topbar,
-body[data-desktop="true"] .rail,
-body[data-desktop="true"] .bottombar { display: none; }
-body[data-desktop="true"] .shell {
-    background: transparent;
-    border-color: transparent;
-    padding: 4px 10px;
+/* 1.7.8：左列（音量 + 溢出的按钮）/ 中列（歌词）/ 右列（按钮）。 */
+.stage {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    align-items: stretch;
+    gap: 10px;
 }
+
+.rail {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    overflow: hidden;
+    opacity: 0;
+    transition: opacity 0.18s ease;
+    -webkit-app-region: no-drag;
+}
+body.hover .rail { opacity: 1; }
+body[data-desktop="true"] .rail { opacity: 0; }
+
+.rail.left { width: 34px; justify-content: center; }
+.rail.right { width: 44px; justify-content: flex-start; padding-top: 2px; gap: 8px; }
+
+.rail .volume-icon { color: #eaf6ff; opacity: 0.8; flex: 0 0 auto; }
+#volume {
+    flex: 1 1 auto;
+    width: 6px;
+    min-height: 32px;
+    max-height: 150px;
+    /* 竖着放：range 旋转 90°，轨道长度就是高度。 */
+    writing-mode: vertical-lr;
+    direction: rtl;
+    accent-color: #7dd3fc;
+    cursor: pointer;
+}
+#volume-value {
+    flex: 0 0 auto;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    color: #eaf6ff;
+    opacity: 0.85;
+}
+/* 右列放不下的按钮挪到左列音量条下方（用户要求：先缩音量条的空间）。 */
+.rail-extra {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+}
+.rail-extra:empty { display: none; }
+.rail-extra .icon-btn { width: 24px; height: 24px; }
+
+.lyrics {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    overflow: hidden;
+}
+
+/* 五行以上的滚动歌词：容器高度固定，行数由 JS 按可用高度算，换行整体上/下平移。 */
+.rows {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: calc(var(--popup-size, 24px) * 0.95);
+    padding: 2px 0;
+    will-change: transform;
+}
+.rows.anim { transition: transform 0.24s cubic-bezier(0.25, 0.8, 0.35, 1); }
+
+.row {
+    text-align: center;
+    font-size: var(--popup-size, 24px);
+    line-height: 1.5;
+    color: var(--popup-color, #eaf6ff);
+    opacity: 0.5;
+    transition: opacity 0.18s ease;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.72);
+    overflow: hidden;
+}
+.row .row-text { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .row-sub {
+    display: block;
+    font-size: 0.55em;
+    font-weight: 400;
+    opacity: 0.85;
+    margin-top: 0.1em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.row .row-sub[hidden] { display: none; }
+.row.current { opacity: 1; font-weight: 600; }
+.row.current .row-text { display: inline-block; text-overflow: clip; will-change: transform; }
+.row.current .row-sub { text-overflow: clip; }
+
+/* 桌面模式（点击穿透）下唯一可点的「退出」键：默认隐藏，光标压上来才亮。 */
+#desktop-exit {
+    -webkit-app-region: no-drag;
+    position: absolute;
+    left: 50%;
+    top: 10px;
+    transform: translateX(-50%);
+    display: none;
+    opacity: 0;
+    z-index: 5;
+    transition: opacity 0.18s ease;
+}
+body[data-desktop="true"] #desktop-exit { display: grid; }
+body[data-desktop="true"][data-pointer="true"] #desktop-exit { opacity: 1; }
 </style>
 </head>
 <body>
-<div class="shell">
+<div class="shell" id="shell">
     <div class="topbar">
-        <button id="surface" class="icon-btn" type="button" title="切回桌面歌词" aria-label="切回桌面歌词">${ICON_SVG.popup}</button>
-        <button id="pin" class="icon-btn" type="button" title="固定位置" aria-label="固定位置">${ICON_SVG.pin}</button>
         <button id="close" class="icon-btn" type="button" title="关闭悬浮窗歌词（模组仍启用）" aria-label="关闭悬浮窗歌词">${ICON_SVG.close}</button>
     </div>
 
-    <div class="stage">
-        <div class="rail">
+    <div class="stage" id="stage">
+        <div class="rail left" id="rail-left">
             <span class="volume-icon" id="volume-icon">${ICON_SVG['volume-2']}</span>
             <input id="volume" type="range" min="0" max="100" step="1" value="100" aria-label="音量" />
             <span id="volume-value">100%</span>
+            <div class="rail-extra" id="rail-extra"></div>
         </div>
 
         <div class="lyrics" id="lyrics">
-            <div class="rows" id="rows">
-                <div class="row near"><span class="row-text" data-slot="-1"></span></div>
-                <div class="row current">
-                    <span class="current-track" id="current-track">等待播放...</span>
-                    <span class="current-sub" id="current-sub" hidden></span>
-                </div>
-                <div class="row near"><span class="row-text" data-slot="1"></span></div>
-            </div>
+            <div class="rows" id="rows"></div>
         </div>
+
+        <div class="rail right" id="rail-right"></div>
     </div>
 
-    <div class="bottombar">
-        <button id="prev" class="icon-btn" type="button" title="上一曲" aria-label="上一曲">${ICON_SVG.prev}</button>
-        <button id="toggle" class="icon-btn" type="button" title="播放 / 暂停" aria-label="播放 / 暂停">${ICON_SVG.play}</button>
-        <button id="next" class="icon-btn" type="button" title="下一曲" aria-label="下一曲">${ICON_SVG.next}</button>
-        <button id="loop" class="icon-btn" type="button" title="循环模式：不循环" aria-label="循环模式" data-mode="off">${ICON_SVG['loop-off']}</button>
-        <button id="desktop" class="icon-btn" type="button" title="桌面模式（点击穿透）" aria-label="桌面模式">${ICON_SVG.monitor}</button>
-        <button id="playlist" class="icon-btn" type="button" title="播放列表" aria-label="播放列表">${ICON_SVG['list-music']}</button>
-    </div>
+    <button id="desktop-exit" class="icon-btn" type="button" title="退出桌面模式" aria-label="退出桌面模式">${ICON_SVG.monitor}</button>
 </div>
 
 <script>
@@ -2106,151 +2096,250 @@ const IPC_CONFIG = '${IPC_CONFIG}';
 const IPC_POPUP_COMMAND = '${IPC_POPUP_COMMAND}';
 const IPC_POPUP_PINNED = '${IPC_POPUP_PINNED}';
 const IPC_POPUP_DESKTOP = '${IPC_POPUP_DESKTOP}';
+const IPC_POPUP_POINTER = '${IPC_POPUP_POINTER}';
+const IPC_POPUP_HOVER = '${IPC_POPUP_HOVER}';
+const IPC_POPUP_LAYOUT = '${IPC_POPUP_LAYOUT}';
+const IPC_POPUP_POINTER_RECT = '${IPC_POPUP_POINTER_RECT}';
 
 const ICONS = ${JSON.stringify(ICON_SVG)};
+const debugToMain = (message) => { try { ipcRenderer.send('${IPC_DEBUG}', '[popup] ' + String(message)); } catch (error) {} };
 
 const WAITING_TEXT = '等待播放...';
 const NO_LYRIC_TEXT = '此歌曲暂无歌词';
 const UPCOMING_TEXT = '……';
+const LOOP_TITLES = { off: '不循环', all: '列表循环', one: '单曲循环' };
 
 const els = {
+    shell: document.getElementById('shell'),
+    stage: document.getElementById('stage'),
     rows: document.getElementById('rows'),
     lyrics: document.getElementById('lyrics'),
-    track: document.getElementById('current-track'),
-    sub: document.getElementById('current-sub'),
-    slots: {},
+    railRight: document.getElementById('rail-right'),
+    railExtra: document.getElementById('rail-extra'),
     prev: document.getElementById('prev'),
     toggle: document.getElementById('toggle'),
     next: document.getElementById('next'),
     loop: document.getElementById('loop'),
     desktop: document.getElementById('desktop'),
+    desktopExit: document.getElementById('desktop-exit'),
     playlist: document.getElementById('playlist'),
     surface: document.getElementById('surface'),
-    pin: document.getElementById('pin'),
+    layout: document.getElementById('layout'),
     close: document.getElementById('close'),
     volume: document.getElementById('volume'),
     volumeIcon: document.getElementById('volume-icon'),
     volumeValue: document.getElementById('volume-value'),
 };
-for (const node of document.querySelectorAll('.row-text[data-slot]')) {
-    els.slots[node.dataset.slot] = node;
-}
 
-// 悬浮窗歌词字号：与主进程的 POPUP_FONT_SIZE_* 保持一致（页面里写成字面量，
-// 避免模板插值把常量名漏进脚本；真正的夹取在 normalizeConfig 里）。
-let config = { shared: { popupFontSize: 24 } };
+const setIcon = (element, name) => {
+    if (!element) return;
+    const path = ICONS[name];
+    if (typeof path !== 'string') return;
+    element.innerHTML = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + path + '</svg>';
+};
+
+const loopIconOf = (mode) => (mode === 'one' ? 'loop-one' : (mode === 'all' ? 'loop-all' : 'loop-off'));
+
+// 1.7.6：排版三态（和桌面歌词同一套规则）：只显示原文 / 原文+译文 / 原文+罗马音。
+const LAYOUT_MODES = ['text', 'text-trans', 'roman'];
+const LAYOUT_TIPS = {
+    text: '排版：只显示原文',
+    'text-trans': '排版：原文 + 译文',
+    roman: '排版：原文 + 罗马音',
+};
+
 let lastPayload = null;
 let lastLineIndex = null;
 let volumeDragging = false;
 let volumeTimer = null;
-let lastVolumeSent = 100;
+let lastVolumeSent = null;
+let popupLayout = 'text';
+let config = { shared: { popupFontSize: ${POPUP_FONT_SIZE_DEFAULT}, popupColor: '#eaf6ff' } };
+// 滚动歌词的几何量：每次 fitLayout 重算。
+let geometry = { size: 24, lineHeight: 36, gap: 23, lineUnit: 36, rows: 1 };
+// 上一次渲染窗口的起点与行数，用来算「这次该往哪边滑」。
+let lastWindow = { offset: 0, count: 0, step: 0 };
+// 当前句横向走马灯。
+let marqueeState = null;
 
-const iconOf = (name) => '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"'
-    + ' fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
-    + (ICONS[name] || '') + '</svg>';
-
-const setIcon = (element, name) => {
-    if (!element) return;
-    element.innerHTML = iconOf(name);
+const applyLayoutButton = () => {
+    if (!els.layout) return;
+    els.layout.dataset.mode = popupLayout;
+    els.layout.title = LAYOUT_TIPS[popupLayout] || LAYOUT_TIPS.text;
+    els.layout.setAttribute('aria-label', LAYOUT_TIPS[popupLayout] || LAYOUT_TIPS.text);
 };
 
-const LOOP_TITLES = { off: '不循环', all: '列表循环', one: '单曲循环' };
-const LOOP_ICONS = { off: 'loop-off', all: 'loop-all', one: 'loop-one' };
-
-/** 图标名映射：ICON_SVG 里循环图标叫 loop-off / loop-all / loop-one，这里直接对齐。 */
-const loopIconOf = (mode) => {
-    if (mode === 'one') return 'loop-one';
-    if (mode === 'all') return 'loop-all';
-    return 'loop-off';
+/** 第二行内容按排版取值：译文 / 罗马音（罗马音缺失时回退译文）。 */
+const secondLineOf = (line, mode) => {
+    if (!line || mode === 'text') return '';
+    const translation = typeof line.translation === 'string' ? line.translation : '';
+    if (mode === 'text-trans') return translation;
+    const romanization = typeof line.romanization === 'string' ? line.romanization : '';
+    return romanization || translation;
 };
 
-/** 五行歌词：中间是当前句，-1/-2 是上面两句，1/2 是下面两句。 */
-const fillRows = (payload) => {
-    const context = payload && payload.context && typeof payload.context === 'object' ? payload.context : null;
-    const before = context && Array.isArray(context.before) ? context.before : [];
-    const after = context && Array.isArray(context.after) ? context.after : [];
-    const textOf = (item) => (item && typeof item.text === 'string' ? item.text : '');
-    const put = (slot, text) => {
-        const node = els.slots[String(slot)];
-        if (!node) return;
-        node.textContent = text || '';
-        node.parentElement.style.visibility = text ? 'visible' : 'hidden';
-    };
-    put(-2, textOf(before[0]));
-    put(-1, textOf(before[1]));
-    put(1, textOf(after[0]));
-    put(2, textOf(after[1]));
-};
-
-/** 换句时整体上滑 / 下滑一小段，模拟滚动；只动 .rows 的 transform，不重排 DOM。 */
-const rollRows = (direction) => {
-    if (!els.rows) return;
-    const step = direction >= 0 ? 16 : -16;
-    els.rows.style.transition = 'none';
-    els.rows.style.transform = 'translateY(' + step + 'px)';
-    els.rows.style.opacity = '0.35';
-    void els.rows.offsetHeight;
-    els.rows.style.transition = 'transform 240ms ease, opacity 240ms ease';
-    els.rows.style.transform = 'translateY(0)';
-    els.rows.style.opacity = '1';
-};
-
-const lyricTextOf = (payload) => {
-    const line = payload && payload.line ? payload.line : null;
-    const status = payload && typeof payload.lineStatus === 'string' ? payload.lineStatus : 'ready';
-    const hasSong = Boolean(payload && payload.song);
-    const stopped = payload && payload.state === 'stopped';
-    if (hasSong && !stopped && status === 'none') return NO_LYRIC_TEXT;
-    if (hasSong && status === 'upcoming') return UPCOMING_TEXT;
-    return line && typeof line.text === 'string' ? line.text : WAITING_TEXT;
+const applyPopupColor = (color) => {
+    document.documentElement.style.setProperty('--popup-color', color);
+    if (els.rows) els.rows.style.color = color;
 };
 
 const applyConfig = (next) => {
     if (!next || typeof next !== 'object') return;
     const shared = next.shared && typeof next.shared === 'object' ? next.shared : {};
     const size = Number(shared.popupFontSize) || config.shared.popupFontSize;
-    // 1.7.0：悬浮窗歌词的字号单独一套（12–48），越界一律夹回，坏值回落默认。
-    const clamped = Math.min(48, Math.max(12, Math.round(size)));
+    const clamped = Math.min(${POPUP_FONT_SIZE_MAX}, Math.max(${POPUP_FONT_SIZE_MIN}, Math.round(size)));
     const color = typeof shared.popupColor === 'string' && /^#[0-9a-f]{6}$/i.test(shared.popupColor.trim())
         ? shared.popupColor.trim().toLowerCase()
-        : '#f4fbff';
+        : '#eaf6ff';
     config = { shared: { popupFontSize: clamped, popupColor: color } };
-    document.documentElement.style.setProperty('--popup-color', color);
+    applyPopupColor(color);
     fitLayout();
 };
 
-/**
- * 窗口可自由缩放：字号以用户设置为基准，随窗口宽度最多放大到 1.8 倍，
- * 同时保证三行歌词 + 两段间距永远装得下（横向也不会长得离谱）。
- * CSS 用 vw/vh 只解决盒模型，字号必须在这里算，否则拉大窗口后文字比例不变。
- */
-const fitLayout = () => {
-    if (!els.rows) return;
-    const width = els.rows.clientWidth || 0;
-    const height = els.rows.clientHeight || 0;
-    if (!width || !height) return;
-    const base = config.shared.popupFontSize || 24;
-    const grow = Math.min(1.8, Math.max(1, width / 560));
-    const byHeight = Math.floor((height - 6) / (1.4 * 3 * 1.0));
-    const byWidth = Math.floor(width / 9);
-    const size = Math.max(12, Math.min(48, Math.floor(base * grow), Math.max(12, byHeight), Math.max(12, byWidth)));
-    document.documentElement.style.setProperty('--popup-size', size + 'px');
+const lyricTextOf = (payload) => {
+    const line = payload.line;
+    const text = line && typeof line.text === 'string' ? line.text : '';
+    const status = typeof payload.lineStatus === 'string' ? payload.lineStatus : '';
+    const hasSong = Boolean(payload.song);
+    const stopped = payload.state === 'stopped';
+    if (hasSong && !stopped && status === 'none') return NO_LYRIC_TEXT;
+    if (hasSong && !stopped && status === 'upcoming' && text === '') return UPCOMING_TEXT;
+    if (hasSong && !stopped && status === 'upcoming' && text === WAITING_TEXT) return UPCOMING_TEXT;
+    return text || WAITING_TEXT;
 };
-window.addEventListener('resize', () => requestAnimationFrame(fitLayout));
+
+/** 把「上一句 / 当前句 / 下一句 …」整体上滑或下滑一段，模拟跟唱滚动。 */
+const scrollRows = (deltaLines) => {
+    if (!els.rows || !deltaLines) return;
+    const step = geometry.lineUnit + geometry.gap;
+    els.rows.classList.remove('anim');
+    els.rows.style.transform = 'translateY(' + (deltaLines * step) + 'px)';
+    void els.rows.offsetHeight;
+    els.rows.classList.add('anim');
+    requestAnimationFrame(() => {
+        if (!els.rows) return;
+        els.rows.style.transform = 'translateY(0)';
+    });
+};
+
+/** 当前句太长时横向缓慢滚动（速度保守，46px/s）。 */
+const stopMarquee = () => {
+    if (marqueeState) {
+        if (marqueeState.raf) cancelAnimationFrame(marqueeState.raf);
+        marqueeState = null;
+    }
+};
+
+const measureMarquee = () => {
+    stopMarquee();
+    const current = els.rows && els.rows.querySelector('.row.current .row-text');
+    if (!current) return;
+    current.style.transform = 'translateX(0)';
+    const overflow = current.scrollWidth - current.parentElement.clientWidth;
+    if (!Number.isFinite(overflow) || overflow < 8) return;
+    marqueeState = { overflow, offset: 0, raf: 0, lastAt: 0, holdUntil: performance.now() + 1400 };
+    const step = (now) => {
+        if (!marqueeState) return;
+        const state = marqueeState;
+        if (!state.lastAt) state.lastAt = now;
+        const dt = Math.min(0.1, (now - state.lastAt) / 1000);
+        state.lastAt = now;
+        if (lastPayload && lastPayload.state !== 'playing') {
+            state.raf = requestAnimationFrame(step);
+            return;
+        }
+        if (now < state.holdUntil) {
+            state.raf = requestAnimationFrame(step);
+            return;
+        }
+        state.offset += 46 * dt;
+        if (state.offset >= state.overflow) {
+            state.offset = 0;
+            state.holdUntil = now + 1200;
+        }
+        current.style.transform = 'translateX(' + (-state.offset).toFixed(2) + 'px)';
+        state.raf = requestAnimationFrame(step);
+    };
+    marqueeState.raf = requestAnimationFrame(step);
+};
+
+/**
+ * 1.7.8：滚动歌词窗口。
+ *  - 先按可用高度算出能完整放下几行 k；
+ *  - 所有行都放得下 → 全显示（当前句只是高亮），offset 恒 0；
+ *  - 放不下 → 让当前句停在「中位」：k=2n 时停在第 n+1 行、k=2n+1 时也停在第 n+1 行 = floor(k/2)；
+ *  - 每次只按整行平移，永远不会出现半截行，所以不会在 n/n+1 之间来回跳。
+ */
+const computeWindow = (total, currentPos, available, count) => {
+    const step = geometry.lineUnit + geometry.gap;
+    const fit = Math.max(1, Math.floor((available + geometry.gap) / (step || 1)));
+    const k = Math.min(count || total, fit);
+    if (k >= total) return { offset: 0, count: total };
+    const centerSlot = Math.floor(k / 2);
+    const offset = Math.max(0, Math.min(total - k, currentPos - centerSlot));
+    return { offset, count: k };
+};
+
+const paintRows = (payload) => {
+    const context = payload && payload.context && typeof payload.context === 'object' ? payload.context : null;
+    const lines = context && Array.isArray(context.lines) ? context.lines : [];
+    if (!els.rows) return;
+    stopMarquee();
+    if (lines.length === 0) {
+        els.rows.innerHTML = '<div class="row current"><span class="row-text"></span></div>';
+        const textNode = els.rows.querySelector('.row-text');
+        if (textNode) textNode.textContent = lyricTextOf(payload);
+        lastWindow = { offset: 0, count: 1, step: 0 };
+        return;
+    }
+    const currentIndex = payload.line && Number.isFinite(payload.line.index) ? payload.line.index : -1;
+    let currentPos = -1;
+    for (let i = 0; i < lines.length; i += 1) {
+        if (lines[i] && lines[i].index === currentIndex) currentPos = i;
+    }
+    if (currentPos < 0) currentPos = Math.min(lines.length - 1, Math.max(0, 0));
+    const available = els.lyrics ? els.lyrics.clientHeight : 0;
+    // 行数算出来后再兜一次底：真实渲染高度可能略有出入，用 scrollHeight 回退一行。
+    let win = computeWindow(lines.length, currentPos, available, 0);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        els.rows.innerHTML = '';
+        for (let i = win.offset; i < win.offset + win.count && i < lines.length; i += 1) {
+            const item = lines[i] || {};
+            const row = document.createElement('div');
+            row.className = 'row' + (i === currentPos ? ' current' : '');
+            const text = document.createElement('span');
+            text.className = 'row-text';
+            text.textContent = typeof item.text === 'string' ? item.text : '';
+            row.appendChild(text);
+            const second = secondLineOf(item, popupLayout);
+            const sub = document.createElement('span');
+            sub.className = 'row-sub';
+            sub.textContent = second;
+            if (second === '') sub.hidden = true;
+            row.appendChild(sub);
+            els.rows.appendChild(row);
+        }
+        const overflow = els.rows.scrollHeight - available;
+        if (overflow > 1 && win.count > 1) {
+            win = { offset: Math.max(0, Math.min(lines.length - win.count + 1, win.offset)), count: win.count - 1 };
+            continue;
+        }
+        break;
+    }
+    geoUpdate: {
+        // 只有「起点变了」才做滑动；换句但起点没变说明是在同一屏里换高亮，不需要动。
+        const delta = lastWindow.count > 0 ? win.offset - lastWindow.offset : 0;
+        if (delta !== 0) scrollRows(delta);
+        break geoUpdate;
+    }
+    lastWindow = { offset: win.offset, count: win.count, step: geometry.lineUnit + geometry.gap };
+    requestAnimationFrame(measureMarquee);
+};
 
 const render = (payload) => {
     if (!payload || typeof payload !== 'object') return;
     lastPayload = payload;
-    els.track.textContent = lyricTextOf(payload);
-    const translation = payload.line && typeof payload.line.translation === 'string' ? payload.line.translation : '';
-    els.sub.textContent = translation;
-    els.sub.hidden = translation === '';
-    fillRows(payload);
-
-    const index = payload.line && Number.isFinite(payload.line.index) ? payload.line.index : -1;
-    if (lastLineIndex !== null && index !== lastLineIndex) rollRows(index > lastLineIndex ? 1 : -1);
-    lastLineIndex = index;
-
+    paintRows(payload);
     const playing = payload.state === 'playing';
     setIcon(els.toggle, playing ? 'pause' : 'play');
     els.toggle.title = playing ? '暂停' : '播放';
@@ -2268,6 +2357,45 @@ const render = (payload) => {
         lastVolumeSent = percent;
     }
     setIcon(els.volumeIcon, payload.muted === true ? 'volume-x' : (Number(els.volume.value) > 50 ? 'volume-2' : 'volume-1'));
+
+    lastLineIndex = payload.line && Number.isFinite(payload.line.index) ? payload.line.index : -1;
+};
+
+/** 按可用高度把 8 颗按钮分配到右列 / 左列（放不下先缩音量条的空间）。 */
+const BUTTON_ORDER = ['desktop', 'surface', 'layout', 'playlist', 'loop', 'prev', 'toggle', 'next'];
+const packRails = () => {
+    if (!els.railRight || !els.railExtra) return;
+    const stageHeight = els.stage ? els.stage.clientHeight : 0;
+    const buttonSize = 26;
+    const gap = 8;
+    const rightCapacity = Math.max(0, Math.floor((stageHeight + gap) / (buttonSize + gap)));
+    const rightKeys = BUTTON_ORDER.slice(0, rightCapacity);
+    const leftKeys = BUTTON_ORDER.slice(rightCapacity);
+    for (const key of BUTTON_ORDER) {
+        const button = els[key];
+        if (!button) continue;
+        if (rightKeys.includes(key)) {
+            if (button.parentElement !== els.railRight) els.railRight.appendChild(button);
+        } else if (leftKeys.includes(key)) {
+            if (button.parentElement !== els.railExtra) els.railExtra.appendChild(button);
+        }
+    }
+};
+
+const fitLayout = () => {
+    const size = Math.max(${POPUP_FONT_SIZE_MIN}, Math.min(${POPUP_FONT_SIZE_MAX}, config.shared.popupFontSize || ${POPUP_FONT_SIZE_DEFAULT}));
+    document.documentElement.style.setProperty('--popup-size', size + 'px');
+    const lineHeight = size * 1.5;
+    const subHeight = popupLayout === 'text' ? 0 : size * 0.55 * 1.5 + size * 0.1;
+    geometry = { size, lineHeight, gap: size * 0.95, lineUnit: lineHeight + subHeight, rows: 1 };
+    packRails();
+    if (lastPayload) {
+        paintRows(lastPayload);
+    } else if (els.rows) {
+        els.rows.innerHTML = '<div class=\"row current\"><span class=\"row-text\"></span></div>';
+        const node = els.rows.querySelector('.row-text');
+        if (node) node.textContent = WAITING_TEXT;
+    }
 };
 
 const sendCommand = (message) => {
@@ -2275,17 +2403,24 @@ const sendCommand = (message) => {
 };
 
 /* ---- 控件 ---- */
-els.prev.addEventListener('click', () => sendCommand({ type: 'prev' }));
-els.next.addEventListener('click', () => sendCommand({ type: 'next' }));
-els.toggle.addEventListener('click', () => sendCommand({ type: 'toggle' }));
-els.loop.addEventListener('click', () => sendCommand({ type: 'cycle-loop' }));
-els.playlist.addEventListener('click', () => sendCommand({ type: 'open-playlist' }));
-els.desktop.addEventListener('click', () => sendCommand({ type: 'toggle-desktop' }));
-els.pin.addEventListener('click', () => sendCommand({ type: 'toggle-pin' }));
-els.surface.addEventListener('click', () => sendCommand({ type: 'toggle-surface' }));
-els.close.addEventListener('click', () => sendCommand({ type: 'hide' }));
 
-/* 拖动音量：只走 0–100 的整数，节流 150ms，松手补最终值（宿主每次 setVolume 都会存设置）。 */
+if (els.close) els.close.addEventListener('click', () => sendCommand({ type: 'hide' }));
+if (els.desktop) els.desktop.addEventListener('click', () => sendCommand({ type: 'toggle-desktop' }));
+if (els.desktopExit) els.desktopExit.addEventListener('click', () => sendCommand({ type: 'toggle-desktop' }));
+if (els.surface) els.surface.addEventListener('click', () => sendCommand({ type: 'toggle-surface' }));
+if (els.playlist) els.playlist.addEventListener('click', () => sendCommand({ type: 'open-playlist' }));
+if (els.prev) els.prev.addEventListener('click', () => sendCommand({ type: 'prev' }));
+if (els.toggle) els.toggle.addEventListener('click', () => sendCommand({ type: 'toggle' }));
+if (els.next) els.next.addEventListener('click', () => sendCommand({ type: 'next' }));
+if (els.loop) els.loop.addEventListener('click', () => sendCommand({ type: 'cycle-loop' }));
+// 1.7.6：排版切换是纯显示逻辑，切完就地重渲染并记到主进程（重启恢复）。
+if (els.layout) els.layout.addEventListener('click', () => {
+    popupLayout = LAYOUT_MODES[(LAYOUT_MODES.indexOf(popupLayout) + 1) % LAYOUT_MODES.length];
+    applyLayoutButton();
+    fitLayout();
+    ipcRenderer.send(IPC_POPUP_LAYOUT, popupLayout);
+});
+
 const flushVolume = () => {
     if (volumeTimer) { clearTimeout(volumeTimer); volumeTimer = null; }
     const percent = Number(els.volume.value);
@@ -2301,54 +2436,94 @@ const scheduleVolume = () => {
         flushVolume();
     }, 150);
 };
+if (els.volume) {
+    const startDrag = () => { volumeDragging = true; };
+    const stopDrag = () => {
+        if (!volumeDragging) return;
+        volumeDragging = false;
+        els.volumeValue.textContent = Math.round(Number(els.volume.value)) + '%';
+        flushVolume();
+    };
+    els.volume.addEventListener('pointerdown', startDrag);
+    els.volume.addEventListener('input', scheduleVolume);
+    els.volume.addEventListener('change', stopDrag);
+    els.volume.addEventListener('pointerup', stopDrag);
+    window.addEventListener('pointerup', stopDrag);
+}
 
-els.volume.addEventListener('pointerdown', () => { volumeDragging = true; });
-els.volume.addEventListener('input', () => {
-    els.volumeValue.textContent = Math.round(Number(els.volume.value)) + '%';
-    scheduleVolume();
-});
-els.volume.addEventListener('change', () => {
-    volumeDragging = false;
-    flushVolume();
-});
+/* ---- 主进程 → 页面 ---- */
 
-/* ---- 主进程下发 ---- */
 ipcRenderer.on(IPC_DATA, (event, payload) => render(payload));
 ipcRenderer.on(IPC_CONFIG, (event, payload) => applyConfig(payload));
-ipcRenderer.on(IPC_POPUP_PINNED, (event, pinned) => {
-    document.body.classList.toggle('pinned', pinned === true);
-    els.pin.dataset.on = pinned === true ? 'true' : 'false';
-    setIcon(els.pin, pinned === true ? 'pin-off' : 'pin');
-    els.pin.title = pinned === true ? '解锁位置' : '固定位置';
+ipcRenderer.on(IPC_POPUP_LAYOUT, (event, value) => {
+    if (!LAYOUT_MODES.includes(value)) return;
+    popupLayout = value;
+    applyLayoutButton();
+    if (lastPayload) fitLayout();
 });
 ipcRenderer.on(IPC_POPUP_DESKTOP, (event, on) => {
     document.body.dataset.desktop = on === true ? 'true' : 'false';
     els.desktop.dataset.on = on === true ? 'true' : 'false';
+    if (els.desktopExit) els.desktopExit.dataset.on = on === true ? 'true' : 'false';
+    requestAnimationFrame(reportPointerRect);
+});
+ipcRenderer.on(IPC_POPUP_POINTER, (event, on) => {
+    document.body.dataset.pointer = on === true ? 'true' : 'false';
+});
+ipcRenderer.on(IPC_POPUP_HOVER, (event, on) => {
+    document.body.classList.toggle('hover', on === true);
 });
 
-/* 图标在启动时统一注入一次：不依赖模板字符串里的 ${ICON_SVG.x}，
-   也避免某个名字在 ICON_SVG 里缺项时整颗按钮变成一句 "undefined"。 */
-setIcon(els.surface, 'popup');
-setIcon(els.pin, 'pin');
+/**
+ * 把「退出穿透」键的矩形报给主进程：穿透态下整窗 ignore 鼠标，只有这块矩形放行，
+ * 所以主进程必须知道它在哪（和桌面歌词的 pin-rect 同一套思路）。
+ */
+function reportPointerRect() {
+    const button = els.desktopExit;
+    if (!button) return;
+    const rect = button.getBoundingClientRect();
+    ipcRenderer.send(IPC_POPUP_POINTER_RECT, {
+        x: Math.round(rect.left),
+        y: Math.round(rect.top),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+    });
+}
+
+/* 图标在启动时统一注入一次：不依赖模板字符串里直接插 ICON_SVG 的键。 */
 setIcon(els.close, 'close');
 setIcon(els.prev, 'prev');
 setIcon(els.toggle, 'play');
 setIcon(els.next, 'next');
 setIcon(els.loop, 'loop-off');
 setIcon(els.desktop, 'monitor');
+setIcon(els.desktopExit, 'monitor');
+setIcon(els.surface, 'popup');
 setIcon(els.playlist, 'list-music');
+setIcon(els.layout, 'layout');
 setIcon(els.volumeIcon, 'volume-2');
-requestAnimationFrame(fitLayout);
+applyLayoutButton();
+requestAnimationFrame(() => { fitLayout(); reportPointerRect(); });
+
+window.addEventListener('resize', () => {
+    requestAnimationFrame(() => {
+        lastWindow = { offset: 0, count: 0, step: 0 };
+        fitLayout();
+        if (els.rows) els.rows.style.transform = 'translateY(0)';
+        reportPointerRect();
+    });
+});
 
 /* 页面整体作为拖拽区时双击会最大化窗口（Windows 的 Aero Snap），这里直接拦掉。 */
 document.addEventListener('dblclick', (event) => {
     const target = event.target;
-    if (target && target.closest && target.closest('button, input, .rail, .bottombar')) return;
+    if (target && target.closest && target.closest('button, input, .rail, .lyrics')) return;
     event.preventDefault();
 });
 </script>
 </body>
 </html>`;
+
 
 module.exports = function activate(api) {
     // 主进程侧状态：窗口、最后一份快照、最后一次已知的循环模式。
@@ -2400,6 +2575,14 @@ module.exports = function activate(api) {
         // 悬浮窗歌词的「桌面（穿透）模式」：隐藏全部控件 + 整窗 setIgnoreMouseEvents(true)。
         // 退出只能靠播放条按钮或全局快捷键（主进程不再响应自身点击，否则就点不出来了）。
         popupDesktop: false,
+        // 1.7.1：穿透态的悬停取消 —— 页面报上来的「退出穿透」键矩形、悬停轮询句柄、当前生效的穿透值。
+        popupPointerRect: null,
+        popupHoverTick: null,
+        popupIgnore: null,
+        // 上次告诉页面的「光标在退出穿透键上」真值（去重）。
+        reportedPointer: null,
+        // 1.7.4：上次告诉页面的「光标在窗口里」真值（控件显隐用它，替代原生 :hover）。
+        reportedPopupHover: null,
         // 上次推给 client 的形态 / 桌面模式真值（去重，null = 还没推过）。
         reportedSurface: null,
         reportedDesktop: null,
@@ -2496,8 +2679,12 @@ module.exports = function activate(api) {
     state.widgetOpen = state.persisted.open !== false;
     // 1.7.0：上次用哪种形态。老存档没有 surface → 桌面歌词（保持升级前观感）。
     state.surface = state.persisted.surface === SURFACE_POPUP ? SURFACE_POPUP : SURFACE_DESKTOP;
-    state.popupPinned = state.persisted.popupPinned === true;
+    // 1.7.2：悬浮窗歌词不再有「固定」按钮，固定态只保留在状态文件里给老版本兼容，这里一律按未固定处理，
+    // 否则老存档 popupPinned=true 会让悬浮窗一启动就「控制栏常驻 + 拖不动」。
+    state.popupPinned = false;
     state.popupDesktop = state.persisted.popupDesktop === true;
+    // 1.7.6：悬浮窗歌词自己的排版（老存档没有 → 只显示原文，和桌面歌词默认一致）。
+    state.popupLayout = LAYOUT_MODE_IDS.includes(state.persisted.popupLayout) ? state.persisted.popupLayout : 'text';
     // 1.5.1：建窗用的初始配置（之后由 client 推来的真配置覆盖）。
     state.config = prepareConfig(state.persisted);
     api.log.info(LOG_PREFIX + ' 窗口状态', JSON.stringify({
@@ -3021,6 +3208,29 @@ module.exports = function activate(api) {
      * 轮询「光标是否落在窗口矩形内」，变化时通过 IPC_HOVER 推给页面。
      * 返回停止函数，窗口关闭时自动调用。
      */
+    /**
+     * 1.7.4：透明 + 点穿透的无边框窗口在被别的应用（尤其是全屏应用）盖住之后，
+     * DWM 可能不再刷新它的合成面 —— 真机表现是「点了固定键窗口就没了」/「全屏后停在旧画面」。
+     * 这里主动要求重绘一帧把画面推回合成器；invalidate 不存在时用透明度抖一下兜底。
+     */
+    const nudgeWidgetRepaint = () => {
+        const widgetWindow = state.win;
+        if (!widgetWindow || widgetWindow.isDestroyed()) return;
+        try {
+            const contents = widgetWindow.webContents;
+            if (!contents || contents.isDestroyed()) return;
+            if (typeof contents.invalidate === 'function') {
+                contents.invalidate();
+                return;
+            }
+            const opacity = widgetWindow.getOpacity();
+            widgetWindow.setOpacity(opacity > 0.99 ? 0.99 : 1);
+            widgetWindow.setOpacity(opacity);
+        } catch (error) {
+            // 只是补救手段，失败不影响功能。
+        }
+    };
+
     const startHoverWatch = (widgetWindow) => {
         let lastHover = null;
         // 当前是否让整窗忽略鼠标（只在固定状态为 true）。null = 还没设置过。
@@ -3051,6 +3261,8 @@ module.exports = function activate(api) {
                 lastIgnore = ignore;
                 // 页面自己设过的那笔账已经被这次设置覆盖掉了。
                 state.ignoreHint = null;
+                // 穿透状态切换会让窗口的命中区域重算，顺手要求重绘，避免合成面停在旧帧。
+                nudgeWidgetRepaint();
             } catch (error) {
                 lastIgnore = null;
             }
@@ -3401,8 +3613,167 @@ module.exports = function activate(api) {
     };
 
     /**
+     * 1.7.1：悬浮窗的穿透不再「整窗一刀切」——桌面模式下页面只留下正中那颗「退出穿透」键，
+     * 光标压到它的矩形里就临时放行点击，这样不用回设置面板也能退出来（和桌面歌词的固定键同一套路）。
+     * force = true 表示忽略去重、无条件调一次（切形态 / 窗口刚建好时用）。
+     */
+    const setPopupIgnore = (ignore, force) => {
+        const popup = popupAlive();
+        if (!popup) {
+            state.popupIgnore = null;
+            return;
+        }
+        if (!force && state.popupIgnore === ignore) return;
+        try {
+            popup.setIgnoreMouseEvents(ignore, { forward: true });
+            state.popupIgnore = ignore;
+        } catch (error) {
+            state.popupIgnore = null;
+            api.log.warn(LOG_PREFIX + ' 设置悬浮窗歌词鼠标穿透失败', error);
+        }
+    };
+
+    const reportPopupPointer = (on) => {
+        if (state.reportedPointer === on) return;
+        const popup = popupAlive();
+        if (!popup) return;
+        try {
+            popup.webContents.send(IPC_POPUP_POINTER, on === true);
+            state.reportedPointer = on === true;
+        } catch (error) {
+            state.reportedPointer = null;
+        }
+    };
+
+    /**
+     * 1.7.4：把「光标是否在悬浮窗里」推给页面，页面据此挂 body.hover 露控件。
+     * 不再用原生 :hover —— 窗口被全屏应用遮挡 / 自身处于穿透态时浏览器收不到鼠标事件，
+     * 那样控件永远出不来（用户反馈「悬停无效、调不出功能面板」）。
+     */
+    const reportPopupHover = (on) => {
+        const next = on === true;
+        if (state.reportedPopupHover === next) return;
+        const popup = popupAlive();
+        if (!popup || popup.webContents.isDestroyed()) return;
+        try {
+            popup.webContents.send(IPC_POPUP_HOVER, next);
+            state.reportedPopupHover = next;
+        } catch (error) {
+            state.reportedPopupHover = null;
+        }
+    };
+
+    /** 光标是否落在悬浮窗内容矩形里（只要在窗口里就算，不要求窗口在最上层）。 */
+    const popupCursorInside = () => {
+        const popup = popupAlive();
+        if (!popup) return false;
+        try {
+            const bounds = popup.getContentBounds();
+            const point = screen.getCursorScreenPoint();
+            return (
+                point.x >= bounds.x &&
+                point.x < bounds.x + bounds.width &&
+                point.y >= bounds.y &&
+                point.y < bounds.y + bounds.height
+            );
+        } catch (error) {
+            return false;
+        }
+    };
+
+    /** 光标是否压在「退出穿透」键的矩形里（页面用 getBoundingClientRect 报上来，单位是内容坐标）。 */
+    const popupPointerOver = () => {
+        const popup = popupAlive();
+        const rect = state.popupPointerRect;
+        if (!popup || !rect || !(rect.width > 0) || !(rect.height > 0)) return false;
+        try {
+            const bounds = popup.getContentBounds();
+            const point = screen.getCursorScreenPoint();
+            const x = point.x - bounds.x;
+            const y = point.y - bounds.y;
+            if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+            return (
+                x >= rect.x - POPUP_POINTER_PADDING &&
+                x <= rect.x + rect.width + POPUP_POINTER_PADDING &&
+                y >= rect.y - POPUP_POINTER_PADDING &&
+                y <= rect.y + rect.height + POPUP_POINTER_PADDING
+            );
+        } catch (error) {
+            return false;
+        }
+    };
+
+    const popupHoverStep = () => {
+        const popup = popupAlive();
+        if (!popup || state.surface !== SURFACE_POPUP || !popup.isVisible() || !state.widgetOpen) {
+            setPopupIgnore(false);
+            reportPopupPointer(false);
+            reportPopupHover(false);
+            return;
+        }
+        // 控件显隐：任何形态都要报（桌面模式下页面虽然把控件全藏了，报 false 无害）。
+        reportPopupHover(popupCursorInside() && !state.popupDesktop);
+        if (!state.popupDesktop) {
+            setPopupIgnore(false);
+            reportPopupPointer(false);
+            return;
+        }
+        const over = popupPointerOver();
+        setPopupIgnore(!over);
+        reportPopupPointer(over);
+    };
+
+    const startPopupHoverWatch = () => {
+        stopPopupHoverWatch();
+        state.popupHoverTick = setInterval(() => {
+            try {
+                popupHoverStep();
+            } catch (error) {
+                // 轮询本身出问题就 fail-open：宁可点得到，也不要让窗口变成一块点不动的玻璃。
+                setPopupIgnore(false);
+                reportPopupPointer(false);
+            }
+        }, HOVER_POLL_MS);
+        popupHoverStep();
+    };
+
+    const stopPopupHoverWatch = () => {
+        if (state.popupHoverTick) {
+            clearInterval(state.popupHoverTick);
+            state.popupHoverTick = null;
+        }
+        state.popupPointerRect = null;
+        state.popupIgnore = null;
+        state.reportedPointer = null;
+        state.reportedPopupHover = null;
+    };
+
+    const onPopupPointerRect = (event, raw) => {
+        if (!state.popup || state.popup.isDestroyed() || event.sender !== state.popup.webContents) return;
+        const x = toFiniteNumber(raw && raw.x);
+        const y = toFiniteNumber(raw && raw.y);
+        const width = toFiniteNumber(raw && raw.width);
+        const height = toFiniteNumber(raw && raw.height);
+        if (x === null || y === null || width === null || height === null) {
+            state.popupPointerRect = null;
+            return;
+        }
+        state.popupPointerRect = { x, y, width, height };
+        // 矩形变了立刻重算一拍，免得要等下一个 80ms。
+        try {
+            popupHoverStep();
+        } catch (error) {
+            /* 下一次轮询会兜底 */
+        }
+    };
+
+    // 1.7.5：悬浮窗尺寸改成固定区间（460×220 ~ 900×600），不再跟着「最长句」动态改最小宽度。
+    // 更长的句子由页面里的走马灯横向滚动解决，用户把窗口调到合适大小后就不会自己变。
+
+    /**
      * 悬浮窗歌词的桌面（穿透）模式：隐藏全部控件、背景全透明、整窗点击穿透。
-     * 开了之后这个窗口就收不到鼠标了，所以只能由播放条按钮 / 全局快捷键（client 侧）关掉。
+     * 1.7.1 起穿透态下「退出穿透」键所在矩形仍然可点（见 setPopupIgnore），
+     * 所以页面上那颗键就是唯一的出口，不需要回设置面板。
      */
     const applyPopupDesktop = (on) => {
         state.popupDesktop = on === true;
@@ -3410,11 +3781,10 @@ module.exports = function activate(api) {
         const popup = popupAlive();
         if (popup) {
             sendPopupDesktop();
-            try {
-                popup.setIgnoreMouseEvents(state.popupDesktop, { forward: true });
-            } catch (error) {
-                api.log.warn(LOG_PREFIX + ' 设置悬浮窗歌词鼠标穿透失败', error);
-            }
+            state.popupIgnore = null;
+            state.reportedPointer = null;
+            setPopupIgnore(state.popupDesktop, true);
+            reportPopupPointer(false);
         }
         reportPopupDesktop();
         api.log.info(LOG_PREFIX + ' 悬浮窗歌词桌面模式' + (state.popupDesktop ? '已开启（点击穿透）' : '已关闭'));
@@ -3468,6 +3838,9 @@ module.exports = function activate(api) {
                 thickFrame: false,
                 minWidth: POPUP_MIN_WIDTH,
                 minHeight: POPUP_MIN_HEIGHT,
+                maxWidth: POPUP_MAX_WIDTH,
+                // 1.7.6：高度上限放开到显示器工作区高（用户要求「上限等于显示器高」）。
+                maxHeight: Math.max(POPUP_MIN_HEIGHT, Math.min(POPUP_MAX_HEIGHT_CAP, screen.getPrimaryDisplay().workArea.height)),
                 show: false,
                 webPreferences: {
                     nodeIntegration: true,
@@ -3496,7 +3869,15 @@ module.exports = function activate(api) {
             if (!popup || popup.isDestroyed()) return;
             try {
                 const [width, height] = popup.getSize();
-                const [x, y] = popup.getPosition();
+                let [x, y] = popup.getPosition();
+                // 1.7.4：左右不能越出显示器——拖动时若外面只剩半截，把人拽回来。
+                const area = screen.getDisplayMatching({ x, y, width, height }).workArea;
+                const maxX = area.x + area.width - width;
+                const nextX = Math.min(Math.max(x, area.x), Math.max(area.x, maxX));
+                if (nextX !== x) {
+                    x = nextX;
+                    popup.setPosition(x, y);
+                }
                 if (!state.persisted) state.persisted = {};
                 state.persisted.popupWidth = width;
                 state.persisted.popupHeight = height;
@@ -3517,6 +3898,11 @@ module.exports = function activate(api) {
             if (state.lastPayload) popup.webContents.send(IPC_DATA, state.lastPayload);
             sendPopupPinned();
             sendPopupDesktop();
+            try {
+                popup.webContents.send(IPC_POPUP_LAYOUT, state.popupLayout);
+            } catch (error) {
+                api.log.warn(LOG_PREFIX + ' 向悬浮窗歌词下发排版失败', error);
+            }
             sendActionToClient({ action: 'request-sync' });
         });
 
@@ -3525,7 +3911,8 @@ module.exports = function activate(api) {
             if (state.disposed || popup.isDestroyed()) return;
             if (!state.widgetOpen || state.surface !== SURFACE_POPUP) return;
             try {
-                popup.setIgnoreMouseEvents(state.popupDesktop, { forward: true });
+                state.popupIgnore = null;
+                setPopupIgnore(state.popupDesktop, true);
                 popup.showInactive();
                 api.log.info(LOG_PREFIX + ' 悬浮窗歌词上屏（首帧就绪）');
             } catch (error) {
@@ -3545,6 +3932,7 @@ module.exports = function activate(api) {
         });
 
         popup.on('closed', () => {
+            stopPopupHoverWatch();
             if (state.popup === popup) state.popup = null;
             if (!state.disposed) {
                 api.log.warn(LOG_PREFIX + ' 悬浮窗歌词窗口被关闭；切回悬浮窗形态时会重新创建');
@@ -3585,10 +3973,12 @@ module.exports = function activate(api) {
         const popup = ensurePopupWindow();
         if (!popup) return;
         try {
+            startPopupHoverWatch();
             // 页面还在加载就先不上屏（否则露空白窗），交给 once('ready-to-show') 上屏。
             if (popup.webContents.isLoading()) return;
             // 桌面（穿透）模式下上屏也要保持穿透，否则开关一重启就变成可点，用户点两下就点乱了。
-            popup.setIgnoreMouseEvents(state.popupDesktop, { forward: true });
+            state.popupIgnore = null;
+            setPopupIgnore(state.popupDesktop, true);
             popup.showInactive();
             api.log.info(LOG_PREFIX + ' 悬浮窗歌词上屏' + (state.popupDesktop ? '（桌面模式）' : ''));
         } catch (error) {
@@ -3599,6 +3989,9 @@ module.exports = function activate(api) {
     const hidePopupWindow = () => {
         const popup = popupAlive();
         if (!popup) return;
+        // 隐藏期间不再轮询光标：既省一次 80ms 定时器，也能让页面把 body.hover 收回去。
+        reportPopupHover(false);
+        stopPopupHoverWatch();
         try {
             if (popup.isVisible()) popup.hide();
             // 隐藏后窗口不该继续吃点击（和桌面歌词窗口同样的处理）。
@@ -3610,6 +4003,7 @@ module.exports = function activate(api) {
 
     /** 停用模组 / 宿主窗口全关时真的销毁悬浮窗歌词（和 closeWidgetWindow 对应）。 */
     const closePopupWindow = () => {
+        stopPopupHoverWatch();
         const popup = popupAlive();
         if (!popup) return;
         if (state.popup === popup) state.popup = null;
@@ -3897,6 +4291,9 @@ module.exports = function activate(api) {
         // 固定状态决定整窗是否忽略鼠标，改了要立刻重算一次，别等下一次轮询（最多 80ms）。
         state.pinned = value === true;
         if (state.hoverTick) state.hoverTick();
+        // 固定/解锁之后立刻补一帧重绘：老版本在真机上「点固定键窗口就消失」，
+        // 现象更像合成面没刷新而不是窗口被关掉（日志里没有任何隐藏/销毁记录）。
+        nudgeWidgetRepaint();
         if (!state.persisted) return;
         state.persisted.pinned = state.pinned;
         savePersistedState();
@@ -3931,6 +4328,16 @@ module.exports = function activate(api) {
         if (state.hoverTick) state.hoverTick();
     };
     // 页面切换排版时记下模式，下次启动恢复。
+    // 1.7.6：悬浮窗歌词的排版（自己记，不影响桌面歌词）。
+    const onPopupLayoutFromWindow = (event, value) => {
+        if (!state.persisted) return;
+        if (!state.popup || event.sender !== state.popup.webContents) return;
+        if (!LAYOUT_MODE_IDS.includes(value)) return;
+        state.popupLayout = value;
+        state.persisted.popupLayout = value;
+        savePersistedState();
+    };
+
     const onLayoutFromWindow = (event, value) => {
         if (!state.persisted) return;
         if (!state.win || event.sender !== state.win.webContents) return;
@@ -4014,11 +4421,13 @@ module.exports = function activate(api) {
     ipcMain.on(IPC_PINNED, onPinnedFromWindow);
     ipcMain.on(IPC_PIN_RECT, onPinRectFromWindow);
     ipcMain.on(IPC_LAYOUT, onLayoutFromWindow);
+    ipcMain.on(IPC_POPUP_LAYOUT, onPopupLayoutFromWindow);
     ipcMain.on(IPC_CLOSE, onCloseFromWindow);
     ipcMain.on(IPC_SHOWN, onShownFromWindow);
     ipcMain.on(IPC_IGNORE_HINT, onIgnoreHintFromWindow);
     // 1.7.0：悬浮窗歌词自己的控制通道（上一曲/播放/音量/循环/固定/桌面模式/播放列表/关闭）。
     ipcMain.on(IPC_POPUP_COMMAND, onPopupCommand);
+    ipcMain.on(IPC_POPUP_POINTER_RECT, onPopupPointerRect);
     ipcMain.on(IPC_TOGGLE_SURFACE, onToggleSurfaceFromWindow);
     app.on('browser-window-created', onBrowserWindowCreated);
 
@@ -4046,10 +4455,12 @@ module.exports = function activate(api) {
             ipcMain.removeListener(IPC_PINNED, onPinnedFromWindow);
             ipcMain.removeListener(IPC_PIN_RECT, onPinRectFromWindow);
             ipcMain.removeListener(IPC_LAYOUT, onLayoutFromWindow);
+            ipcMain.removeListener(IPC_POPUP_LAYOUT, onPopupLayoutFromWindow);
             ipcMain.removeListener(IPC_CLOSE, onCloseFromWindow);
             ipcMain.removeListener(IPC_SHOWN, onShownFromWindow);
             ipcMain.removeListener(IPC_IGNORE_HINT, onIgnoreHintFromWindow);
             ipcMain.removeListener(IPC_POPUP_COMMAND, onPopupCommand);
+            ipcMain.removeListener(IPC_POPUP_POINTER_RECT, onPopupPointerRect);
             ipcMain.removeListener(IPC_TOGGLE_SURFACE, onToggleSurfaceFromWindow);
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 移除窗口指令监听失败', error);
