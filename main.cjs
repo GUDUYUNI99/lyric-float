@@ -1924,6 +1924,13 @@ body[data-desktop="true"] .shell { background: transparent; border-color: transp
     justify-content: flex-end;
 }
 #close { -webkit-app-region: no-drag; }
+/* 1.7.10：桌面模式键挪到顶栏正中；顶栏这一行的高度自然成为「功能键列」与右上关闭键之间的距离。 */
+.topbar-center {
+    position: absolute;
+    left: 50%;
+    top: 0;
+    transform: translateX(-50%);
+}
 
 .icon-btn {
     -webkit-app-region: no-drag;
@@ -2066,6 +2073,7 @@ body[data-desktop="true"][data-pointer="true"] #desktop-exit { opacity: 1; }
 <body>
 <div class="shell" id="shell">
     <div class="topbar">
+        <button id="desktop" class="icon-btn topbar-center" type="button" title="桌面模式（隐藏控件并让鼠标穿透）" aria-label="桌面模式">${ICON_SVG.monitor}</button>
         <button id="close" class="icon-btn" type="button" title="关闭悬浮窗歌词（模组仍启用）" aria-label="关闭悬浮窗歌词">${ICON_SVG.close}</button>
     </div>
 
@@ -2082,7 +2090,6 @@ body[data-desktop="true"][data-pointer="true"] #desktop-exit { opacity: 1; }
         </div>
 
         <div class="rail right" id="rail-right">
-            <button id="desktop" class="icon-btn" type="button" title="桌面模式（隐藏控件并让鼠标穿透）" aria-label="桌面模式">${ICON_SVG.monitor}</button>
             <button id="surface" class="icon-btn" type="button" title="切换到桌面歌词" aria-label="切换到桌面歌词">${ICON_SVG.popup}</button>
             <button id="layout" class="icon-btn" type="button" data-mode="text" title="歌词排版：原文" aria-label="歌词排版">${ICON_SVG.layout}</button>
             <button id="playlist" class="icon-btn" type="button" title="播放列表" aria-label="播放列表">${ICON_SVG['list-music']}</button>
@@ -2371,7 +2378,7 @@ const render = (payload) => {
 };
 
 /** 按可用高度把 8 颗按钮分配到右列 / 左列（放不下时先缩音量条的空间）。 */
-const BUTTON_ORDER = ['desktop', 'surface', 'layout', 'playlist', 'loop', 'prev', 'toggle', 'next'];
+const BUTTON_ORDER = ['surface', 'layout', 'playlist', 'loop', 'prev', 'toggle', 'next'];
 const packRails = () => {
     if (!els.railRight || !els.railExtra) return;
     const stageHeight = els.stage ? els.stage.clientHeight : 0;
@@ -3879,19 +3886,13 @@ module.exports = function activate(api) {
         }
 
         // 拖动 / 缩放后把几何落盘（缩放时 'resize' 会连发，scheduleSave 会合并成一次写盘）。
-        const rememberPopupBounds = () => {
+        // 1.7.10：拖动过程中**不要**改位置 —— 边拖边 setPosition 会和系统的拖动循环打架，
+        // 撞到屏幕边缘时会留下一层「移动叠影」。改成只在拖动结束（moved）和缩放结束（resized）时夹一次。
+        const savePopupBounds = () => {
             if (!popup || popup.isDestroyed()) return;
             try {
                 const [width, height] = popup.getSize();
-                let [x, y] = popup.getPosition();
-                // 1.7.4：左右不能越出显示器——拖动时若外面只剩半截，把人拽回来。
-                const area = screen.getDisplayMatching({ x, y, width, height }).workArea;
-                const maxX = area.x + area.width - width;
-                const nextX = Math.min(Math.max(x, area.x), Math.max(area.x, maxX));
-                if (nextX !== x) {
-                    x = nextX;
-                    popup.setPosition(x, y);
-                }
+                const [x, y] = popup.getPosition();
                 if (!state.persisted) state.persisted = {};
                 state.persisted.popupWidth = width;
                 state.persisted.popupHeight = height;
@@ -3902,8 +3903,28 @@ module.exports = function activate(api) {
                 // 读不到就算了，下次按默认几何建窗。
             }
         };
-        popup.on('move', rememberPopupBounds);
-        popup.on('resize', rememberPopupBounds);
+        /** 把窗口夹进当前显示器的可用区域：左右不越界，上不过屏幕顶、下不过任务栏顶边。 */
+        const clampPopupBounds = () => {
+            if (!popup || popup.isDestroyed()) return;
+            try {
+                const bounds = popup.getBounds();
+                const area = screen.getDisplayMatching(bounds).workArea;
+                const width = Math.min(bounds.width, area.width);
+                const height = Math.min(bounds.height, area.height);
+                const x = Math.min(Math.max(bounds.x, area.x), Math.max(area.x, area.x + area.width - width));
+                const y = Math.min(Math.max(bounds.y, area.y), Math.max(area.y, area.y + area.height - height));
+                if (width !== bounds.width || height !== bounds.height || x !== bounds.x || y !== bounds.y) {
+                    popup.setBounds({ x, y, width, height }, false);
+                }
+                savePopupBounds();
+            } catch (error) {
+                // 夹不了就算了，不影响显示。
+            }
+        };
+        popup.on('move', savePopupBounds);
+        popup.on('moved', clampPopupBounds);
+        popup.on('resize', savePopupBounds);
+        popup.on('resized', clampPopupBounds);
 
         popup.webContents.on('did-finish-load', () => {
             api.log.info(LOG_PREFIX + ' 悬浮窗歌词页面 did-finish-load');
@@ -3927,6 +3948,8 @@ module.exports = function activate(api) {
             try {
                 state.popupIgnore = null;
                 setPopupIgnore(state.popupDesktop, true);
+                // 1.7.10：上屏前先夹一次几何，避免老存档把窗口留在屏幕外 / 压到任务栏下面。
+                clampPopupBounds();
                 popup.showInactive();
                 api.log.info(LOG_PREFIX + ' 悬浮窗歌词上屏（首帧就绪）');
             } catch (error) {
