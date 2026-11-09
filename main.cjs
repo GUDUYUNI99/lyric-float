@@ -1973,6 +1973,8 @@ body[data-desktop="true"] .shell { background: transparent; border-color: transp
 }
 body.hover .rail { opacity: 1; }
 body[data-desktop="true"] .rail { opacity: 0; }
+/* 1.7.10：桌面模式下顶栏也藏起来（桌面模式键已挪进顶栏，退出用 #desktop-exit 那颗替身）。 */
+body[data-desktop="true"] .topbar { visibility: hidden; }
 
 .rail.left { width: 34px; justify-content: center; }
 .rail.right { width: 44px; justify-content: flex-start; padding-top: 2px; gap: 8px; }
