@@ -2782,6 +2782,8 @@ module.exports = function activate(api) {
         // 上次推给 client 的形态 / 桌面模式真值（去重，null = 还没推过）。
         reportedSurface: null,
         reportedDesktop: null,
+        // 1.7.14：置顶重申 / 强制重绘的定时器（见 startTopmostWatch）。
+        topmostTick: null,
         // 正在 new 悬浮窗歌词窗口：构造期会同步触发 browser-window-created，用它把自己排除掉。
         creatingPopup: false,
     };
@@ -3307,6 +3309,9 @@ module.exports = function activate(api) {
     const showWidgetWindow = (force) => {
         const widgetWindow = state.win;
         cancelShownWait();
+        // 1.7.14：停掉置顶重申定时器与焦点监听。
+        stopTopmostWatch();
+        app.removeListener('browser-window-focus', onAppFocus);
         // 期间被关掉 / 被销毁 / 模组已停用：不再上屏。
         if (!widgetWindow || widgetWindow.isDestroyed() || !state.widgetOpen || state.disposed) return;
         try {
@@ -3418,6 +3423,24 @@ module.exports = function activate(api) {
      * DWM 可能不再刷新它的合成面 —— 真机表现是「点了固定键窗口就没了」/「全屏后停在旧画面」。
      * 这里主动要求重绘一帧把画面推回合成器；invalidate 不存在时用透明度抖一下兜底。
      */
+    /** 1.7.14：对任意一个窗口强制重绘一帧（透明分层窗口被完全遮挡后 DWM 可能不再给它新帧）。 */
+    const nudgeRepaintFor = (targetWindow) => {
+        if (!targetWindow || targetWindow.isDestroyed()) return;
+        try {
+            const contents = targetWindow.webContents;
+            if (!contents || contents.isDestroyed()) return;
+            if (typeof contents.invalidate === 'function') {
+                contents.invalidate();
+                return;
+            }
+            const opacity = targetWindow.getOpacity();
+            targetWindow.setOpacity(opacity > 0.99 ? 0.99 : 1);
+            targetWindow.setOpacity(opacity);
+        } catch (error) {
+            // 只是补救手段，失败不影响功能。
+        }
+    };
+
     const nudgeWidgetRepaint = () => {
         const widgetWindow = state.win;
         if (!widgetWindow || widgetWindow.isDestroyed()) return;
@@ -3434,6 +3457,50 @@ module.exports = function activate(api) {
         } catch (error) {
             // 只是补救手段，失败不影响功能。
         }
+    };
+
+    /**
+     * 1.7.14：无边框全屏窗口（浏览器 F11、游戏「窗口化全屏」）和我们的歌词同属 Windows 的 topmost 层，
+     * 谁最后 SetWindowPos(HWND_TOPMOST) 谁在上。它们每次获得焦点都会重申一次，我们被踩下去后不会自己爬回来，
+     * 所以这里每秒做一次「重申置顶 + 强制重绘」：moveTop() 是 SWP_NOACTIVATE（不抢焦点、不改尺寸），
+     * 重绘是给透明分层窗口补帧（被完全遮挡期间 DWM 可能停更，露出来会显示旧画面）。
+     * 独占全屏（D3D exclusive）绕开合成器，任何窗口都盖不上去 —— 那种情况只能让路。
+     */
+    const reassertTopmost = () => {
+        if (!state.config || !state.config.shared.keepOnTop) return;
+        for (const target of [state.win, state.popup]) {
+            if (!target || target.isDestroyed() || !target.isVisible()) continue;
+            try {
+                if (!target.isAlwaysOnTop()) target.setAlwaysOnTop(true);
+                target.moveTop();
+            } catch (error) {
+                // 单个窗口失败不影响另一个窗口。
+            }
+            nudgeRepaintFor(target);
+        }
+    };
+
+    const stopTopmostWatch = () => {
+        if (state.topmostTick) {
+            clearInterval(state.topmostTick);
+            state.topmostTick = null;
+        }
+    };
+
+    const startTopmostWatch = () => {
+        if (state.topmostTick) return;
+        state.topmostTick = setInterval(() => {
+            if (state.disposed) {
+                stopTopmostWatch();
+                return;
+            }
+            reassertTopmost();
+        }, TOPMOST_REFRESH_MS);
+    };
+
+    /** 应用/窗口重新获得焦点时立刻补一次：alt-tab 回来、全屏应用退出后能马上回到最上层。 */
+    const onAppFocus = () => {
+        reassertTopmost();
     };
 
     const startHoverWatch = (widgetWindow) => {
@@ -4830,6 +4897,9 @@ module.exports = function activate(api) {
         // 1.7.0：形态与桌面（穿透）模式也各推一次，播放条按钮靠它们高亮。
         reportSurface(true);
         reportPopupDesktop(true);
+        // 1.7.14：每秒重申置顶 + 重绘，并把「应用获得焦点」也接上（见 reassertTopmost）。
+        startTopmostWatch();
+        app.on('browser-window-focus', onAppFocus);
         // 1.5.1：入口（重新）建起来就要配置。这条覆盖「主进程重载、client 没重跑」和
         // 「页面比 client 先加载完所以那次要早了」两种情况；client 侧做了合并，重复要不会抖动。
         requestConfigFromClient();
