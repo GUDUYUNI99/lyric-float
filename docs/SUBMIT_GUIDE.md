@@ -1,7 +1,7 @@
 # 上架材料说明（先行测试渠道）
 
 > 本文件是提交到 [folium-compound](https://folium-compound.cielaniska.top) 模组市场「先行测试」渠道时用的说明材料与自查清单。
-> 最后更新：2026-11-10，对应 `mod.json` 版本 **1.7.15**。
+> 最后更新：2026-11-10，对应 `mod.json` 版本 **1.8.0**。
 
 ## 一、模组简介
 
@@ -39,13 +39,13 @@
 4. **需要歌词源支持**：本地 `.lrc`、内嵌歌词、在线歌词都可用；但没有歌词的歌只能显示「此歌曲暂无歌词」。
 5. **桌面歌词窗口不可自由缩放**：它的高度跟随字号自动计算（这是 1.3.0 以来的设计）；需要自由缩放的场景请用悬浮窗歌词。
 6. **播放列表面板显示的是宿主队列**：外部播放（非宿主队列）时面板会提示无队列；点歌后高亮由宿主回填，可能有约半秒延迟。
-7. **权限只有 `playback.read` / `playback.control`**：不读写宿主配置文件，不联网，不执行下载；状态存于 `userData/my-lyric-widget-state.json`。
+7. **权限只有 `playback.read` / `playback.control`**：不读写宿主配置文件，不联网，不执行下载；状态存于 `userData/lyric-float-state.json`（旧文件 `my-lyric-widget-state.json` 会迁移一次）。
 8. **未签名时显示「未验证」**：签名由 folium-compound 的 CI 用先行测试（beta）渠道密钥完成，签名覆盖所有文件（含 `mod.json` 与 `preview.png`），**签名后不要再改任何文件**。
 
 ## 五、安装与启用
 
-1. 从模组市场下载 zip（或在开发版里把 `mods/my-lyric-widget` 目录放进去）；
-2. 打开 Folia → 设置 → 高级 → 模组 → 安装并启用「悬浮窗歌词」；
+1. 从模组市场下载 zip（或在开发版里把 `mods/lyric-float` 目录放进去）；
+2. 打开 Folia → 设置 → 高级 → 模组 → 安装并启用「歌词浮岛」；
 3. 首次启用后 **桌面歌词窗口**会直接出现（贴边、半透明、置顶）；
 4. 布局微调：设置 → 高级 → 模组 → 悬浮窗歌词。
 
@@ -63,7 +63,14 @@
 - 生成脚本：`docs/make-preview.py`（用 Pillow 合成，配色/尺寸与模组页面一致；沙箱里跑不起 Electron GUI，所以不是真截图）。
   - 若要换成真截图，建议：桌面壁纸用深色带纹理照片；桌面歌词放屏幕底部居中（窗口 640×180，显示原文 + 译文，控制条处于悬停可见状态）；悬浮窗放右上（520–920 宽，显示 3–5 行歌词、当前句高亮）；导出 1280×720 后压到 1 MB 以内（PNG 或 JPG 均可）。
 
-## 八、版本号约定（重要）
+## 八、改名记录（2026-11-10）
+
+- 旧 id/名称：`my-lyric-widget` /「悬浮窗歌词」→ 新 id/名称：`lyric-float` /「歌词浮岛」。
+- 影响：设置存于 `settings:<id>` 作用域，改 id 后**字号/颜色等设置会回到默认值，需要重设一次**；窗口位置/尺寸/固定状态会从旧状态文件 `my-lyric-widget-state.json` 自动迁移一次（`main.cjs` 的 `readPersistedState`）。
+- 命令 id、播放条按钮 id、日志前缀、IPC 通道前缀都改成 `lyric-float` / `[lyric-float]`。
+- GitHub 仓库名目前仍是 `GUDUYUNI99/my-lyric-widget`（改名需要在 GitHub 上操作，不影响模组安装）。
+
+## 九、版本号约定（重要）
 
 宿主清单校验器 `electron/modSystem/manifest.cjs:87-93` 只接受 **`主.次.修订`（三段纯数字）**：
 
@@ -71,16 +78,16 @@
 mod.version must be a semantic version like 1.2.3
 ```
 
-因此 `1.7.15-beta.1` 这类预发布号**无法通过宿主校验**（已实测：`npm run folium:check -- my-lyric-widget` 直接报这条错误）。
+因此 `1.8.0-beta.1` 这类预发布号**无法通过宿主校验**（已实测：`npm run folium:check -- lyric-float` 直接报这条错误）。
 「先行测试渠道」的身份由 folium-compound 侧的渠道元数据 + beta 签名密钥表达，而不是写在 `mod.json` 的 `version` 里。
-当前提交版本为 **1.7.15**。
+当前提交版本为 **1.8.0**。
 
-## 九、提交 PR 前需要准备的材料
+## 十、提交 PR 前需要准备的材料
 
-1. **模组打包**：`mods/my-lyric-widget/` 目录（`mod.json`、`client.mjs`、`main.cjs`、`preview.png`），不加 `docs/`（体积）。提交前跑一次：
+1. **模组打包**：`mods/lyric-float/` 目录（`mod.json`、`client.mjs`、`main.cjs`、`preview.png`），不加 `docs/`（体积）。提交前跑一次：
    ```bash
    cd D:\folia-dev\folia-major
-   npm run folium:check -- my-lyric-widget
+   npm run folium:check -- lyric-float
    ```
    期望输出 `no problem found.`（只剩「not signed」note，签名由 CI 做）。
 2. **`mod.json` 字段**（已满足）：`folium: 1`、`id`、`name`、`version`、`description`、`client`、`main`、`preview`、`permissions: ["playback.read","playback.control"]`。

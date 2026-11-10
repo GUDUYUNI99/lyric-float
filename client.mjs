@@ -1,5 +1,5 @@
 /**
- * my-lyric-widget 的渲染进程入口：独立常驻的数据搬运模块，不渲染任何界面。
+ * lyric-float 的渲染进程入口：独立常驻的数据搬运模块，不渲染任何界面。
  *
  * 1.0.0 起不再注册为「歌词样式（visualizer）」：只要模组启用，activate 就常驻运行，
  * 不依赖用户在设置里选中某个样式，也不依赖宿主的 mount 上下文。
@@ -94,7 +94,7 @@ const RPC_CONFIG = 'config';
 const ACTION_REQUEST_CONFIG = 'request-config';
 const RPC_TOGGLE_PIN = 'toggle-pin';
 // 设置分区 id：设置 → 高级 → 模组 → 展开「悬浮窗歌词」。
-const SETTINGS_SECTION_ID = 'lyric-widget';
+const SETTINGS_SECTION_ID = 'lyric-float';
 // 桌面歌词的字号范围（1.4.2 起就是这个范围，默认 38 不能动）。
 const FONT_SIZE_MIN = 20;
 const FONT_SIZE_MAX = 50;
@@ -237,7 +237,7 @@ const debugLog = (...args) => {
 };
 
 // 模块级日志：只要 client.mjs 被 import 就会打印，用来区分「没加载」和「加载了但没 activate」。
-debugLog('[lyric-widget] client 模块已求值（client.mjs 被 import）', {
+debugLog('[lyric-float] client 模块已求值（client.mjs 被 import）', {
     href: typeof location !== 'undefined' ? location.href.slice(0, 120) : '(无 location)',
 });
 
@@ -542,7 +542,7 @@ const readPlaylistAndSend = (folium) => {
             items,
         });
     } catch (error) {
-        folium.log.warn('[lyric-widget] 读取播放列表失败', error);
+        folium.log.warn('[lyric-float] 读取播放列表失败', error);
         reportPlaybackHint(folium, '读取播放列表失败');
     }
 };
@@ -556,17 +556,17 @@ const playQueueIndex = (folium, index) => {
             return;
         }
         Promise.resolve(folium.playback.playQueueItem(target)).catch((error) => {
-            folium.log.warn('[lyric-widget] 切歌失败', error);
+            folium.log.warn('[lyric-float] 切歌失败', error);
             reportPlaybackHint(folium, '切歌失败');
         });
     } catch (error) {
-        folium.log.warn('[lyric-widget] 切歌失败', error);
+        folium.log.warn('[lyric-float] 切歌失败', error);
     }
 };
 
 const handleAction = (folium, message) => {
     if (!message || typeof message !== 'object') {
-        folium.log.warn('[lyric-widget] 收到无法识别的 action 载荷，已忽略', message);
+        folium.log.warn('[lyric-float] 收到无法识别的 action 载荷，已忽略', message);
         return;
     }
     switch (message.action) {
@@ -583,7 +583,7 @@ const handleAction = (folium, message) => {
             // 只接受真正的 number：主进程发来 null / 字符串 / 缺字段时忽略，避免把音量误设成 0。
             const volume = message.volume;
             if (typeof volume !== 'number' || !Number.isFinite(volume)) {
-                folium.log.warn('[lyric-widget] set-volume 的 volume 必须是有限数字，已忽略', message);
+                folium.log.warn('[lyric-float] set-volume 的 volume 必须是有限数字，已忽略', message);
                 break;
             }
             folium.playback.setVolume(clampVolume(volume));
@@ -591,7 +591,7 @@ const handleAction = (folium, message) => {
         }
         case 'set-loop':
             if (!LOOP_MODES.includes(message.mode)) {
-                folium.log.warn('[lyric-widget] set-loop 收到未知循环模式，已忽略', message.mode);
+                folium.log.warn('[lyric-float] set-loop 收到未知循环模式，已忽略', message.mode);
                 break;
             }
             folium.playback.setLoopMode(message.mode);
@@ -602,15 +602,15 @@ const handleAction = (folium, message) => {
             // 1.7.11：每一跳都打日志（主进程 → client → 宿主 UI），真机上能直接看出断在哪一环。
             try {
                 if (folium.ui && typeof folium.ui.openPlayerPanel === 'function') {
-                    folium.log.info('[lyric-widget] 播放列表：client 收到指令，调用 folium.ui.openPlayerPanel');
+                    folium.log.info('[lyric-float] 播放列表：client 收到指令，调用 folium.ui.openPlayerPanel');
                     folium.ui.openPlayerPanel();
-                    folium.log.info('[lyric-widget] 播放列表：openPlayerPanel 调用返回（面板应由宿主主窗口打开）');
+                    folium.log.info('[lyric-float] 播放列表：openPlayerPanel 调用返回（面板应由宿主主窗口打开）');
                 } else {
-                    folium.log.warn('[lyric-widget] 当前 Folium 没有 folium.ui.openPlayerPanel，无法打开播放面板');
+                    folium.log.warn('[lyric-float] 当前 Folium 没有 folium.ui.openPlayerPanel，无法打开播放面板');
                     reportPlaybackHint(folium, '当前 Folia 版本不支持打开播放列表');
                 }
             } catch (error) {
-                folium.log.warn('[lyric-widget] 打开播放面板失败', error);
+                folium.log.warn('[lyric-float] 打开播放面板失败', error);
                 reportPlaybackHint(folium, '打开播放列表失败');
             }
             break;
@@ -623,7 +623,7 @@ const handleAction = (folium, message) => {
             playQueueIndex(folium, message.index);
             break;
         default:
-            folium.log.warn('[lyric-widget] 收到未知 action，已忽略', message.action);
+            folium.log.warn('[lyric-float] 收到未知 action，已忽略', message.action);
     }
 };
 
@@ -722,14 +722,14 @@ const createSyncEngine = (folium) => {
                 if (!hostReady) {
                     if (!hostNotReadyLogged) {
                         hostNotReadyLogged = true;
-                        debugLog('[lyric-widget] 宿主播放服务还没注册，先跳过这一帧（轮询会自动重试）');
+                        debugLog('[lyric-float] 宿主播放服务还没注册，先跳过这一帧（轮询会自动重试）');
                     }
                     return;
                 }
                 hostNotReadyLogged = false;
                 // 补发激活时被跳过的那一帧，并让主进程拿到当前状态。
                 force = true;
-                debugLog('[lyric-widget] 宿主播放服务已就绪');
+                debugLog('[lyric-float] 宿主播放服务已就绪');
             }
 
             refreshPlaySession(folium, session);
@@ -772,7 +772,7 @@ const createSyncEngine = (folium) => {
             lastSentSession = payload.playSessionId;
 
             if (DEBUG) {
-                debugLog('[lyric-widget] syncData 发送', {
+                debugLog('[lyric-float] syncData 发送', {
                     force,
                     drifted,
                     state: payload.state,
@@ -796,9 +796,9 @@ const createSyncEngine = (folium) => {
                     lastSentKey = '';
                     if (reportedFailure) return;
                     reportedFailure = true;
-                    console.error('[lyric-widget] update-data 发送失败', error);
+                    console.error('[lyric-float] update-data 发送失败', error);
                     folium.log.warn(
-                        '[lyric-widget] 发送 update-data 失败，确认 main.cjs 已注册 api.rpc.handle("update-data", ...)；下一次轮询会自动重试',
+                        '[lyric-float] 发送 update-data 失败，确认 main.cjs 已注册 api.rpc.handle("update-data", ...)；下一次轮询会自动重试',
                         error,
                     );
                 });
@@ -809,14 +809,14 @@ const createSyncEngine = (folium) => {
             lastSentKey = '';
             if (reportedSyncError) return;
             reportedSyncError = true;
-            debugLog('[lyric-widget] 本次快照读取失败，稍后自动重试', error && error.message);
-            folium.log.warn('[lyric-widget] 读取播放状态失败（会自动重试）', error);
+            debugLog('[lyric-float] 本次快照读取失败，稍后自动重试', error && error.message);
+            folium.log.warn('[lyric-float] 读取播放状态失败（会自动重试）', error);
         }
     };
 
     /** request-sync 需要绕过内容去重强制重发，其余指令交给 handleAction。 */
     const handleActionMessage = (message) => {
-        debugLog('[lyric-widget] 收到 action', message);
+        debugLog('[lyric-float] 收到 action', message);
         try {
             if (message && typeof message === 'object' && message.action === ACTION_REQUEST_SYNC) {
                 syncData(true);
@@ -831,7 +831,7 @@ const createSyncEngine = (folium) => {
             handleAction(folium, message);
         } catch (error) {
             // 按钮可能在宿主播放服务注册之前就被点下来：记一条警告即可，不能把异常抛回 rpc 派发。
-            folium.log.warn('[lyric-widget] 执行 action 失败（宿主可能还没就绪）', message, error);
+            folium.log.warn('[lyric-float] 执行 action 失败（宿主可能还没就绪）', message, error);
         }
     };
 
@@ -871,7 +871,7 @@ const createSyncEngine = (folium) => {
 
 /**
  * 1.0.0 起本模组不再注册 visualizer，旧版本留在 localStorage 里的
- * `visualizer_mode = mod:my-lyric-widget:lyric-widget` 已经指向不存在的样式。
+ * `visualizer_mode = mod:my-lyric-widget:lyric-widget`（旧 id，见 2026-11-10 改名）已经指向不存在的样式。
  * 宿主在启动时已经把无效值回退成内置样式，但设置面板会提示「属于某个模组」；
  * 这里只清掉「指向本模组」的那一条，其他值一律不碰。
  */
@@ -880,7 +880,7 @@ const clearStaleVisualizerSelection = (folium) => {
         const saved = localStorage.getItem('visualizer_mode');
         if (!saved || !saved.startsWith('mod:' + folium.modId + ':')) return;
         localStorage.removeItem('visualizer_mode');
-        debugLog('[lyric-widget] 已清除旧的歌词样式选择（不再需要选中本模组）', saved);
+        debugLog('[lyric-float] 已清除旧的歌词样式选择（不再需要选中本模组）', saved);
     } catch {
         // localStorage 不可用时不影响同步。
     }
@@ -892,13 +892,13 @@ const clearStaleVisualizerSelection = (folium) => {
 //   「窗」 切换形态：桌面歌词 ↔ 悬浮窗歌词
 //   「透」 悬浮窗歌词的桌面（点击穿透）模式开关——开启后窗口整块不接收鼠标，这里是唯一出口，
 //          所以它必须留在播放条上（命令面板 / 全局快捷键是第二条路径）。
-const PROGRESS_BUTTON_STYLE_ID = 'lyric-widget-progress-style';
-const PROGRESS_BUTTON_CLASS = 'lyric-widget-btn';
+const PROGRESS_BUTTON_STYLE_ID = 'lyric-float-progress-style';
+const PROGRESS_BUTTON_CLASS = 'lyric-float-btn';
 const progressButtonHtml = (text) =>
     '<button type="button" class="' + PROGRESS_BUTTON_CLASS + '" data-on="false" aria-pressed="false">' +
     '<span aria-hidden="true">' + text + '</span></button>';
 const PROGRESS_BUTTON_CSS = `
-.lyric-widget-btn {
+.lyric-float-btn {
     all: unset;
     box-sizing: border-box;
     display: inline-flex;
@@ -915,15 +915,15 @@ const PROGRESS_BUTTON_CSS = `
     opacity: 0.4;
     transition: opacity 0.15s ease, background-color 0.15s ease;
 }
-.lyric-widget-btn:hover {
+.lyric-float-btn:hover {
     opacity: 0.8;
     background-color: color-mix(in srgb, currentColor 12%, transparent);
 }
-.lyric-widget-btn[data-on="true"] {
+.lyric-float-btn[data-on="true"] {
     opacity: 1;
     background-color: color-mix(in srgb, currentColor 18%, transparent);
 }
-.lyric-widget-btn:focus-visible {
+.lyric-float-btn:focus-visible {
     opacity: 1;
     outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);
     outline-offset: 1px;
@@ -938,7 +938,7 @@ const registerProgressButton = (folium, options) => {
     const { id, text, order, titleOf, onClick } = options;
     const progressButtons = folium.registries && folium.registries.progressButtons;
     if (!progressButtons || typeof progressButtons.register !== 'function') {
-        folium.log.warn('[lyric-widget] 当前 Folium 没有 progressButtons 注册表，播放条按钮不可用（需要 1.4+）');
+        folium.log.warn('[lyric-float] 当前 Folium 没有 progressButtons 注册表，播放条按钮不可用（需要 1.4+）');
         return null;
     }
     let button = null;
@@ -987,7 +987,7 @@ const registerProgressButton = (folium, options) => {
                         }
                     })
                     .catch((error) => {
-                        folium.log.warn('[lyric-widget] 播放条按钮操作失败', error);
+                        folium.log.warn('[lyric-float] 播放条按钮操作失败', error);
                     });
             };
             button.addEventListener('click', onClickHandler);
@@ -1006,7 +1006,7 @@ const registerProgressButton = (folium, options) => {
         handle = progressButtons.register(def);
     } catch (error) {
         // id 重复（模组热重载时旧条目还没被宿主清掉）之类的注册错误：按钮没了不该拖垮数据同步。
-        folium.log.warn('[lyric-widget] 注册播放条按钮失败：' + id, error);
+        folium.log.warn('[lyric-float] 注册播放条按钮失败：' + id, error);
         return null;
     }
 
@@ -1021,7 +1021,7 @@ const registerProgressButton = (folium, options) => {
             try {
                 if (handle && typeof handle.unregister === 'function') handle.unregister();
             } catch (error) {
-                folium.log.warn('[lyric-widget] 注销播放条按钮失败', error);
+                folium.log.warn('[lyric-float] 注销播放条按钮失败', error);
             }
             styleNode = null;
             button = null;
@@ -1041,7 +1041,7 @@ const registerProgressButtons = (folium) => {
     const state = { visible: true };
 
     const widgetButton = registerProgressButton(folium, {
-        id: 'lyric-widget-toggle',
+        id: 'lyric-float-toggle',
         text: '词',
         order: 480,
         titleOf: (active) => (active ? '隐藏歌词窗口（模组仍在运行）' : '显示歌词窗口'),
@@ -1068,7 +1068,7 @@ const registerProgressButtons = (folium) => {
                 }),
             );
         } catch (error) {
-            folium.log.warn('[lyric-widget] 订阅歌词窗口状态失败', error);
+            folium.log.warn('[lyric-float] 订阅歌词窗口状态失败', error);
         }
     }
     Promise.resolve(callMain(RPC_WIDGET_STATE))
@@ -1079,7 +1079,7 @@ const registerProgressButtons = (folium) => {
         })
         .catch((error) => {
             // 宿主没登记 widget-state（不该发生）时保持默认状态，不影响数据同步。
-            folium.log.warn('[lyric-widget] 读取歌词窗口状态失败', error);
+            folium.log.warn('[lyric-float] 读取歌词窗口状态失败', error);
         });
 
     updateButtons();
@@ -1108,7 +1108,7 @@ const registerProgressButtons = (folium) => {
  */
 const buildSettingsSection = () => ({
     id: SETTINGS_SECTION_ID,
-    label: L('悬浮窗歌词', 'Floating lyric window'),
+    label: L('歌词浮岛', 'Lyric Float'),
     description: L(
         '所有设置只影响这个悬浮歌词窗口，不影响播放器本身的歌词样式。',
         'These settings only affect the floating lyric window, not the player itself.',
@@ -1276,7 +1276,7 @@ const readConfigFromHandle = (handle) => {
     try {
         values = handle.settings.get() || {};
     } catch (error) {
-        debugLog('[lyric-widget] 读取模组设置失败', error);
+        debugLog('[lyric-float] 读取模组设置失败', error);
         return null;
     }
     const toNumber = (value, fallback) => {
@@ -1314,7 +1314,7 @@ const readConfigFromHandle = (handle) => {
 const registerSettingsSection = (folium) => {
     const registry = folium.registries && folium.registries.settingsSections;
     if (!registry || typeof registry.register !== 'function') {
-        debugLog('[lyric-widget] 当前 Folium 没有 settingsSections 注册表，跳过设置表单');
+        debugLog('[lyric-float] 当前 Folium 没有 settingsSections 注册表，跳过设置表单');
         return null;
     }
     const section = buildSettingsSection();
@@ -1328,10 +1328,10 @@ const registerSettingsSection = (folium) => {
         try {
             // 主进程会做一次 normalizeConfig，坏值在那里回落默认，这里不重复校验。
             Promise.resolve(folium.rpc.call(RPC_CONFIG, config)).catch((error) => {
-                folium.log.warn('[lyric-widget] 下发显示配置失败', error);
+                folium.log.warn('[lyric-float] 下发显示配置失败', error);
             });
         } catch (error) {
-            folium.log.warn('[lyric-widget] 下发显示配置失败', error);
+            folium.log.warn('[lyric-float] 下发显示配置失败', error);
         }
     };
     const push = () => {
@@ -1351,7 +1351,7 @@ const registerSettingsSection = (folium) => {
         });
     } catch (error) {
         // 注册失败不影响悬浮窗本身，只是没有设置界面（样式走默认）。
-        folium.log.warn('[lyric-widget] 注册模组设置失败（悬浮窗仍用默认样式）', error);
+        folium.log.warn('[lyric-float] 注册模组设置失败（悬浮窗仍用默认样式）', error);
         return null;
     }
     let offChange = null;
@@ -1360,7 +1360,7 @@ const registerSettingsSection = (folium) => {
             offChange = handle.settings.onChange(() => push());
         }
     } catch (error) {
-        folium.log.warn('[lyric-widget] 订阅模组设置变化失败', error);
+        folium.log.warn('[lyric-float] 订阅模组设置变化失败', error);
     }
     // 激活即下发一次（不走防抖）：宿主重启后会恢复设置值，窗口不能停在默认 38px 上。
     pushNow();
@@ -1399,7 +1399,7 @@ const registerSettingsSection = (folium) => {
 const registerWidgetCommands = (folium, settings) => {
     const registry = folium.registries && folium.registries.commands;
     if (!registry || typeof registry.register !== 'function') {
-        debugLog('[lyric-widget] 当前 Folium 没有 commands 注册表，跳过命令');
+        debugLog('[lyric-float] 当前 Folium 没有 commands 注册表，跳过命令');
         return [];
     }
     const minor = (folium.host && folium.host.folium && folium.host.folium.minor) || 0;
@@ -1409,7 +1409,7 @@ const registerWidgetCommands = (folium, settings) => {
         try {
             return Promise.resolve(folium.rpc.call(method));
         } catch (error) {
-            folium.log.warn('[lyric-widget] 执行命令失败', error);
+            folium.log.warn('[lyric-float] 执行命令失败', error);
             return Promise.reject(error);
         }
     };
@@ -1425,7 +1425,7 @@ const registerWidgetCommands = (folium, settings) => {
             // 桌面歌词的字号是 select，写字符串；悬浮窗字号是 number，命令先只动桌面歌词这一项。
             return settings.handle.settings.set({ fontSize: String(next) });
         } catch (error) {
-            folium.log.warn('[lyric-widget] 调整字号失败', error);
+            folium.log.warn('[lyric-float] 调整字号失败', error);
             return Promise.reject(error);
         }
     };
@@ -1434,18 +1434,18 @@ const registerWidgetCommands = (folium, settings) => {
             const registered = registry.register(minor >= 7 ? { ...definition, globalShortcut: true } : definition);
             if (registered) handles.push(registered);
         } catch (error) {
-            folium.log.warn('[lyric-widget] 注册命令失败', error);
+            folium.log.warn('[lyric-float] 注册命令失败', error);
         }
     };
     add({
-        id: 'lyric-widget-toggle',
+        id: 'lyric-float-toggle',
         label: L('桌面歌词：显示 / 隐藏', 'Floating lyrics: show / hide'),
         description: L('和播放控制条上的「词」按钮同一个开关。', 'Same switch as the 词 button on the player bar.'),
         keywords: ['歌词', '桌面歌词', '悬浮窗', 'widget', 'lyric'],
         run: () => callMain(RPC_TOGGLE_WIDGET),
     });
     add({
-        id: 'lyric-widget-pin',
+        id: 'lyric-float-pin',
         label: L('歌词窗口：锁定 / 解锁位置', 'Lyric window: lock / unlock'),
         description: L('和窗口正中那个图钉按钮同一套状态。', 'Same state as the pin button in the window.'),
         keywords: ['歌词', '锁定', '固定', 'pin', 'lock'],
@@ -1454,7 +1454,7 @@ const registerWidgetCommands = (folium, settings) => {
     // 1.7.0：形态切换与桌面（穿透）模式。穿透开启后窗口不接收鼠标，命令面板 / 这里是唯一出口，
     // 所以 minor >= 7 时顺带挂全局快捷键（见下面的 add）。
     add({
-        id: 'lyric-widget-surface',
+        id: 'lyric-float-surface',
         label: L('歌词窗口：切换桌面歌词 / 悬浮窗歌词', 'Lyric window: switch desktop / popup'),
         description: L(
             '和播放控制条上的「窗」按钮同一个切换。',
@@ -1468,7 +1468,7 @@ const registerWidgetCommands = (folium, settings) => {
         },
     });
     add({
-        id: 'lyric-widget-desktop-mode',
+        id: 'lyric-float-desktop-mode',
         label: L('歌词窗口：桌面模式（点击穿透）', 'Lyric window: desktop mode (click-through)'),
         description: L(
             '隐藏所有控件并让鼠标穿透；再执行一次退出。',
@@ -1478,13 +1478,13 @@ const registerWidgetCommands = (folium, settings) => {
         run: () => callMain(RPC_TOGGLE_DESKTOP_MODE),
     });
     add({
-        id: 'lyric-widget-font-up',
+        id: 'lyric-float-font-up',
         label: L('桌面歌词：字号 +1', 'Floating lyrics: font size +1'),
         keywords: ['歌词', '字号', '字体大小'],
         run: () => stepFontSize(1),
     });
     add({
-        id: 'lyric-widget-font-down',
+        id: 'lyric-float-font-down',
         label: L('桌面歌词：字号 -1', 'Floating lyrics: font size -1'),
         keywords: ['歌词', '字号', '字体大小'],
         run: () => stepFontSize(-1),
@@ -1493,7 +1493,7 @@ const registerWidgetCommands = (folium, settings) => {
 };
 
 export default function activate(folium) {
-    debugLog('[lyric-widget] client activate', {
+    debugLog('[lyric-float] client activate', {
         modId: folium.modId,
         context: folium.env.context,
         folium: folium.host && folium.host.folium,
@@ -1517,16 +1517,16 @@ export default function activate(folium) {
     clearStaleVisualizerSelection(folium);
 
     if (!engine.canReport) {
-        folium.log.warn('[lyric-widget] 当前 Folium 版本没有 folium.rpc.call（需要 1.7+），悬浮窗收不到数据');
+        folium.log.warn('[lyric-float] 当前 Folium 版本没有 folium.rpc.call（需要 1.7+），悬浮窗收不到数据');
         return;
     }
     if (!engine.canReceiveActions) {
-        folium.log.warn('[lyric-widget] 当前 Folium 版本没有 folium.rpc.on（需要 1.7+），悬浮窗的按钮/滑块会无效');
+        folium.log.warn('[lyric-float] 当前 Folium 版本没有 folium.rpc.on（需要 1.7+），悬浮窗的按钮/滑块会无效');
     }
 
     // 导出窗口里没有播放页：不轮询、不搬数据。
     if (folium.env.context !== 'main') {
-        debugLog('[lyric-widget] 非 main 上下文，不同步');
+        debugLog('[lyric-float] 非 main 上下文，不同步');
         return;
     }
 
@@ -1578,9 +1578,9 @@ export default function activate(folium) {
             try {
                 dispose();
             } catch (error) {
-                folium.log.warn('[lyric-widget] 停止同步时出错', error);
+                folium.log.warn('[lyric-float] 停止同步时出错', error);
             }
         }
-        debugLog('[lyric-widget] client 已停止（监听与轮询已撤）');
+        debugLog('[lyric-float] client 已停止（监听与轮询已撤）');
     };
 }

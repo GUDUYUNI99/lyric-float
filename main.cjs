@@ -1,12 +1,12 @@
 /**
- * my-lyric-widget 的主进程入口：开一个无边框、透明、置顶的悬浮歌词窗口，
+ * lyric-float 的主进程入口：开一个无边框、透明、置顶的悬浮歌词窗口，
  * 并在 client.mjs 和这个窗口之间搬运数据。
  *
  * 数据流（与 client.mjs 的协议）：
  *   client.mjs -> 主进程：folium.rpc.call('update-data', payload)；
  *       这里用 api.rpc.handle('update-data', ...) 接住，记下最后一份 payload，
- *       再用 win.webContents.send('my-lyric-widget:data-from-client', payload) 交给窗口。
- *   窗口 -> 主进程：ipcRenderer.send('my-lyric-widget:action-to-client', ...)，页面里用简写：
+ *       再用 win.webContents.send('lyric-float:data-from-client', payload) 交给窗口。
+ *   窗口 -> 主进程：ipcRenderer.send('lyric-float:action-to-client', ...)，页面里用简写：
  *       'prev' | 'next' | 'toggle' | 'request-sync'
  *       { type: 'set-volume', value: 0–100 }
  *       { type: 'set-loop', value: 'off' | 'all' | 'one' }
@@ -47,7 +47,7 @@
  *     folium.rpc.call('toggle-widget') 切显示/隐藏（返回 { visible }），首帧用
  *     folium.rpc.call('widget-state') 对齐（主进程可能先于 client 推送）；每次显隐变化再用
  *     api.rpc.send('widget-visibility', { visible }) 推回 client 给按钮高亮。
- *     窗口右上角的 × 走 ipcRenderer.send('my-lyric-widget:close')，效果同样是隐藏（模组仍启用）。
+ *     窗口右上角的 × 走 ipcRenderer.send('lyric-float:close')，效果同样是隐藏（模组仍启用）。
  *     隐藏期间照收快照（记 lastPayload）但不转给页面；重新显示时补发最后一份并 request-sync。
  *   - 1.6.1 长句横向滚动（页内叫 marquee）：配置在 desktop.marquee。开着时页面把歌词拆成
  *     「视口 + 轨道」两层，溢出才 translateX，速度按这一句剩余可唱时间反推，句首留白、滚到底交还
@@ -73,7 +73,7 @@ const { app, BrowserWindow, ipcMain, screen } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
-const LOG_PREFIX = '[lyric-widget]';
+const LOG_PREFIX = '[lyric-float]';
 
 // 和 client.mjs 约定的 RPC 名字（那边是 RPC_UPDATE / RPC_ACTION）。
 const RPC_UPDATE = 'update-data';
@@ -93,23 +93,23 @@ const SURFACE_DESKTOP = 'desktop';
 const SURFACE_POPUP = 'window';
 
 // 悬浮窗歌词自己的控制通道（页面 → 主进程）。桌面歌词窗口那套 IPC 通道不动。
-const IPC_POPUP_COMMAND = 'my-lyric-widget:popup-command';
+const IPC_POPUP_COMMAND = 'lyric-float:popup-command';
 // 桌面歌词窗口：切换形态（点固定键左边那颗按钮）。
-const IPC_TOGGLE_SURFACE = 'my-lyric-widget:toggle-surface';
+const IPC_TOGGLE_SURFACE = 'lyric-float:toggle-surface';
 // 主进程 → 悬浮窗歌词页面：固定状态、桌面（穿透）模式。
-const IPC_POPUP_PINNED = 'my-lyric-widget:popup-pinned';
-const IPC_POPUP_DESKTOP = 'my-lyric-widget:popup-desktop';
+const IPC_POPUP_PINNED = 'lyric-float:popup-pinned';
+const IPC_POPUP_DESKTOP = 'lyric-float:popup-desktop';
 // 1.7.1：穿透态的悬停取消。页面报「退出穿透」键的矩形（页面 → 主进程），
 // 主进程把光标是否落在该矩形里告诉页面（主进程 → 页面），穿透态下只有这块矩形放行点击。
-const IPC_POPUP_POINTER_RECT = 'my-lyric-widget:popup-pointer-rect';
-const IPC_POPUP_POINTER = 'my-lyric-widget:popup-pointer';
-const IPC_POPUP_HOVER = 'my-lyric-widget:popup-hover';
+const IPC_POPUP_POINTER_RECT = 'lyric-float:popup-pointer-rect';
+const IPC_POPUP_POINTER = 'lyric-float:popup-pointer';
+const IPC_POPUP_HOVER = 'lyric-float:popup-hover';
 // 1.7.6：悬浮窗歌词自己的排版三态（只显示原文 / 原文+译文 / 原文+罗马音）。
-const IPC_POPUP_LAYOUT = 'my-lyric-widget:popup-layout';
+const IPC_POPUP_LAYOUT = 'lyric-float:popup-layout';
 // 1.7.11：播放列表 / 其它一次性提示，直接弹在悬浮窗歌词页面里（失败提示用）。
-const IPC_POPUP_TOAST = 'my-lyric-widget:popup-toast';
+const IPC_POPUP_TOAST = 'lyric-float:popup-toast';
 // 1.7.12：悬浮窗歌词里的播放列表面板（数据由 client 读宿主队列后回传）。
-const IPC_POPUP_PLAYLIST = 'my-lyric-widget:popup-playlist';
+const IPC_POPUP_PLAYLIST = 'lyric-float:popup-playlist';
 const RPC_PLAYLIST_DATA = 'playlist-data';
 const RPC_PLAYBACK_HINT = 'playback-hint';
 // 穿透态下「退出穿透」键的命中外扩（和桌面歌词固定键同一口径）。
@@ -150,12 +150,12 @@ const clampPopupHeight = (value) => {
 
 // 窗口页面的 IPC 通道。带上模组 id 前缀：ipcMain 的通道是全应用共用的，
 // 别的模组若也叫 'action-to-client' 就会收到本窗口的消息。
-const IPC_ACTION = 'my-lyric-widget:action-to-client';
-const IPC_DATA = 'my-lyric-widget:data-from-client';// 排查用的页面→主进程调试通道（真机定位完连监听一起删掉）。
-const IPC_DEBUG = 'my-lyric-widget:debug';
+const IPC_ACTION = 'lyric-float:action-to-client';
+const IPC_DATA = 'lyric-float:data-from-client';// 排查用的页面→主进程调试通道（真机定位完连监听一起删掉）。
+const IPC_DEBUG = 'lyric-float:debug';
 // 主进程→页面的悬停状态（true/false）。整窗是拖拽区时渲染进程收不到鼠标事件，
 // 所以「鼠标是否停在窗口上」由主进程轮询光标位置后从这条通道推给页面。
-const IPC_HOVER = 'my-lyric-widget:hover';
+const IPC_HOVER = 'lyric-float:hover';
 // 悬停检测的轮询间隔：40~120ms 都够用；80ms 既跟得上手速，又几乎不占 CPU。
 const HOVER_POLL_MS = 80;
 // 悬停轮询连续失败的次数上限（约 8 秒）：只在窗口已经不可用时才停，单次异常会 fail-open 后继续跑。
@@ -167,12 +167,12 @@ const TOPMOST_REFRESH_MS = 1000;
 // 和任务栏至少重叠这么多像素才算「压在任务栏上」：窗口边缘 1px 压线不该让它长期抢占置顶层。
 const MIN_TASKBAR_OVERLAP = 8;
 // 固定/解锁状态（页面→主进程：用户点了图钉；主进程→页面：启动时恢复上次的固定状态）。
-const IPC_PINNED = 'my-lyric-widget:pinned';
+const IPC_PINNED = 'lyric-float:pinned';
 // 排版模式（页面→主进程：用户切了排版；主进程→页面：启动时恢复上次的排版）。
-const IPC_LAYOUT = 'my-lyric-widget:layout';
+const IPC_LAYOUT = 'lyric-float:layout';
 // 解锁按钮的矩形（页面→主进程，CSS 像素、相对窗口内容区）。固定状态下整窗忽略鼠标，
 // 主进程靠这个矩形判断光标是否落在按钮上，只有落在上面才把窗口重新变成可点（部分点击穿透）。
-const IPC_PIN_RECT = 'my-lyric-widget:pin-rect';
+const IPC_PIN_RECT = 'lyric-float:pin-rect';
 // 命中测试往外放一点：按钮本体 32×32，光标擦边时提前 2px 恢复可点，免得第一下点空。
 const PIN_HIT_PADDING = 2;
 // 显示握手：主进程等页面回 IPC_SHOWN 的最长时间（页面 400ms 兜底回信，这里再留余量）。
@@ -182,15 +182,15 @@ const SHOWN_TIMEOUT_MS = 800;
 // 这个值写进页面模板，页面脚本里直接用它（曾经漏过模板插值，页面侧变成未定义变量、握手直接报错）。
 const SHOWN_FRAME_WAIT_MS = 400;
 // 右上角 ×（1.4.0，页面→主进程）：只隐藏悬浮窗，不停用模组。重新显示走播放条上的「词」按钮。
-const IPC_CLOSE = 'my-lyric-widget:close';
+const IPC_CLOSE = 'lyric-float:close';
 // 1.5.1 显示握手（解决「× 关掉再打开时先闪一下旧画面」）：
 //   IPC_SHOW  主进程 → 页面：准备显示了，页面回一句 handled 再让窗口真正上屏
 //   IPC_SHOWN 页面 → 主进程：这一帧已经画好，可以 showInactive
 // 隐藏期间主进程照收快照但没转给页面，页面上停的是关闭那一刻的画面（高亮停在旧位置）。
-const IPC_SHOW = 'my-lyric-widget:show';
-const IPC_SHOWN = 'my-lyric-widget:shown';
+const IPC_SHOW = 'lyric-float:show';
+const IPC_SHOWN = 'lyric-float:shown';
 // 1.5.2 页面 → 主进程：页面自己改了整窗鼠标穿透（显示握手期间先全窗穿透，上屏后放开）。
-const IPC_IGNORE_HINT = 'my-lyric-widget:ignore-hint';
+const IPC_IGNORE_HINT = 'lyric-float:ignore-hint';
 // 排版三态（主进程侧只用来校验从页面收到的值，别让坏值写进状态文件）。
 // 第三态 1.3.0 从「原文 + 译文 + 罗马音」(full) 改成「原文 + 罗马音」(roman)；老存档里的 full 在恢复时映射过来。
 const LAYOUT_MODE_IDS = ['text', 'text-trans', 'roman'];
@@ -198,7 +198,7 @@ const LEGACY_LAYOUT_IDS = { full: 'roman' };
 // 形态切换（1.7.0 落地「桌面歌词 / 悬浮窗歌词」两种形态）：1.3.0 只有桌面歌词，这里先把状态位和
 // IPC 预留出来。页面此刻还不发这条消息，1.7.0 加「切换形态」按钮时直接复用。
 const SURFACE_IDS = ['desktop', 'window'];
-const IPC_SURFACE = 'my-lyric-widget:surface';
+const IPC_SURFACE = 'lyric-float:surface';
 // 形态切换的调用协议：client.mjs（1.7.0 起）用 folium.rpc.call(RPC_SURFACE, 'window') 请求切换，
 // 主进程在主窗口的渲染进程里 answer。宿主只保留 activate 返回的 dispose 函数（electron/modSystem/
 // nodeEntry.cjs:135），所以接口只能走 RPC，不能靠 activate 返回值。
@@ -209,7 +209,10 @@ const SURFACE_UNCHANGED = 'unchanged';
 const SURFACE_UNSUPPORTED = 'unsupported';
 // 窗口状态（位置 + 是否固定）存在 userData 下的一个小 JSON 里，重启后恢复。
 // 只记这两个值：尺寸固定、不需要记。
-const STATE_FILE_NAME = 'my-lyric-widget-state.json';
+const STATE_FILE_NAME = 'lyric-float-state.json';
+// 2026-11-10 改名（my-lyric-widget → lyric-float）：老用户的状态文件还叫旧名字，
+// 新文件不存在时回退读一次旧的，读到了就按新名字落盘，位置/尺寸不用重调。
+const LEGACY_STATE_FILE_NAME = 'my-lyric-widget-state.json';
 const SAVE_DEBOUNCE_MS = 500;
 
 // ---- 图标（内联 SVG） ----
@@ -320,14 +323,14 @@ const WINDOW_MARGIN = 48;
 const RPC_CONFIG = 'config';
 // 1.5.2：页面每画完一帧就把「已经画到哪」（行号 + 位置）从这条通道推上来，
 // 主进程据此把晚到的旧快照挡在页面前面。用 IPC 而不是 RPC：消息很轻，也不占 client 的 rpc 名字。
-const IPC_SHOWN_FRAME = 'my-lyric-widget:shown-frame';
+const IPC_SHOWN_FRAME = 'lyric-float:shown-frame';
 // 1.5.1：主进程 → client 的「重发一次配置」指令（和 request-sync 一样走 action 通道）。
 // 配置真源在 client 侧，而宿主「重载模组」在模组文件没变时不会重跑 client，只能由这边主动去要。
 const ACTION_REQUEST_CONFIG = 'request-config';
 // 命令面板「锁定 / 解锁位置」：命令面板没有页面上下文，由主进程翻状态再推回页面。
 const RPC_TOGGLE_PIN = 'toggle-pin';
 // 主进程 → 页面：把配置下发进窗口页面（字号、字体、外观）。
-const IPC_CONFIG = 'my-lyric-widget:config';
+const IPC_CONFIG = 'lyric-float:config';
 
 const SURFACE_MODES = ['auto', 'dark', 'light', 'transparent'];
 const FONT_MODES = ['system', 'theme'];
@@ -2816,12 +2819,23 @@ module.exports = function activate(api) {
     // 以前每次启动都把窗口摆回「主屏底部居中」，用户拖到的位置一重启就丢；
     // 这里在 userData 下记一个小 JSON，启动时恢复。
     const stateFilePath = () => path.join(app.getPath('userData'), STATE_FILE_NAME);
+    const legacyStateFilePath = () => path.join(app.getPath('userData'), LEGACY_STATE_FILE_NAME);
 
     const readPersistedState = () => {
         try {
             const parsed = JSON.parse(fs.readFileSync(stateFilePath(), 'utf8'));
             return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
         } catch (error) {
+            // 改名后的第一次启动：新文件还没有，回退读旧名字。
+            try {
+                const legacy = JSON.parse(fs.readFileSync(legacyStateFilePath(), 'utf8'));
+                if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
+                    api.log.info(LOG_PREFIX + ' 已从旧状态文件迁移窗口状态（my-lyric-widget-state.json → ' + STATE_FILE_NAME + '）');
+                    return legacy;
+                }
+            } catch {
+                // 旧文件也没有：按全新安装处理。
+            }
             // 第一次运行没有这个文件是正常情况，不打扰用户。
             if (!error || error.code !== 'ENOENT') {
                 api.log.warn(LOG_PREFIX + ' 读取窗口状态失败，本次用默认位置', error);
