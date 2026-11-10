@@ -108,6 +108,9 @@ const IPC_POPUP_HOVER = 'my-lyric-widget:popup-hover';
 const IPC_POPUP_LAYOUT = 'my-lyric-widget:popup-layout';
 // 1.7.11：播放列表 / 其它一次性提示，直接弹在悬浮窗歌词页面里（失败提示用）。
 const IPC_POPUP_TOAST = 'my-lyric-widget:popup-toast';
+// 1.7.12：悬浮窗歌词里的播放列表面板（数据由 client 读宿主队列后回传）。
+const IPC_POPUP_PLAYLIST = 'my-lyric-widget:popup-playlist';
+const RPC_PLAYLIST_DATA = 'playlist-data';
 const RPC_PLAYBACK_HINT = 'playback-hint';
 // 穿透态下「退出穿透」键的命中外扩（和桌面歌词固定键同一口径）。
 const POPUP_POINTER_PADDING = 2;
@@ -2065,6 +2068,47 @@ body[data-desktop="true"] .topbar { visibility: hidden; }
 .row.current .row-sub { text-overflow: clip; }
 
 /* 桌面模式（点击穿透）下唯一可点的「退出」键：默认隐藏，光标压上来才亮。 */
+.playlist {
+    position: absolute;
+    inset: 4px;
+    display: flex;
+    flex-direction: column;
+    background: rgba(8, 22, 36, 0.94);
+    border: 1px solid rgba(125, 211, 252, 0.22);
+    border-radius: 10px;
+    overflow: hidden;
+    z-index: 7;
+    -webkit-app-region: no-drag;
+}
+.playlist[hidden] { display: none; }
+.playlist-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 3px 4px 3px 10px;
+    border-bottom: 1px solid rgba(125, 211, 252, 0.14);
+}
+.playlist-title { font-size: 12px; color: #eaf6ff; opacity: 0.85; }
+.playlist-list { flex: 1 1 auto; overflow-y: auto; padding: 4px 0; }
+.playlist-item {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    padding: 5px 10px;
+    font-size: 12px;
+    line-height: 1.35;
+    color: #eaf6ff;
+    cursor: pointer;
+    -webkit-app-region: no-drag;
+}
+.playlist-item:hover { background: rgba(125, 211, 252, 0.12); }
+.playlist-item.current { color: #7dd3fc; font-weight: 600; }
+.playlist-item .pl-index { flex: 0 0 22px; opacity: 0.5; text-align: right; font-variant-numeric: tabular-nums; }
+.playlist-item .pl-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.playlist-item .pl-artist { flex: 0 1 auto; opacity: 0.6; font-size: 11px; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.playlist-empty { padding: 10px; font-size: 12px; color: #eaf6ff; opacity: 0.6; text-align: center; }
 .toast {
     position: absolute;
     left: 50%;
@@ -2130,6 +2174,13 @@ body[data-desktop="true"][data-pointer="true"] #desktop-exit { opacity: 1; }
         </div>
     </div>
 
+    <div class="playlist" id="playlist-panel" hidden>
+        <div class="playlist-head">
+            <span class="playlist-title">播放列表</span>
+            <button id="playlist-close" class="icon-btn" type="button" title="关闭播放列表" aria-label="关闭播放列表">${ICON_SVG.close}</button>
+        </div>
+        <div class="playlist-list" id="playlist-list"></div>
+    </div>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <button id="desktop-exit" class="icon-btn" type="button" title="退出桌面模式" aria-label="退出桌面模式">${ICON_SVG.monitor}</button>
 </div>
@@ -2147,6 +2198,7 @@ const IPC_POPUP_POINTER = '${IPC_POPUP_POINTER}';
 const IPC_POPUP_HOVER = '${IPC_POPUP_HOVER}';
 const IPC_POPUP_LAYOUT = '${IPC_POPUP_LAYOUT}';
 const IPC_POPUP_TOAST = '${IPC_POPUP_TOAST}';
+const IPC_POPUP_PLAYLIST = '${IPC_POPUP_PLAYLIST}';
 const IPC_POPUP_POINTER_RECT = '${IPC_POPUP_POINTER_RECT}';
 
 const ICONS = ${JSON.stringify(ICON_SVG)};
@@ -2171,6 +2223,9 @@ const els = {
     desktop: document.getElementById('desktop'),
     desktopExit: document.getElementById('desktop-exit'),
     toast: document.getElementById('toast'),
+    playlistPanel: document.getElementById('playlist-panel'),
+    playlistList: document.getElementById('playlist-list'),
+    playlistClose: document.getElementById('playlist-close'),
     playlist: document.getElementById('playlist'),
     surface: document.getElementById('surface'),
     layout: document.getElementById('layout'),
@@ -2462,7 +2517,7 @@ if (els.close) els.close.addEventListener('click', () => sendCommand({ type: 'hi
 if (els.desktop) els.desktop.addEventListener('click', () => sendCommand({ type: 'toggle-desktop' }));
 if (els.desktopExit) els.desktopExit.addEventListener('click', () => sendCommand({ type: 'toggle-desktop' }));
 if (els.surface) els.surface.addEventListener('click', () => sendCommand({ type: 'toggle-surface' }));
-if (els.playlist) els.playlist.addEventListener('click', () => sendCommand({ type: 'open-playlist' }));
+if (els.playlist) els.playlist.addEventListener('click', () => togglePlaylistPanel());
 if (els.prev) els.prev.addEventListener('click', () => sendCommand({ type: 'prev' }));
 if (els.toggle) els.toggle.addEventListener('click', () => sendCommand({ type: 'toggle' }));
 if (els.next) els.next.addEventListener('click', () => sendCommand({ type: 'next' }));
@@ -2521,6 +2576,64 @@ const showToast = (text) => {
         if (els.toast) els.toast.classList.remove('show');
     }, 2400);
 };
+/** 1.7.12：播放列表面板。数据由 client 读宿主队列后经主进程转过来（IPC_POPUP_PLAYLIST）。 */
+const renderPlaylist = (data) => {
+    if (!els.playlistList) return;
+    els.playlistList.textContent = '';
+    const items = data && Array.isArray(data.items) ? data.items : [];
+    if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'playlist-empty';
+        empty.textContent = data && data.kind === 'stage' ? '外部播放中，无队列' : '播放队列是空的';
+        els.playlistList.appendChild(empty);
+        return;
+    }
+    const currentIndex = data && Number.isFinite(data.currentIndex) ? data.currentIndex : -1;
+    for (const item of items) {
+        const row = document.createElement('div');
+        row.className = 'playlist-item' + (item.index === currentIndex ? ' current' : '');
+        const num = document.createElement('span');
+        num.className = 'pl-index';
+        num.textContent = String(item.index + 1);
+        const title = document.createElement('span');
+        title.className = 'pl-title';
+        title.textContent = item.title || '未知曲目';
+        const artist = document.createElement('span');
+        artist.className = 'pl-artist';
+        artist.textContent = item.artist || '';
+        row.appendChild(num);
+        row.appendChild(title);
+        if (item.artist) row.appendChild(artist);
+        row.addEventListener('click', () => sendCommand({ type: 'play-item', index: item.index }));
+        els.playlistList.appendChild(row);
+    }
+};
+
+const openPlaylistPanel = () => {
+    if (!els.playlistPanel) return;
+    els.playlistPanel.hidden = false;
+    if (els.playlistList) {
+        els.playlistList.textContent = '';
+        const loading = document.createElement('div');
+        loading.className = 'playlist-empty';
+        loading.textContent = '正在读取播放列表…';
+        els.playlistList.appendChild(loading);
+    }
+    sendCommand({ type: 'playlist' });
+};
+
+const closePlaylistPanel = () => {
+    if (els.playlistPanel) els.playlistPanel.hidden = true;
+};
+
+const togglePlaylistPanel = () => {
+    if (!els.playlistPanel) return;
+    if (els.playlistPanel.hidden) openPlaylistPanel();
+    else closePlaylistPanel();
+};
+
+if (els.playlistClose) els.playlistClose.addEventListener('click', () => closePlaylistPanel());
+ipcRenderer.on(IPC_POPUP_PLAYLIST, (event, data) => renderPlaylist(data));
 ipcRenderer.on(IPC_POPUP_TOAST, (event, text) => showToast(text));
 ipcRenderer.on(IPC_POPUP_LAYOUT, (event, value) => {
     if (!LAYOUT_MODES.includes(value)) return;
@@ -3797,9 +3910,12 @@ module.exports = function activate(api) {
             reportPopupPointer(false);
             return;
         }
+        // 1.7.12：桌面模式下，只要光标进到窗口里就把退出键亮出来（用户要求「悬停在窗口区域就显示」），
+        // 但**只让退出键那块可点** —— 其余区域仍然穿透，点歌词不会挡住下面的窗口。
+        const inside = popupCursorInside();
         const over = popupPointerOver();
         setPopupIgnore(!over);
-        reportPopupPointer(over);
+        reportPopupPointer(inside);
     };
 
     const startPopupHoverWatch = () => {
@@ -4227,6 +4343,18 @@ module.exports = function activate(api) {
                 // 右上角 ×：只隐藏窗口，模组继续跑；显示 / 隐藏由播放条按钮控制。
                 setWidgetOpen(false, 'popup-close');
                 return;
+            case 'playlist':
+                // 1.7.12：播放列表面板画在悬浮窗歌词自己身上（不拉起主程序面板）。
+                api.log.info(LOG_PREFIX + ' 播放列表：请求宿主队列');
+                sendActionToClient({ action: 'playlist-request' });
+                return;
+            case 'play-item': {
+                const targetIndex = Number(message.index);
+                if (!Number.isFinite(targetIndex)) return;
+                api.log.info(LOG_PREFIX + ' 播放列表：切到队列第 ' + targetIndex + ' 首');
+                sendActionToClient({ action: 'play-item', index: targetIndex });
+                return;
+            }
             case 'open-playlist': {
                 // 1.7.11：播放列表面板是宿主主窗口里的侧栏，Folia 在后台时它「打开」了也看不见，
                 // 所以转发之后再把宿主窗口带到前台；每一跳都打日志，方便真机定位断在哪。
@@ -4539,6 +4667,19 @@ module.exports = function activate(api) {
     }));
     // 1.7.0：悬浮窗歌词的桌面（穿透）模式开关。播放条按钮 / 全局快捷键都调这里。
     // 1.7.11：client 那边播放列表打不开时回传一句提示，直接弹在悬浮窗歌词页面里。
+    // 1.7.12：client 读到的播放队列，转给悬浮窗歌词页面画列表。
+    api.rpc.handle(RPC_PLAYLIST_DATA, (payload) => {
+        const popup = popupAlive();
+        if (!popup) return { ok: false };
+        try {
+            popup.webContents.send(IPC_POPUP_PLAYLIST, payload);
+            return { ok: true };
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 向悬浮窗歌词页面推送播放列表失败', error);
+            return { ok: false };
+        }
+    });
+
     api.rpc.handle(RPC_PLAYBACK_HINT, (payload) => {
         const popup = popupAlive();
         const text = payload && typeof payload.text === 'string' ? payload.text : '';

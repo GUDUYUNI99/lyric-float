@@ -510,6 +510,60 @@ const reportPlaybackHint = (folium, text) => {
         // 提示失败不影响主流程。
     }
 };
+/**
+ * 1.7.12：悬浮窗歌词里的「播放列表」面板由我们自己画，数据来自宿主的播放队列（Folium 1.7 的 playback.getQueue）。
+ * 读一页（最多 200 首）就够用：面板只展示列表 + 点击切歌，不做搜索 / 编辑。
+ */
+const pushPlaylistData = (folium, payload) => {
+    try {
+        Promise.resolve(folium.rpc.call('playlist-data', payload)).catch(() => {});
+    } catch (error) {
+        // 主进程没接住就算了，面板会停在「空」。
+    }
+};
+
+const readPlaylistAndSend = (folium) => {
+    try {
+        const playback = folium.playback;
+        if (!playback || typeof playback.getQueue !== 'function') {
+            reportPlaybackHint(folium, '当前 Folia 版本不支持读取播放列表');
+            return;
+        }
+        const snapshot = playback.getQueue({ offset: 0, limit: 200 });
+        const items = (snapshot.items || []).map((item) => ({
+            index: item.index,
+            title: item.song && typeof item.song.title === 'string' ? item.song.title : '',
+            artist: item.song && typeof item.song.artist === 'string' ? item.song.artist : '',
+        }));
+        pushPlaylistData(folium, {
+            kind: snapshot.kind || 'queue',
+            length: Number(snapshot.length) || items.length,
+            currentIndex: Number.isFinite(snapshot.currentIndex) ? snapshot.currentIndex : -1,
+            items,
+        });
+    } catch (error) {
+        folium.log.warn('[lyric-widget] 读取播放列表失败', error);
+        reportPlaybackHint(folium, '读取播放列表失败');
+    }
+};
+
+const playQueueIndex = (folium, index) => {
+    const target = Number(index);
+    if (!Number.isFinite(target)) return;
+    try {
+        if (!folium.playback || typeof folium.playback.playQueueItem !== 'function') {
+            reportPlaybackHint(folium, '当前 Folia 版本不支持切歌');
+            return;
+        }
+        Promise.resolve(folium.playback.playQueueItem(target)).catch((error) => {
+            folium.log.warn('[lyric-widget] 切歌失败', error);
+            reportPlaybackHint(folium, '切歌失败');
+        });
+    } catch (error) {
+        folium.log.warn('[lyric-widget] 切歌失败', error);
+    }
+};
+
 const handleAction = (folium, message) => {
     if (!message || typeof message !== 'object') {
         folium.log.warn('[lyric-widget] 收到无法识别的 action 载荷，已忽略', message);
@@ -559,6 +613,14 @@ const handleAction = (folium, message) => {
                 folium.log.warn('[lyric-widget] 打开播放面板失败', error);
                 reportPlaybackHint(folium, '打开播放列表失败');
             }
+            break;
+        case 'playlist-request':
+            // 悬浮窗歌词打开播放列表面板：读宿主队列，回传给主进程再转给页面。
+            readPlaylistAndSend(folium);
+            break;
+        case 'play-item':
+            // 面板里点某一首：按队列下标切歌（宿主会自己处理越界 / 不可切的情况）。
+            playQueueIndex(folium, message.index);
             break;
         default:
             folium.log.warn('[lyric-widget] 收到未知 action，已忽略', message.action);
