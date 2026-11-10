@@ -1127,6 +1127,17 @@ const buildSettingsSection = () => ({
             options: FONT_SIZE_OPTIONS,
         },
         {
+            key: 'lyricColor',
+            type: 'color',
+            label: L('桌面歌词颜色', 'Desktop lyric color'),
+            description: L(
+                '桌面歌词的原文与译文都用这个颜色，默认白色。',
+                'Both the line and its translation in the desktop lyric window use this color; white by default.',
+            ),
+            group: L('桌面歌词', 'Desktop lyric'),
+            defaultValue: '#ffffff',
+        },
+        {
             key: 'popupFontSize',
             type: 'select',
             label: L('悬浮窗歌词字号', 'Popup lyric font size'),
@@ -1278,6 +1289,7 @@ const readConfigFromHandle = (handle) => {
             popupFontSize: toNumber(values.popupFontSize, POPUP_FONT_SIZE_DEFAULT),
             // 颜色交给 main.cjs 的 normalizeConfig 校验（只认 #rrggbb），这里原样透传。
             popupColor: typeof values.popupColor === 'string' ? values.popupColor : '#eaf6ff',
+            lyricColor: typeof values.lyricColor === 'string' ? values.lyricColor : '#ffffff',
             fontMode: values.fontMode,
             surface: values.surface,
             surfaceOpacity: toNumber(values.surfaceOpacity, 0.58),

@@ -355,6 +355,8 @@ const DEFAULT_CONFIG = {
         popupFontSize: POPUP_FONT_SIZE_DEFAULT,
         // 1.7.0：悬浮窗歌词「当前句」的自定义颜色（整句着色，不做逐字）。
         popupColor: '#eaf6ff',
+        // 1.7.15：桌面歌词的文字颜色（默认白，和 1.7.14 及以前的观感完全一致）。
+        lyricColor: '#ffffff',
         fontMode: 'system',
         surface: 'auto',
         surfaceOpacity: 0.58,
@@ -402,6 +404,11 @@ const normalizeConfig = (raw) => {
     if (typeof sharedSource.popupColor === 'string') {
         const color = sharedSource.popupColor.trim().toLowerCase();
         if (/^#[0-9a-f]{6}$/.test(color)) config.shared.popupColor = color;
+    }
+    // 1.7.15：桌面歌词颜色，同样只认 #rrggbb。
+    if (typeof sharedSource.lyricColor === 'string') {
+        const lyricColor = sharedSource.lyricColor.trim().toLowerCase();
+        if (/^#[0-9a-f]{6}$/.test(lyricColor)) config.shared.lyricColor = lyricColor;
     }
     if (FONT_MODES.includes(sharedSource.fontMode)) config.shared.fontMode = sharedSource.fontMode;
     if (SURFACE_MODES.includes(sharedSource.surface)) config.shared.surface = sharedSource.surface;
@@ -710,6 +717,8 @@ const WIDGET_HTML = `<!DOCTYPE html>
         overflow: hidden;
         text-overflow: ellipsis;
         /* 窗口背景可能是任意壁纸（甚至纯白），所以歌词要自带一圈暗描边保证可读。 */
+        /* 1.7.15：文字颜色可自定义（默认白，观感与之前一致）。 */
+        color: var(--lyric-color, #ffffff);
         text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 2px 12px rgba(0, 0, 0, 0.6);
     }
     /* 译文行单独覆盖字号与字重（原文见上面的合并规则）。 */
@@ -1208,6 +1217,11 @@ const applyConfig = (next) => {
     style.setProperty('--widget-radius', current.radius + 'px');
     style.setProperty('--surface-alpha', String(current.surfaceOpacity));
     style.setProperty('--border-alpha', current.border ? '0.08' : '0');
+    // 1.7.15：桌面歌词文字颜色。CSS 变量 + 内联双保险（悬浮窗那边踩过「设置改了不生效」）。
+    const lyricColor = /^#[0-9a-f]{6}$/i.test(String(current.lyricColor || '')) ? String(current.lyricColor).toLowerCase() : '#ffffff';
+    style.setProperty('--lyric-color', lyricColor);
+    if (els.line) els.line.style.color = lyricColor;
+    if (els.trans) els.trans.style.color = lyricColor;
     document.body.dataset.surface = current.surface;
     document.body.dataset.backdrop = String(current.backdrop === true);
     document.body.dataset.pausedDim = String(current.pausedDim === true);
