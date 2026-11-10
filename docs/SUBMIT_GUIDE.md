@@ -68,7 +68,7 @@
 - 旧 id/名称：`my-lyric-widget` /「悬浮窗歌词」→ 新 id/名称：`lyric-float` /「歌词浮岛」。
 - 影响：设置存于 `settings:<id>` 作用域，改 id 后**字号/颜色等设置会回到默认值，需要重设一次**；窗口位置/尺寸/固定状态会从旧状态文件 `my-lyric-widget-state.json` 自动迁移一次（`main.cjs` 的 `readPersistedState`）。
 - 命令 id、播放条按钮 id、日志前缀、IPC 通道前缀都改成 `lyric-float` / `[lyric-float]`。
-- GitHub 仓库名目前仍是 `GUDUYUNI99/my-lyric-widget`（改名需要在 GitHub 上操作，不影响模组安装）。
+- GitHub 仓库已改名为 `GUDUYUNI99/lyric-float`（本地 `origin` 已同步更新）；旧地址会由 GitHub 自动重定向。
 
 ## 九、版本号约定（重要）
 
@@ -82,9 +82,11 @@ mod.version must be a semantic version like 1.2.3
 「先行测试渠道」的身份由 folium-compound 侧的渠道元数据 + beta 签名密钥表达，而不是写在 `mod.json` 的 `version` 里。
 当前提交版本为 **1.8.0**。
 
-## 十、提交 PR 前需要准备的材料
+## 十、提交（开 issue，不需要 fork）
 
-1. **模组打包**：`mods/lyric-float/` 目录（`mod.json`、`client.mjs`、`main.cjs`、`preview.png`），不加 `docs/`（体积）。提交前跑一次：
+官方流程见 [Folium 模组开发与贡献指南](https://github.com/chthollyphile/folia-major/blob/main/docs/folium/contributing.md) 第 6 节：**不需要 fork**，只要源码仓库公开、mod.json 通过校验、为发布版本打 tag，然后在 folium-compound 仓库开一个「模组提交」issue 即可。
+
+1. **模组目录**：本仓库根目录就是模组目录（`mod.json`、`client.mjs`、`main.cjs`、`preview.png`、`LICENSE`）。CI 只排除以 `.` 开头的文件和 `node_modules`，其它会原样收录（含 `docs/`，体积远小于 16 MB 上限）。提交前跑一次：
    ```bash
    cd D:\folia-dev\folia-major
    npm run folium:check -- lyric-float
@@ -95,5 +97,7 @@ mod.version must be a semantic version like 1.2.3
 4. **本文件 `docs/SUBMIT_GUIDE.md`**（简介 / 功能 / 先行测试声明 / 已知限制）。
 5. **权限说明**：为什么需要 `playback.read` 与 `playback.control`（读播放状态与歌词、发播放控制指令）；不申请 `filesystem.data`，因此不使用 `folium.storage`。
 6. **变更说明**：相对上一个公开版本的改动摘要（1.7.x 系列：新增悬浮窗歌词形态、播放列表面板、桌面模式退出键、全屏置顶刷新、桌面歌词颜色）。
-7. **作者信息与联系方式**（GitHub `GUDUYUNI99` / 邮箱），以及 PR 里说明「目标渠道：preview（先行测试）」。
+7. **作者信息与联系方式**（GitHub `GUDUYUNI99` / 邮箱），以及 issue 里说明「目标渠道：preview（先行测试）」。
+
+issue 需要填：模组 id、源码仓库、版本（tag 优先，也可写分支或完整 commit）、模组目录、模组说明、逐条权限说明、许可证（MIT）。CI 会把版本解析成具体 commit、只取回该提交做格式与收录规则检查，并在 issue 里回复「格式检查通过，请等待维护者审查」或指出要改的地方。
 8. **签名**：不要自己签；由 folium-compound 的 CI 使用 beta 渠道密钥签名。签名后任何文件改动都会让签名失效，需重新签。
