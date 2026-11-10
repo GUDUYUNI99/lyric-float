@@ -2604,7 +2604,18 @@ const renderPlaylist = (data) => {
         row.appendChild(num);
         row.appendChild(title);
         if (item.artist) row.appendChild(artist);
-        row.addEventListener('click', () => sendCommand({ type: 'play-item', index: item.index }));
+        row.addEventListener('click', () => {
+            sendCommand({ type: 'play-item', index: item.index });
+            // 1.7.13：宿主切歌不是同步的，先就地把高亮挪到点中的行，
+            // 再隔一拍重新读一次队列，避免面板一直停在切换之前的歌。
+            for (const node of els.playlistList.querySelectorAll('.playlist-item.current')) {
+                node.classList.remove('current');
+            }
+            row.classList.add('current');
+            setTimeout(() => {
+                if (els.playlistPanel && !els.playlistPanel.hidden) sendCommand({ type: 'playlist' });
+            }, 500);
+        });
         els.playlistList.appendChild(row);
     }
 };
@@ -2861,7 +2872,9 @@ module.exports = function activate(api) {
 
     state.persisted = readPersistedState();
     // 1.4.0：显隐也持久化。老存档没有 open 字段 → 默认显示（不能因为升级就把歌词藏起来）。
-    state.widgetOpen = state.persisted.open !== false;
+    // 1.7.13：启动一律显示。之前沿用 persisted.open，用户关掉一次之后每次重启都看不到歌词，
+    // 只能重载模组才回来（反馈里说的「记忆功能没了、每次都要重新启动」）。
+    state.widgetOpen = true;
     // 1.7.0：上次用哪种形态。老存档没有 surface → 桌面歌词（保持升级前观感）。
     state.surface = state.persisted.surface === SURFACE_POPUP ? SURFACE_POPUP : SURFACE_DESKTOP;
     // 1.7.2：悬浮窗歌词不再有「固定」按钮，固定态只保留在状态文件里给老版本兼容，这里一律按未固定处理，
@@ -4002,8 +4015,12 @@ module.exports = function activate(api) {
         const workArea = screen.getPrimaryDisplay().workArea;
         const savedX = toFiniteNumber(saved.popupX);
         const savedY = toFiniteNumber(saved.popupY);
-        const x = savedX === null ? Math.round(workArea.x + (workArea.width - width) / 2) : Math.round(savedX);
-        const y = savedY === null ? Math.round(workArea.y + workArea.height - height - 80) : Math.round(savedY);
+        const defaultX = Math.round(workArea.x + (workArea.width - width) / 2);
+        const defaultY = Math.round(workArea.y + workArea.height - height - 80);
+        // 1.7.13：存档坐标也要夹回当前工作区 —— 换分辨率 / 改缩放 / 拔副屏之后，
+        // 旧坐标可能落在屏幕外，窗口建出来就「看不见」，用户会以为位置没被记住。
+        const x = Math.min(Math.max(savedX === null ? defaultX : Math.round(savedX), workArea.x), Math.max(workArea.x, workArea.x + workArea.width - width));
+        const y = Math.min(Math.max(savedY === null ? defaultY : Math.round(savedY), workArea.y), Math.max(workArea.y, workArea.y + workArea.height - height));
         return { x, y, width, height };
     };
 
