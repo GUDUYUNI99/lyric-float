@@ -162,6 +162,8 @@ const HOVER_POLL_MS = 80;
 const MAX_HOVER_FAILURES = 100;
 // 任务栏守卫的轮询间隔：只在窗口压在任务栏上时才动窗口，500ms 足够跟手，也不会频繁重排层序。
 const TASKBAR_GUARD_MS = 500;
+// 1.7.14：无边框全屏窗口会给自己重申置顶，把我们踩到下面；这里每秒重申一次 + 强制重绘一帧。
+const TOPMOST_REFRESH_MS = 1000;
 // 和任务栏至少重叠这么多像素才算「压在任务栏上」：窗口边缘 1px 压线不该让它长期抢占置顶层。
 const MIN_TASKBAR_OVERLAP = 8;
 // 固定/解锁状态（页面→主进程：用户点了图钉；主进程→页面：启动时恢复上次的固定状态）。
@@ -360,6 +362,8 @@ const DEFAULT_CONFIG = {
         border: true,
         pausedDim: false,
         backdrop: false,
+        // 1.7.14：每秒重申置顶 + 重绘一帧，避免被无边框全屏窗口盖住 / 露出来是旧帧。
+        keepOnTop: true,
     },
     desktop: {
         // 1.6.2 起默认开启：用户要的就是「长句能读完」，默认关的话打开设置也看不出变化。
@@ -410,6 +414,7 @@ const normalizeConfig = (raw) => {
     config.shared.border = sharedSource.border !== false;
     config.shared.pausedDim = sharedSource.pausedDim === true;
     config.shared.backdrop = sharedSource.backdrop === true;
+    config.shared.keepOnTop = sharedSource.keepOnTop !== false;
     if (desktopSource) config.desktop.marquee = desktopSource.marquee === true;
     return config;
 };
