@@ -3,11 +3,12 @@
   "id": "my-lyric-widget",
   "name": "悬浮窗歌词",
   "version": "1.7.15",
-  "description": "",
+  "description": "独立桌面歌词与悬浮窗歌词双形态，多行滚动、鼠标穿透、自由缩放，支持播放器控制与状态记忆",
   "permissions": [
     "playback.control",
     "playback.read"
   ],
   "client": "client.mjs",
-  "main": "main.cjs"
+  "main": "main.cjs",
+  "preview": "preview.png"
 }
