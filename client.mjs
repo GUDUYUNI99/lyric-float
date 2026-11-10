@@ -502,6 +502,14 @@ const refreshPlaySession = (folium, session) => {
 };
 
 /** 主进程发来的控制指令；控制后的状态变化会由 playback.* 事件再发一次快照。 */
+/** 1.7.11：把失败原因回传给主进程，由悬浮窗歌词页面弹一句提示。 */
+const reportPlaybackHint = (folium, text) => {
+    try {
+        Promise.resolve(folium.rpc.call('playback-hint', { text })).catch(() => {});
+    } catch (error) {
+        // 提示失败不影响主流程。
+    }
+};
 const handleAction = (folium, message) => {
     if (!message || typeof message !== 'object') {
         folium.log.warn('[lyric-widget] 收到无法识别的 action 载荷，已忽略', message);
@@ -537,14 +545,19 @@ const handleAction = (folium, message) => {
         case 'open-playlist':
             // 1.7.0：悬浮窗歌词底部的「播放列表」按钮。宿主原生播放面板只能在渲染进程里开，
             // 主进程没有对应 API，所以由这里代劳（folium.ui 是 1.6+ 的 UI 服务）。
+            // 1.7.11：每一跳都打日志（主进程 → client → 宿主 UI），真机上能直接看出断在哪一环。
             try {
                 if (folium.ui && typeof folium.ui.openPlayerPanel === 'function') {
+                    folium.log.info('[lyric-widget] 播放列表：client 收到指令，调用 folium.ui.openPlayerPanel');
                     folium.ui.openPlayerPanel();
+                    folium.log.info('[lyric-widget] 播放列表：openPlayerPanel 调用返回（面板应由宿主主窗口打开）');
                 } else {
                     folium.log.warn('[lyric-widget] 当前 Folium 没有 folium.ui.openPlayerPanel，无法打开播放面板');
+                    reportPlaybackHint(folium, '当前 Folia 版本不支持打开播放列表');
                 }
             } catch (error) {
                 folium.log.warn('[lyric-widget] 打开播放面板失败', error);
+                reportPlaybackHint(folium, '打开播放列表失败');
             }
             break;
         default:

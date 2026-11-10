@@ -106,6 +106,9 @@ const IPC_POPUP_POINTER = 'my-lyric-widget:popup-pointer';
 const IPC_POPUP_HOVER = 'my-lyric-widget:popup-hover';
 // 1.7.6：悬浮窗歌词自己的排版三态（只显示原文 / 原文+译文 / 原文+罗马音）。
 const IPC_POPUP_LAYOUT = 'my-lyric-widget:popup-layout';
+// 1.7.11：播放列表 / 其它一次性提示，直接弹在悬浮窗歌词页面里（失败提示用）。
+const IPC_POPUP_TOAST = 'my-lyric-widget:popup-toast';
+const RPC_PLAYBACK_HINT = 'playback-hint';
 // 穿透态下「退出穿透」键的命中外扩（和桌面歌词固定键同一口径）。
 const POPUP_POINTER_PADDING = 2;
 
@@ -1922,7 +1925,12 @@ body[data-desktop="true"] .shell { background: transparent; border-color: transp
     display: flex;
     align-items: center;
     justify-content: flex-end;
+    /* 1.7.11：顶栏和两侧按钮列一样只在悬停时出现（桌面模式键挪进来后不再常显）。 */
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease;
 }
+body.hover:not([data-desktop="true"]) .topbar { opacity: 1; pointer-events: auto; }
 #close { -webkit-app-region: no-drag; }
 /* 1.7.10：桌面模式键挪到顶栏正中；顶栏这一行的高度自然成为「功能键列」与右上关闭键之间的距离。 */
 .topbar-center {
@@ -2057,6 +2065,26 @@ body[data-desktop="true"] .topbar { visibility: hidden; }
 .row.current .row-sub { text-overflow: clip; }
 
 /* 桌面模式（点击穿透）下唯一可点的「退出」键：默认隐藏，光标压上来才亮。 */
+.toast {
+    position: absolute;
+    left: 50%;
+    bottom: 14px;
+    transform: translateX(-50%) translateY(6px);
+    max-width: 80%;
+    padding: 5px 10px;
+    border-radius: 8px;
+    background: rgba(8, 22, 36, 0.86);
+    border: 1px solid rgba(125, 211, 252, 0.22);
+    color: #eaf6ff;
+    font-size: 12px;
+    line-height: 1.4;
+    text-align: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    z-index: 6;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 #desktop-exit {
     -webkit-app-region: no-drag;
     position: absolute;
@@ -2102,6 +2130,7 @@ body[data-desktop="true"][data-pointer="true"] #desktop-exit { opacity: 1; }
         </div>
     </div>
 
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <button id="desktop-exit" class="icon-btn" type="button" title="退出桌面模式" aria-label="退出桌面模式">${ICON_SVG.monitor}</button>
 </div>
 
@@ -2117,6 +2146,7 @@ const IPC_POPUP_DESKTOP = '${IPC_POPUP_DESKTOP}';
 const IPC_POPUP_POINTER = '${IPC_POPUP_POINTER}';
 const IPC_POPUP_HOVER = '${IPC_POPUP_HOVER}';
 const IPC_POPUP_LAYOUT = '${IPC_POPUP_LAYOUT}';
+const IPC_POPUP_TOAST = '${IPC_POPUP_TOAST}';
 const IPC_POPUP_POINTER_RECT = '${IPC_POPUP_POINTER_RECT}';
 
 const ICONS = ${JSON.stringify(ICON_SVG)};
@@ -2140,6 +2170,7 @@ const els = {
     loop: document.getElementById('loop'),
     desktop: document.getElementById('desktop'),
     desktopExit: document.getElementById('desktop-exit'),
+    toast: document.getElementById('toast'),
     playlist: document.getElementById('playlist'),
     surface: document.getElementById('surface'),
     layout: document.getElementById('layout'),
@@ -2478,6 +2509,19 @@ if (els.volume) {
 
 ipcRenderer.on(IPC_DATA, (event, payload) => render(payload));
 ipcRenderer.on(IPC_CONFIG, (event, payload) => applyConfig(payload));
+let toastTimer = null;
+/** 一次性提示（播放列表打不开之类），2.4 秒后自动淡出。 */
+const showToast = (text) => {
+    if (!els.toast || typeof text !== 'string' || !text) return;
+    els.toast.textContent = text;
+    els.toast.classList.add('show');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+        toastTimer = null;
+        if (els.toast) els.toast.classList.remove('show');
+    }, 2400);
+};
+ipcRenderer.on(IPC_POPUP_TOAST, (event, text) => showToast(text));
 ipcRenderer.on(IPC_POPUP_LAYOUT, (event, value) => {
     if (!LAYOUT_MODES.includes(value)) return;
     popupLayout = value;
@@ -2602,6 +2646,11 @@ module.exports = function activate(api) {
         popupPointerRect: null,
         popupHoverTick: null,
         popupIgnore: null,
+        // 1.7.11：拖动阻尼正在 setBounds（防 'move' 重入，见 createPopupWindow 里的 dampPopupOvershoot）。
+        popupDamping: false,
+        // 1.7.11：最近一次形态切换时刻 / 最近一次显隐请求的来源（真机排查「窗口自己消失」用）。
+        surfaceSwitchedAt: 0,
+        lastVisibilitySource: null,
         // 上次告诉页面的「光标在退出穿透键上」真值（去重）。
         reportedPointer: null,
         // 1.7.4：上次告诉页面的「光标在窗口里」真值（控件显隐用它，替代原生 :hover）。
@@ -3064,7 +3113,14 @@ module.exports = function activate(api) {
      * 1.5.2：「显示」在这里只是开始——真正上屏要等页面回 IPC_SHOWN（见 showWidgetWindow）。
      * 函数名保留 setWidgetOpen，因为它同时负责状态、落盘与向 client 汇报（hideWhenCollapsed 用）。
      */
-    const setWidgetOpen = (open) => {
+    const setWidgetOpen = (open, source = 'manual') => {
+        // 1.7.11：切形态后的 900ms 内忽略「隐藏」请求 —— 那是上一个窗口在切换瞬间发出的残留指令。
+        // 真机表现：切回桌面歌词后窗口自己消失、播放条按钮还亮着，只能重载模组恢复。
+        if (open !== true && Date.now() - state.surfaceSwitchedAt < 900) {
+            api.log.info(LOG_PREFIX + ' 忽略切形态瞬间的隐藏请求（来源：' + source + '）');
+            return state.widgetOpen;
+        }
+        state.lastVisibilitySource = source;
         state.widgetOpen = open === true;
         // 1.7.0：当前形态是悬浮窗歌词时，显隐作用在悬浮窗上；桌面歌词窗口保持隐藏，切回来再显示。
         if (state.surface === SURFACE_POPUP) {
@@ -3072,7 +3128,7 @@ module.exports = function activate(api) {
             else hidePopupWindow();
             persistWidgetOpen(state.widgetOpen);
             reportWidgetVisibility();
-            api.log.info(LOG_PREFIX + ' 悬浮窗歌词' + (state.widgetOpen ? '已显示' : '已隐藏（模组仍在运行）'));
+            api.log.info(LOG_PREFIX + ' 悬浮窗歌词' + (state.widgetOpen ? '已显示' : '已隐藏（模组仍在运行）') + '（来源：' + source + '）');
             return state.widgetOpen;
         }
         const widgetWindow = state.win;
@@ -3112,7 +3168,7 @@ module.exports = function activate(api) {
         }
         persistWidgetOpen(state.widgetOpen);
         reportWidgetVisibility();
-        api.log.info(LOG_PREFIX + ' 悬浮窗' + (state.widgetOpen ? '已显示' : '已隐藏（模组仍在运行）'));
+        api.log.info(LOG_PREFIX + ' 悬浮窗' + (state.widgetOpen ? '已显示' : '已隐藏（模组仍在运行）') + '（来源：' + source + '）');
         return state.widgetOpen;
     };
 
@@ -3197,7 +3253,7 @@ module.exports = function activate(api) {
             api.log.warn(LOG_PREFIX + ' 收到非本悬浮窗的关闭请求，已忽略');
             return;
         }
-        setWidgetOpen(false);
+        setWidgetOpen(false, 'desktop-close');
     };
 
     /** 默认位置：主显示器工作区底部中间。 */
@@ -3923,8 +3979,45 @@ module.exports = function activate(api) {
                 // 夹不了就算了，不影响显示。
             }
         };
-        popup.on('move', savePopupBounds);
-        popup.on('moved', clampPopupBounds);
+        /**
+         * 1.7.11：拖动时的「阻尼」。
+         * 用户要把窗口拖出屏幕时，不完全禁止（那会跟系统拖动循环硬顶、留下叠影），
+         * 而是把越界的那部分按 3.5 折往回带 —— 手上有阻力感，松手再由 clampPopupBounds 完全归位。
+         * 用 state.popupDamping 防重入：setBounds 会再触发一次 'move'，必须跳过那一轮。
+         */
+        const dampPopupOvershoot = () => {
+            if (!popup || popup.isDestroyed() || state.popupDamping) return;
+            try {
+                const bounds = popup.getBounds();
+                const area = screen.getDisplayMatching(bounds).workArea;
+                const maxX = Math.max(area.x, area.x + area.width - bounds.width);
+                const maxY = Math.max(area.y, area.y + area.height - bounds.height);
+                let x = bounds.x;
+                let y = bounds.y;
+                if (x < area.x) x = area.x - (area.x - x) * 0.35;
+                else if (x > maxX) x = maxX + (x - maxX) * 0.35;
+                if (y < area.y) y = area.y - (area.y - y) * 0.35;
+                else if (y > maxY) y = maxY + (y - maxY) * 0.35;
+                if (Math.round(x) !== bounds.x || Math.round(y) !== bounds.y) {
+                    state.popupDamping = true;
+                    popup.setBounds({ x: Math.round(x), y: Math.round(y), width: bounds.width, height: bounds.height }, false);
+                }
+            } catch (error) {
+                state.popupDamping = false;
+            }
+        };
+        popup.on('move', () => {
+            if (state.popupDamping) {
+                state.popupDamping = false;
+                return;
+            }
+            savePopupBounds();
+            dampPopupOvershoot();
+        });
+        popup.on('moved', () => {
+            state.popupDamping = false;
+            clampPopupBounds();
+        });
         popup.on('resize', savePopupBounds);
         popup.on('resized', clampPopupBounds);
 
@@ -4067,6 +4160,8 @@ module.exports = function activate(api) {
             return { ok: false, code: SURFACE_UNCHANGED, surface: state.surface };
         }
         state.surface = target;
+        // 1.7.11：记下切换时刻，用于忽略切换瞬间来自另一个窗口的残留「隐藏」指令。
+        state.surfaceSwitchedAt = Date.now();
         persistPopup('surface', state.surface);
         // 形态切换视为「我要看这个窗口」：之前用「词」按钮把窗口藏起来时，
         // 切换后必须把目标窗口显示出来，否则命令面板/按钮点了像没反应。
@@ -4087,13 +4182,19 @@ module.exports = function activate(api) {
             if (state.widgetOpen) {
                 ensureWidgetWindow();
                 if (state.win && !state.win.isDestroyed()) {
+                    const widgetWindow = state.win;
                     try {
-                        state.win.showInactive();
+                        // 1.7.11：切回桌面歌词走完整显示握手（和「词」按钮同一条路径）——
+                        // 之前直接 showInactive()，页面还是旧帧、悬停状态也可能停在穿透态，
+                        // 真机上会看到「闪旧句 / 窗口像消失了一样不可交互」。
+                        sendActionToClient({ action: 'request-sync' });
+                        applyWindowSize();
+                        widgetWindow.webContents.send(IPC_SHOW);
+                        waitForShown();
                     } catch (error) {
                         api.log.warn(LOG_PREFIX + ' 切回桌面歌词时显示窗口失败', error);
                     }
                     if (state.lastPayload) sendPayloadToWindow(state.lastPayload);
-                    sendActionToClient({ action: 'request-sync' });
                 }
             }
         }
@@ -4124,10 +4225,15 @@ module.exports = function activate(api) {
                 return;
             case 'hide':
                 // 右上角 ×：只隐藏窗口，模组继续跑；显示 / 隐藏由播放条按钮控制。
-                setWidgetOpen(false);
+                setWidgetOpen(false, 'popup-close');
                 return;
             case 'open-playlist': {
+                // 1.7.11：播放列表面板是宿主主窗口里的侧栏，Folia 在后台时它「打开」了也看不见，
+                // 所以转发之后再把宿主窗口带到前台；每一跳都打日志，方便真机定位断在哪。
+                api.log.info(LOG_PREFIX + ' 播放列表：收到悬浮窗指令，开始转发给 client');
                 sendActionToClient({ action: 'open-playlist' });
+                const focused = focusHostWindow();
+                api.log.info(LOG_PREFIX + ' 播放列表：转发完成，宿主窗口' + (focused ? '已带到前台' : '没找到，无法带到前台'));
                 return;
             }
             default: {
@@ -4169,6 +4275,26 @@ module.exports = function activate(api) {
             return;
         }
         for (const hostWindow of allWindows) trackHostWindow(hostWindow);
+    };
+
+    /**
+     * 1.7.11：把 Folia 主窗口带到前台。
+     * 播放列表面板是宿主主窗口里的侧栏 —— Folia 在后台时「打开」了也看不见，
+     * 用户只会觉得「播放列表按钮没反应」。返回值用于打日志。
+     */
+    const focusHostWindow = () => {
+        for (const hostWindow of state.hostWindows) {
+            if (!hostWindow || hostWindow.isDestroyed()) continue;
+            try {
+                if (hostWindow.isMinimized()) hostWindow.restore();
+                if (!hostWindow.isVisible()) hostWindow.show();
+                hostWindow.focus();
+                return true;
+            } catch (error) {
+                api.log.warn(LOG_PREFIX + ' 把宿主窗口带到前台失败', error);
+            }
+        }
+        return false;
     };
 
     /**
@@ -4402,7 +4528,7 @@ module.exports = function activate(api) {
 
     // 1.4.0：播放条「词」按钮。client 每点一次问一次显隐，主进程按当前状态取反，
     // 返回切换后的真值让按钮对齐（不信任 client 的本地翻转，避免两边跑偏）。
-    api.rpc.handle(RPC_TOGGLE_WIDGET, () => ({ visible: setWidgetOpen(!state.widgetOpen) }));
+    api.rpc.handle(RPC_TOGGLE_WIDGET, () => ({ visible: setWidgetOpen(!state.widgetOpen, 'progress-toggle') }));
     // 首帧对齐：client 激活时问一次。因为 widget-visibility 是 fire-and-forget，
     // main 先发、client 后监听的那一帧会丢，只靠推送按钮高亮会错。
     api.rpc.handle(RPC_WIDGET_STATE, () => ({
@@ -4412,6 +4538,19 @@ module.exports = function activate(api) {
         desktopMode: state.popupDesktop,
     }));
     // 1.7.0：悬浮窗歌词的桌面（穿透）模式开关。播放条按钮 / 全局快捷键都调这里。
+    // 1.7.11：client 那边播放列表打不开时回传一句提示，直接弹在悬浮窗歌词页面里。
+    api.rpc.handle(RPC_PLAYBACK_HINT, (payload) => {
+        const popup = popupAlive();
+        const text = payload && typeof payload.text === 'string' ? payload.text : '';
+        if (!popup || !text) return { ok: false };
+        try {
+            popup.webContents.send(IPC_POPUP_TOAST, text);
+            return { ok: true };
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 向悬浮窗歌词页面推送提示失败', error);
+            return { ok: false };
+        }
+    });
     api.rpc.handle(RPC_TOGGLE_DESKTOP_MODE, () => ({ desktopMode: togglePopupDesktop() }));
     // 1.5.0：配置真源在宿主的模组设置里，client 每次变化后整份推过来。
     // 这里只做校验与生效：改窗口高度、把整份配置转给页面；没变化就不动，免得每帧都重设尺寸。
