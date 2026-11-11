@@ -369,6 +369,10 @@ const DEFAULT_CONFIG = {
         backdrop: false,
         // 1.7.14：每秒重申置顶 + 重绘一帧，避免被无边框全屏窗口盖住 / 露出来是旧帧。
         keepOnTop: true,
+        // 1.8.1 逐字染色：默认关（1.5.0 那次默认开启的直接后果是「没词级时间的歌看起来像坏了」）。
+        karaoke: false,
+        sungColor: '#7dd3fc',
+        unsungOpacity: 0.55,
     },
     desktop: {
         // 1.6.2 起默认开启：用户要的就是「长句能读完」，默认关的话打开设置也看不出变化。
@@ -425,6 +429,14 @@ const normalizeConfig = (raw) => {
     config.shared.pausedDim = sharedSource.pausedDim === true;
     config.shared.backdrop = sharedSource.backdrop === true;
     config.shared.keepOnTop = sharedSource.keepOnTop !== false;
+    // 1.8.1 逐字染色：开关默认关；已唱色只认 #rrggbb；未唱透明度夹在 0.2–1（0 会让整句消失）。
+    config.shared.karaoke = sharedSource.karaoke === true;
+    if (typeof sharedSource.sungColor === 'string') {
+        const sungColor = sharedSource.sungColor.trim().toLowerCase();
+        if (/^#[0-9a-f]{6}$/.test(sungColor)) config.shared.sungColor = sungColor;
+    }
+    const unsungOpacity = toFiniteNumber(sharedSource.unsungOpacity);
+    if (unsungOpacity !== null) config.shared.unsungOpacity = clampNumber(unsungOpacity, 0.2, 1);
     if (desktopSource) config.desktop.marquee = desktopSource.marquee === true;
     return config;
 };
@@ -743,6 +755,18 @@ const WIDGET_HTML = `<!DOCTYPE html>
            量出来的宽度就和实际显示的字宽对不上（量出来偏窄 → 溢出偏小甚至为 0 → 不滚）。 */
         font: inherit;
         will-change: transform;
+    }
+    /* 1.8.1 逐字染色：每个词一个 span，只在「已唱 / 未唱」两态之间切 class，
+       颜色与透明度都来自 CSS 变量（和 1.5.0 的做法一致，避免每帧写行内样式）。 */
+    .word {
+        transition: color 0.1s linear, opacity 0.1s linear;
+    }
+    .word.is-unsung {
+        opacity: var(--unsung-opacity, 0.55);
+    }
+    .word.is-sung {
+        color: var(--sung-color, #7dd3fc);
+        opacity: 1;
     }
     /* 滚动中改成左对齐：从句子开头读起，滚到最后一段时刚好停在眼眶里。
        已经滚到底（is-scrolled-end）就交还给居中，免得滚动结束那一刻文字突然跳一下。 */
@@ -1225,6 +1249,13 @@ const applyConfig = (next) => {
     style.setProperty('--lyric-color', lyricColor);
     if (els.line) els.line.style.color = lyricColor;
     if (els.trans) els.trans.style.color = lyricColor;
+    // 1.8.1 逐字染色：已唱色只认 #rrggbb，未唱透明度夹在 0.2–1（和 main 侧 normalizeConfig 一致）。
+    const sungColor = /^#[0-9a-f]{6}$/i.test(String(current.sungColor || '')) ? String(current.sungColor).toLowerCase() : '#7dd3fc';
+    const unsungOpacity = Number.isFinite(Number(current.unsungOpacity))
+        ? Math.min(1, Math.max(0.2, Number(current.unsungOpacity)))
+        : 0.55;
+    style.setProperty('--sung-color', sungColor);
+    style.setProperty('--unsung-opacity', String(unsungOpacity));
     document.body.dataset.surface = current.surface;
     document.body.dataset.backdrop = String(current.backdrop === true);
     document.body.dataset.pausedDim = String(current.pausedDim === true);
@@ -1236,7 +1267,9 @@ const applyConfig = (next) => {
     // clientWidth / scrollWidth 全是最初那一下的值（往往是 0 或等待文案的宽度），
     // 量出来的滚动量就是错的。强制一次同步排版再量。
     void document.body.offsetHeight;
-    remeasureLyrics();
+    // 1.8.1：改设置（尤其逐字开关、颜色）要立刻反映到当前句上，重渲染一遍最稳。
+    if (lastPayload) render(lastPayload, lastPayloadReceivedAt);
+    else remeasureLyrics();
 };
 
 /** 这份快照里的 position 是「什么时候」的位置：优先用 client 打的 sentAt，缺了才退回收到时刻。 */
@@ -1260,6 +1293,89 @@ const positionNowFrom = (payload, receivedAt) => {
     if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > 30) return base;
     return base + elapsed;
 };
+
+/**
+ * 1.8.1：「现在」的歌词时钟（秒）。
+ * 逐字染色比的是歌词时钟（words.startTime 就是歌词时钟），而 payload.position 是媒体位置，
+ * 两者相差用户自己设的歌词偏移（client 已算好放在 payload.offsetSec）。
+ * 行号由 client 用「媒体位置 - 偏移」求得，页面若拿媒体位置去比词时间，偏移非 0 时必然错位。
+ */
+const lyricNowFrom = (payload, receivedAt) =>
+    positionNowFrom(payload, receivedAt) - (Number(payload && payload.offsetSec) || 0);
+
+// ---- 1.8.1 逐字染色（桌面歌词）----
+// 只在词级时间可用时启用；普通 LRC 一行只有一个词级时间，words 长度 1，直接退回整行渲染。
+let karaoke = null;
+
+const karaokeEnabled = () => config.shared.karaoke === true;
+
+const stopKaraoke = () => {
+    if (karaoke && karaoke.raf) cancelAnimationFrame(karaoke.raf);
+    karaoke = null;
+};
+
+const karaokeNow = () => (karaoke ? karaoke.base + (performance.now() - karaoke.startedAt) / 1000 : 0);
+
+/** 只切「已唱 / 未唱」两个 class，颜色与透明度交给 CSS 变量。 */
+const paintKaraokeAt = (time) => {
+    if (!karaoke) return;
+    for (const item of karaoke.spans) {
+        const sung = time >= item.start;
+        if (sung === item.sung) continue;
+        item.sung = sung;
+        item.el.classList.toggle('is-sung', sung);
+        item.el.classList.toggle('is-unsung', !sung);
+    }
+};
+
+const stepKaraoke = () => {
+    if (!karaoke) return;
+    paintKaraokeAt(karaokeNow());
+    karaoke.raf = requestAnimationFrame(stepKaraoke);
+};
+
+/** 返回 true 表示这一行已按逐字画好；false 让调用方退回整行文本。 */
+const renderKaraokeLine = (line, payload, receivedAt) => {
+    const words = line && Array.isArray(line.words) ? line.words : null;
+    if (!words || words.length < 2) {
+        stopKaraoke();
+        return false;
+    }
+    const key = String(line.text || '') + '|' + words.map((word) => word.startTime).join(',');
+    if (!karaoke || karaoke.key !== key) {
+        stopKaraoke();
+        els.lineTrack.textContent = '';
+        const spans = [];
+        for (const word of words) {
+            const span = document.createElement('span');
+            span.className = 'word is-unsung';
+            span.textContent = word.text;
+            els.lineTrack.appendChild(span);
+            spans.push({ el: span, start: word.startTime, sung: false });
+        }
+        karaoke = { key, spans, base: lyricNowFrom(payload, receivedAt), startedAt: performance.now(), raf: 0 };
+    } else {
+        // 同一行：拖动进度条 / 暂停恢复 / 改设置重渲染时，用新快照重设基准。
+        const position = lyricNowFrom(payload, receivedAt);
+        if (Math.abs(position - karaokeNow()) > 0.5) {
+            karaoke.base = position;
+            karaoke.startedAt = performance.now();
+        }
+    }
+    paintKaraokeAt(karaokeNow());
+    if (payload.state === 'playing') {
+        if (!karaoke.raf) karaoke.raf = requestAnimationFrame(stepKaraoke);
+    } else if (karaoke.raf) {
+        cancelAnimationFrame(karaoke.raf);
+        karaoke.raf = 0;
+    }
+    return true;
+};
+
+/** 窗口收起时页面不可见：停掉 rAF，回来按新快照重新接上。 */
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') stopKaraoke();
+});
 
 /**
  * 1.6.1 长句滚动（「走马灯」）。1.6.2 起默认开启；设置里关掉时长句照旧截断（尾部省略号）。
@@ -1460,7 +1576,8 @@ const secondsLeftForLine = (line, payload) => {
     const end = Number(line && line.endTime);
     // 1.6.3：位置取「现在」，不是快照里那个时刻的位置。config 变化后的重量、下一拍补量都会走到这里，
     // 用快照的旧 position 会把剩余时间算长（滚动变慢），甚至算成负数。
-    const position = positionNowFrom(payload, lastPayloadReceivedAt);
+    // 1.8.1：剩余时间按「歌词时钟」算（line.endTime 是歌词时钟，payload.position 是媒体位置）。
+    const position = lyricNowFrom(payload, lastPayloadReceivedAt);
     if (!Number.isFinite(end) || !Number.isFinite(position)) return MARQUEE_DEFAULT_SECONDS;
     const left = end - position;
     // 只有「还没唱完」才用剩余时间反推速度。句间、刚换句时 endTime 可能已经过去（剩余为负），
@@ -1542,7 +1659,11 @@ const render = (payload, receivedAt) => {
         ' title="' + ((payload.song && payload.song.title) || '') + '"',
     );
     // 1.6.7：没歌词 / 还没到第一句时换文案；其余（含空字符串）都用快照里的文本。
-    els.lineTrack.textContent = lyricTextOf(payload);
+    // 1.8.1：逐字染色开启且有词级时间时，轨道里改成「每个词一个 span」；否则整行文本。
+    if (!(karaokeEnabled() && line.index >= 0 && renderKaraokeLine(line, payload, receivedAt))) {
+        stopKaraoke();
+        els.lineTrack.textContent = lyricTextOf(payload);
+    }
     // 暂停变淡要知道播放状态；只认 playing，其他都当暂停。
     document.body.dataset.playback = typeof payload.state === 'string' ? payload.state : 'paused';
     // 1.7.0：暂停时把长句滚动一起停下，恢复播放再从当前位置继续。
@@ -2088,6 +2209,12 @@ body[data-desktop="true"] .topbar { visibility: hidden; }
 .row.current { opacity: 1; font-weight: 600; }
 .row.current .row-text { display: inline-block; text-overflow: clip; will-change: transform; }
 .row.current .row-sub { text-overflow: clip; }
+/* 1.8.1：当前句在横向滚动时改成左对齐 —— 居中会把句子开头裁掉，第一秒就看不到从哪开始。 */
+.row.current.is-scrolling { text-align: left; }
+/* 1.8.1 逐字染色：只在「已唱 / 未唱」两态之间切 class，颜色与透明度来自 CSS 变量。 */
+.word { transition: color 0.1s linear, opacity 0.1s linear; }
+.word.is-unsung { opacity: var(--unsung-opacity, 0.55); }
+.word.is-sung { color: var(--sung-color, #7dd3fc); opacity: 1; }
 
 /* 桌面模式（点击穿透）下唯一可点的「退出」键：默认隐藏，光标压上来才亮。 */
 .playlist {
@@ -2280,7 +2407,7 @@ let volumeDragging = false;
 let volumeTimer = null;
 let lastVolumeSent = null;
 let popupLayout = 'text';
-let config = { shared: { popupFontSize: ${POPUP_FONT_SIZE_DEFAULT}, popupColor: '#eaf6ff' } };
+let config = { shared: { popupFontSize: ${POPUP_FONT_SIZE_DEFAULT}, popupColor: '#eaf6ff', karaoke: false, sungColor: '#7dd3fc', unsungOpacity: 0.55 } };
 // 滚动歌词的几何量：每次 fitLayout 重算。
 let geometry = { size: 24, lineHeight: 36, gap: 23, lineUnit: 36, rows: 1 };
 // 上一次渲染窗口的起点与行数，用来算「这次该往哪边滑」。
@@ -2317,7 +2444,22 @@ const applyConfig = (next) => {
     const color = typeof shared.popupColor === 'string' && /^#[0-9a-f]{6}$/i.test(shared.popupColor.trim())
         ? shared.popupColor.trim().toLowerCase()
         : '#eaf6ff';
-    config = { shared: { popupFontSize: clamped, popupColor: color } };
+    config = {
+        shared: {
+            popupFontSize: clamped,
+            popupColor: color,
+            // 1.8.1：逐字染色沿用同一套设置（两个窗口一起生效）。
+            karaoke: shared.karaoke === true,
+            sungColor: typeof shared.sungColor === 'string' && /^#[0-9a-f]{6}$/i.test(shared.sungColor.trim())
+                ? shared.sungColor.trim().toLowerCase()
+                : '#7dd3fc',
+            unsungOpacity: Number.isFinite(Number(shared.unsungOpacity))
+                ? Math.min(1, Math.max(0.2, Number(shared.unsungOpacity)))
+                : 0.55,
+        },
+    };
+    document.documentElement.style.setProperty('--sung-color', config.shared.sungColor);
+    document.documentElement.style.setProperty('--unsung-opacity', String(config.shared.unsungOpacity));
     applyPopupColor(color);
     fitLayout();
 };
@@ -2334,59 +2476,228 @@ const lyricTextOf = (payload) => {
     return text || WAITING_TEXT;
 };
 
-/** 把「上一句 / 当前句 / 下一句 …」整体上滑或下滑一段，模拟跟唱滚动。 */
+/** 读当前 translateY（动画中间也能读到真实值，用来做「不打架」的续接）。 */
+const readRowsShift = () => {
+    if (!els.rows) return 0;
+    const transform = getComputedStyle(els.rows).transform;
+    if (!transform || transform === 'none') return 0;
+    const match = transform.match(/matrix(?:3d)?\(([^)]+)\)/);
+    if (!match) return 0;
+    const parts = match[1].split(',').map((value) => Number(value));
+    if (parts.length === 16) return Number.isFinite(parts[13]) ? parts[13] : 0;
+    return Number.isFinite(parts[5]) ? parts[5] : 0;
+};
+
+/**
+ * 把「上一句 / 当前句 / 下一句 …」整体上滑或下滑一段，模拟跟唱滚动。
+ * 1.8.1 三处改动（真机反馈「切句动画很突出很刺眼」）：
+ *  - 位移接得上：起点 = 当前实际位置 + 这次该走的量，动画被打断也不会瞬移（旧版只写 delta×step，
+ *    上一段动画没走完就重建 DOM，画面会跳一下）；
+ *  - 跳多行不飞：点歌 / 拖进度 / 尺寸变化时 delta 可能有十几行，整屏飞行非常刺眼 —— 直接落位；
+ *  - 距离越远时长略长：固定 0.24s 走 2 行和走 1 行的瞬时速度差一倍，按距离给 0.13–0.26s。
+ */
 const scrollRows = (deltaLines) => {
     if (!els.rows || !deltaLines) return;
     const step = geometry.lineUnit + geometry.gap;
-    els.rows.classList.remove('anim');
-    els.rows.style.transform = 'translateY(' + (deltaLines * step) + 'px)';
+    const shift = readRowsShift();
+    const start = shift + deltaLines * step;
+    // 跳多行 / 位移太大：不做动画，直接落到最终位置。
+    if (Math.abs(deltaLines) > 1 || Math.abs(start) > step * 1.6) {
+        els.rows.style.transition = 'none';
+        els.rows.style.transform = 'translateY(0)';
+        return;
+    }
+    const distance = Math.abs(start);
+    const duration = Math.min(0.26, Math.max(0.13, distance / 900));
+    els.rows.style.transition = 'none';
+    els.rows.style.transform = 'translateY(' + start.toFixed(2) + 'px)';
     void els.rows.offsetHeight;
-    els.rows.classList.add('anim');
     requestAnimationFrame(() => {
         if (!els.rows) return;
+        els.rows.style.transition = 'transform ' + duration.toFixed(3) + 's cubic-bezier(0.22, 0.72, 0.3, 1)';
         els.rows.style.transform = 'translateY(0)';
     });
 };
 
-/** 当前句太长时横向缓慢滚动（速度保守，46px/s）。 */
+/* ---- 1.8.1：当前句横向滚动（改成和桌面歌词同一套节奏）----
+ * 1.7.8 那版速度写死 46px/s、滚到底硬跳回开头再滚一遍 —— 真机上就是「一抖一抖」。
+ * 现在和桌面歌词共用同一套参数：
+ *  - 句首留 MARQUEE_LEAD_IN 秒让人读完，句尾留 MARQUEE_TAIL 秒；
+ *  - 速度 = max(按剩余可唱时间反推, 溢出 ÷ MARQUEE_SCROLL_SECONDS)，上限 MARQUEE_MAX_SPEED；
+ *  - 滚到底就停住（保持最后一段可见），不回头；
+ *  - 暂停时收掉 rAF，恢复播放从当前偏移接着走。
+ */
+const MARQUEE_LEAD_IN = 1.2;
+const MARQUEE_TAIL = 0.15;
+const MARQUEE_MAX_SPEED = 190;
+const MARQUEE_MIN_OVERFLOW = 6;
+const MARQUEE_SCROLL_SECONDS = 0.2;
+const MARQUEE_DEFAULT_SECONDS = 8;
+
+/** 把「快照位置」折算成现在的歌词时钟（秒）：媒体位置 - 用户偏移 + 已流逝时间。 */
+const popupLyricNow = (payload) => {
+    const base = Number(payload && payload.position);
+    const offset = Number(payload && payload.offsetSec) || 0;
+    if (!Number.isFinite(base)) return 0;
+    if (!payload || payload.state !== 'playing') return base - offset;
+    const sentAt = Number(payload.sentAt);
+    const anchor = Number.isFinite(sentAt) && sentAt > 0 ? sentAt : Date.now();
+    const elapsed = (Date.now() - anchor) / 1000;
+    const now = Number.isFinite(elapsed) && elapsed >= 0 && elapsed <= 30 ? base + elapsed : base;
+    return now - offset;
+};
+
 const stopMarquee = () => {
-    if (marqueeState) {
-        if (marqueeState.raf) cancelAnimationFrame(marqueeState.raf);
-        marqueeState = null;
+    if (!marqueeState) return;
+    if (marqueeState.raf) cancelAnimationFrame(marqueeState.raf);
+    if (marqueeState.view) marqueeState.view.classList.remove('is-scrolling');
+    if (marqueeState.el) marqueeState.el.style.transform = '';
+    marqueeState = null;
+};
+
+const stepMarquee = (now) => {
+    if (!marqueeState) return;
+    const state = marqueeState;
+    // 暂停：收掉循环；恢复播放时由 ensureMarqueeStep 从当前偏移继续。
+    if (!lastPayload || lastPayload.state !== 'playing') {
+        state.raf = 0;
+        state.lastAt = 0;
+        return;
     }
+    const dt = state.lastAt ? Math.min(0.1, (now - state.lastAt) / 1000) : 0;
+    state.lastAt = now;
+    if (state.delay > 0) {
+        state.delay = Math.max(0, state.delay - dt);
+        state.raf = requestAnimationFrame(stepMarquee);
+        return;
+    }
+    state.offset = Math.min(state.overflow, state.offset + state.speed * dt);
+    state.el.style.transform = 'translateX(' + (-state.offset).toFixed(2) + 'px)';
+    if (state.offset >= state.overflow) {
+        // 滚到底停住：保持最后一段露在眼眶里，不跳回开头。
+        state.done = true;
+        state.raf = 0;
+        return;
+    }
+    state.raf = requestAnimationFrame(stepMarquee);
+};
+
+const ensureMarqueeStep = () => {
+    if (!marqueeState || marqueeState.done || marqueeState.raf) return;
+    if (!lastPayload || lastPayload.state !== 'playing') return;
+    marqueeState.lastAt = 0;
+    marqueeState.raf = requestAnimationFrame(stepMarquee);
 };
 
 const measureMarquee = () => {
     stopMarquee();
-    const current = els.rows && els.rows.querySelector('.row.current .row-text');
-    if (!current) return;
-    current.style.transform = 'translateX(0)';
-    const overflow = current.scrollWidth - current.parentElement.clientWidth;
-    if (!Number.isFinite(overflow) || overflow < 8) return;
-    marqueeState = { overflow, offset: 0, raf: 0, lastAt: 0, holdUntil: performance.now() + 1400 };
-    const step = (now) => {
-        if (!marqueeState) return;
-        const state = marqueeState;
-        if (!state.lastAt) state.lastAt = now;
-        const dt = Math.min(0.1, (now - state.lastAt) / 1000);
-        state.lastAt = now;
-        if (lastPayload && lastPayload.state !== 'playing') {
-            state.raf = requestAnimationFrame(step);
-            return;
-        }
-        if (now < state.holdUntil) {
-            state.raf = requestAnimationFrame(step);
-            return;
-        }
-        state.offset += 46 * dt;
-        if (state.offset >= state.overflow) {
-            state.offset = 0;
-            state.holdUntil = now + 1200;
-        }
-        current.style.transform = 'translateX(' + (-state.offset).toFixed(2) + 'px)';
-        state.raf = requestAnimationFrame(step);
+    const view = els.rows && els.rows.querySelector('.row.current');
+    const el = view && view.querySelector('.row-text');
+    if (!view || !el) return;
+    const available = view.clientWidth;
+    if (!available) return;
+    const overflow = el.scrollWidth - available;
+    if (!Number.isFinite(overflow) || overflow < MARQUEE_MIN_OVERFLOW) return;
+    // 这一句还剩多少秒可唱：算不出来（句间 / 时间戳缺失 / 已过）就给宽裕值，
+    // 否则预算会被夹到 0.9 秒、速度顶到上限，肉眼看就是「闪一下没了」。
+    let availableSeconds = MARQUEE_DEFAULT_SECONDS;
+    const end = Number(lastPayload && lastPayload.line && lastPayload.line.endTime);
+    if (Number.isFinite(end)) {
+        const left = end - popupLyricNow(lastPayload);
+        if (left > 0) availableSeconds = left;
+    }
+    const budget = Math.max(0.9, availableSeconds - MARQUEE_LEAD_IN - MARQUEE_TAIL);
+    const needed = overflow / budget;
+    const neededSlow = overflow / MARQUEE_SCROLL_SECONDS;
+    marqueeState = {
+        view,
+        el,
+        overflow,
+        offset: 0,
+        speed: Math.min(MARQUEE_MAX_SPEED, Math.max(needed, neededSlow)),
+        delay: MARQUEE_LEAD_IN,
+        done: false,
+        raf: 0,
+        lastAt: 0,
     };
-    marqueeState.raf = requestAnimationFrame(step);
+    view.classList.add('is-scrolling');
+    el.style.transform = 'translateX(0)';
+    ensureMarqueeStep();
+};
+
+// ---- 1.8.1 逐字染色（悬浮窗当前句）----
+let popupKaraoke = null;
+
+const stopPopupKaraoke = () => {
+    if (popupKaraoke && popupKaraoke.raf) cancelAnimationFrame(popupKaraoke.raf);
+    popupKaraoke = null;
+};
+
+const popupKaraokeNow = () => (popupKaraoke ? popupKaraoke.base + (performance.now() - popupKaraoke.startedAt) / 1000 : 0);
+
+const paintPopupKaraokeAt = (time) => {
+    if (!popupKaraoke) return;
+    for (const item of popupKaraoke.spans) {
+        const sung = time >= item.start;
+        if (sung === item.sung) continue;
+        item.sung = sung;
+        item.el.classList.toggle('is-sung', sung);
+        item.el.classList.toggle('is-unsung', !sung);
+    }
+};
+
+const stepPopupKaraoke = () => {
+    if (!popupKaraoke) return;
+    paintPopupKaraokeAt(popupKaraokeNow());
+    if (!lastPayload || lastPayload.state !== 'playing') {
+        popupKaraoke.raf = 0;
+        return;
+    }
+    popupKaraoke.raf = requestAnimationFrame(stepPopupKaraoke);
+};
+
+/** 把当前行的文本换成「每个词一个 span」；没词级时间就保持整行文本。 */
+const paintCurrentKaraoke = (payload) => {
+    stopPopupKaraoke();
+    if (config.shared.karaoke !== true) return;
+    const line = payload && payload.line ? payload.line : null;
+    const words = line && Array.isArray(line.words) ? line.words : null;
+    if (!words || words.length < 2) return;
+    const view = els.rows && els.rows.querySelector('.row.current');
+    const el = view && view.querySelector('.row-text');
+    if (!el) return;
+    el.textContent = '';
+    const spans = [];
+    for (const word of words) {
+        const span = document.createElement('span');
+        span.className = 'word is-unsung';
+        span.textContent = word.text;
+        el.appendChild(span);
+        spans.push({ el: span, start: word.startTime, sung: false });
+    }
+    popupKaraoke = { spans, base: popupLyricNow(payload), startedAt: performance.now(), raf: 0 };
+    paintPopupKaraokeAt(popupKaraoke.base);
+    if (payload.state === 'playing') popupKaraoke.raf = requestAnimationFrame(stepPopupKaraoke);
+};
+
+/** 播放状态变化时同步：暂停收掉 rAF，恢复且还没滚完就接着走。 */
+const syncPopupMotion = () => {
+    if (!lastPayload || lastPayload.state !== 'playing') {
+        if (popupKaraoke && popupKaraoke.raf) {
+            cancelAnimationFrame(popupKaraoke.raf);
+            popupKaraoke.raf = 0;
+        }
+        if (marqueeState && marqueeState.raf) {
+            cancelAnimationFrame(marqueeState.raf);
+            marqueeState.raf = 0;
+            marqueeState.lastAt = 0;
+        }
+        return;
+    }
+    ensureMarqueeStep();
+    if (popupKaraoke && !popupKaraoke.raf) {
+        popupKaraoke.raf = requestAnimationFrame(stepPopupKaraoke);
+    }
 };
 
 /**
@@ -2416,6 +2727,7 @@ const paintRows = (payload) => {
         const textNode = els.rows.querySelector('.row-text');
         if (textNode) textNode.textContent = lyricTextOf(payload);
         lastWindow = { offset: 0, count: 1, step: 0 };
+        stopPopupKaraoke();
         return;
     }
     const currentIndex = payload.line && Number.isFinite(payload.line.index) ? payload.line.index : -1;
@@ -2459,6 +2771,8 @@ const paintRows = (payload) => {
         break geoUpdate;
     }
     lastWindow = { offset: win.offset, count: win.count, step: geometry.lineUnit + geometry.gap };
+    // 1.8.1：当前句换成 span 后再量滚动（重建 DOM 之后量，宽度才准）。
+    paintCurrentKaraoke(payload);
     requestAnimationFrame(measureMarquee);
 };
 
@@ -2466,6 +2780,8 @@ const render = (payload) => {
     if (!payload || typeof payload !== 'object') return;
     lastPayload = payload;
     paintRows(payload);
+    // 1.8.1：暂停时收掉横向滚动与逐字染色的 rAF，恢复播放接着走。
+    syncPopupMotion();
     const playing = payload.state === 'playing';
     setIcon(els.toggle, playing ? 'pause' : 'play');
     els.toggle.title = playing ? '暂停' : '播放';
@@ -2599,8 +2915,28 @@ const showToast = (text) => {
     }, 2400);
 };
 /** 1.7.12：播放列表面板。数据由 client 读宿主队列后经主进程转过来（IPC_POPUP_PLAYLIST）。 */
+// 1.8.1：面板刷新时的定位状态。
+//  - playlistFocusPending：刚打开面板 → 第一次拿到数据要滚到当前歌；
+//  - playlistLastCurrent：上一次渲染时的当前歌下标，用来判断「当前歌变了」还是「只是刷新」。
+let playlistFocusPending = false;
+let playlistLastCurrent = -2;
+
+/** 把某一行的中线对齐到列表中线（不依赖 offsetParent，position 怎么改都成立）。 */
+const centerPlaylistRow = (row) => {
+    const list = els.playlistList;
+    if (!list || !row) return;
+    const listRect = list.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    const offset = rowRect.top - listRect.top;
+    list.scrollTop += offset - (list.clientHeight - rowRect.height) / 2;
+};
+
 const renderPlaylist = (data) => {
     if (!els.playlistList) return;
+    const previousScrollTop = els.playlistList.scrollTop;
+    const currentIndex = data && Number.isFinite(data.currentIndex) ? data.currentIndex : -1;
+    // 刷新（当前歌没变）时保留用户自己的滚动位置，别每次都弹回当前歌。
+    const keepScroll = !playlistFocusPending && currentIndex === playlistLastCurrent;
     els.playlistList.textContent = '';
     const items = data && Array.isArray(data.items) ? data.items : [];
     if (!items.length) {
@@ -2608,12 +2944,22 @@ const renderPlaylist = (data) => {
         empty.className = 'playlist-empty';
         empty.textContent = data && data.kind === 'stage' ? '外部播放中，无队列' : '播放队列是空的';
         els.playlistList.appendChild(empty);
+        playlistLastCurrent = currentIndex;
+        playlistFocusPending = false;
         return;
     }
-    const currentIndex = data && Number.isFinite(data.currentIndex) ? data.currentIndex : -1;
+    // 1.8.1：当前歌不在队列里（外部舞台 / FM / 队列被清空）时给一行提示，别让用户以为没高亮是坏了。
+    if (currentIndex < 0) {
+        const hint = document.createElement('div');
+        hint.className = 'playlist-empty';
+        hint.textContent = '当前播放不在队列中';
+        els.playlistList.appendChild(hint);
+    }
+    let currentRow = null;
     for (const item of items) {
         const row = document.createElement('div');
         row.className = 'playlist-item' + (item.index === currentIndex ? ' current' : '');
+        if (item.index === currentIndex) currentRow = row;
         const num = document.createElement('span');
         num.className = 'pl-index';
         num.textContent = String(item.index + 1);
@@ -2634,17 +2980,29 @@ const renderPlaylist = (data) => {
                 node.classList.remove('current');
             }
             row.classList.add('current');
+            // 点中的行自己滚到中间：用户点的大概率离视野中心不远，这一步只是确认。
+            centerPlaylistRow(row);
             setTimeout(() => {
                 if (els.playlistPanel && !els.playlistPanel.hidden) sendCommand({ type: 'playlist' });
             }, 500);
         });
         els.playlistList.appendChild(row);
     }
+    playlistLastCurrent = currentIndex;
+    if (keepScroll) {
+        els.playlistList.scrollTop = previousScrollTop;
+    } else if (currentRow) {
+        // 1.8.1：打开面板 / 换歌之后滚到当前歌，原来永远停在第一行。
+        centerPlaylistRow(currentRow);
+    }
+    playlistFocusPending = false;
 };
 
 const openPlaylistPanel = () => {
     if (!els.playlistPanel) return;
     els.playlistPanel.hidden = false;
+    // 1.8.1：每次打开都重新定位到当前歌（而不是记住上次的滚动位置）。
+    playlistFocusPending = true;
     if (els.playlistList) {
         els.playlistList.textContent = '';
         const loading = document.createElement('div');

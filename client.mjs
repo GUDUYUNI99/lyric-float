@@ -404,6 +404,23 @@ const readContext = (lines, lineIndex) => {
  * 调用方传进来的 index 已经是 resolveLineIndex 解析过的行号（句间也指向上一句），
  * 只有「什么都没得显示」时才是 -1。
  */
+/**
+ * 1.8.1 逐字歌词：把宿主的 words 收窄成页面要的最小形状。
+ * 宿主保证 `FoliumLine.words` 一定存在（mods/folium.d.ts:136：没有词级时间的行就是「整行一个词」），
+ * 所以这里不做 null 特判 —— 词数 < 2 时由页面自行退回整行渲染。
+ * 只带 text 与 startTime：染色只看「到没到这个词的起点」。
+ */
+const projectWords = (words) => {
+    if (!Array.isArray(words) || words.length === 0) return null;
+    const out = [];
+    for (const word of words) {
+        if (!word || typeof word.text !== 'string') continue;
+        const start = Number(word.startTime);
+        out.push({ text: word.text, startTime: Number.isFinite(start) ? start : 0 });
+    }
+    return out.length ? out : null;
+};
+
 const readLine = (folium, lines, index, time) => {
     const safeLines = Array.isArray(lines) ? lines : [];
     const line = index >= 0 ? safeLines[index] : null;
@@ -417,6 +434,7 @@ const readLine = (folium, lines, index, time) => {
             romanization: null,
             startTime: null,
             endTime: null,
+            words: null,
         };
     }
     return {
@@ -426,6 +444,8 @@ const readLine = (folium, lines, index, time) => {
         romanization: line.romanization ?? null,
         startTime: line.startTime,
         endTime: line.endTime,
+        // 1.8.1：逐字歌词用。context 里的行不带（±20 句都带会把 payload 撑大几十倍）。
+        words: projectWords(line.words),
     };
 };
 
@@ -467,6 +487,9 @@ const buildPayload = (folium, view, playSessionId) => {
         context: readContext(view.lines, view.lineIndex),
         // 1.6.7：页面据此区分「等待播放 / 歌词还在加载 / 这首歌没歌词 / 还没到第一句」。
         lineStatus: view.lineStatus,
+        // 1.8.1：用户自己设的歌词偏移（秒）。页面要用它把「媒体位置」折算成「歌词时钟」，
+        // 逐字染色比的是歌词时钟（words.startTime 就是歌词时钟，见 mods/folium.d.ts）。
+        offsetSec: Number.isFinite(view.offsetSec) ? view.offsetSec : 0,
         theme: readTheme(folium, view.theme),
         // 这份 position 是「什么时候」的位置。页面在配置变化后要用旧快照重渲染，只有靠它才能
         // 把「上次内容变化那一刻的位置」换算成「现在」（见 main.cjs 页面的 positionNowFrom）。
@@ -529,7 +552,15 @@ const readPlaylistAndSend = (folium) => {
             reportPlaybackHint(folium, '当前 Folia 版本不支持读取播放列表');
             return;
         }
-        const snapshot = playback.getQueue({ offset: 0, limit: 200 });
+        // 1.8.1：先单独读一次「元信息」，再按当前歌所在位置拉一页。
+        // 原来固定 offset:0/limit:200，队列超过 200 首时当前歌根本不在这一页里，
+        // 悬浮窗面板也就永远「找不到当前歌曲」。
+        const meta = playback.getQueue({ offset: 0, limit: 1 });
+        const length = Number(meta && meta.length) || 0;
+        const currentIndex = meta && Number.isFinite(meta.currentIndex) ? meta.currentIndex : -1;
+        const PAGE = 200;
+        const pageOffset = Math.max(0, Math.min(Math.max(0, length - PAGE), (currentIndex >= 0 ? currentIndex : 0) - Math.floor(PAGE / 2)));
+        const snapshot = playback.getQueue({ offset: pageOffset, limit: PAGE });
         const items = (snapshot.items || []).map((item) => ({
             index: item.index,
             title: item.song && typeof item.song.title === 'string' ? item.song.title : '',
@@ -538,7 +569,8 @@ const readPlaylistAndSend = (folium) => {
         pushPlaylistData(folium, {
             kind: snapshot.kind || 'queue',
             length: Number(snapshot.length) || items.length,
-            currentIndex: Number.isFinite(snapshot.currentIndex) ? snapshot.currentIndex : -1,
+            currentIndex: Number.isFinite(snapshot.currentIndex) ? snapshot.currentIndex : currentIndex,
+            offset: pageOffset,
             items,
         });
     } catch (error) {
@@ -1161,6 +1193,42 @@ const buildSettingsSection = () => ({
             defaultValue: '#eaf6ff',
         },
         {
+            key: 'karaoke',
+            type: 'boolean',
+            label: L('逐字染色', 'Word-by-word coloring'),
+            description: L(
+                '注意：只有歌词本身带逐字时间轴时才看得出效果，普通 LRC 一行一个词时间，看起来仍是整行同时变色。',
+                'Only lyrics that carry per-word timing show the effect; plain LRC lines keep one timing for the whole line.',
+            ),
+            group: L('通用', 'Shared'),
+            defaultValue: false,
+        },
+        {
+            key: 'sungColor',
+            type: 'color',
+            label: L('已唱字颜色', 'Sung word color'),
+            description: L(
+                '逐字染色开启时，已经唱到的字用这个颜色，其余字保持歌词颜色并降低透明度。',
+                'When word-by-word coloring is on, sung words use this color; the rest keep the lyric color at reduced opacity.',
+            ),
+            group: L('通用', 'Shared'),
+            defaultValue: '#7dd3fc',
+        },
+        {
+            key: 'unsungOpacity',
+            type: 'number',
+            label: L('未唱字透明度', 'Unsung word opacity'),
+            description: L(
+                '0.2–1，越小未唱的字越淡。',
+                '0.2-1; lower makes unsung words fainter.',
+            ),
+            group: L('通用', 'Shared'),
+            defaultValue: 0.55,
+            min: 0.2,
+            max: 1,
+            step: 0.05,
+        },
+        {
             key: 'fontMode',
             type: 'select',
             label: L('字体来源', 'Font source'),
@@ -1299,6 +1367,10 @@ const readConfigFromHandle = (handle) => {
             pausedDim: values.pausedDim === true,
             keepOnTop: values.keepOnTop !== false,
             backdrop: values.backdrop === true,
+            // 1.8.1 逐字染色：默认关，只有明确 true 才开。
+            karaoke: values.karaoke === true,
+            sungColor: typeof values.sungColor === 'string' ? values.sungColor : '#7dd3fc',
+            unsungOpacity: toNumber(values.unsungOpacity, 0.55),
         },
         desktop: {
             marquee: values.marquee === true,
