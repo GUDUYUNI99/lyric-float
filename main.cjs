@@ -3164,6 +3164,8 @@ module.exports = function activate(api) {
         reportedDesktop: null,
         // 1.7.14：置顶重申 / 强制重绘的定时器（见 startTopmostWatch）。
         topmostTick: null,
+        // 1.8.2：焦点监听是否已挂上（启动、重新上屏都会调 startTopmostWatch，靠它避免重复挂）。
+        focusBound: false,
         // 正在 new 悬浮窗歌词窗口：构造期会同步触发 browser-window-created，用它把自己排除掉。
         creatingPopup: false,
     };
@@ -3700,9 +3702,6 @@ module.exports = function activate(api) {
     const showWidgetWindow = (force) => {
         const widgetWindow = state.win;
         cancelShownWait();
-        // 1.7.14：停掉置顶重申定时器与焦点监听。
-        stopTopmostWatch();
-        app.removeListener('browser-window-focus', onAppFocus);
         // 期间被关掉 / 被销毁 / 模组已停用：不再上屏。
         if (!widgetWindow || widgetWindow.isDestroyed() || !state.widgetOpen || state.disposed) return;
         try {
@@ -3718,6 +3717,11 @@ module.exports = function activate(api) {
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 显示悬浮窗失败', error);
         }
+        // 1.8.2：这里原来挂着 stopTopmostWatch()（1.7.14 的清理逻辑被放错了位置），
+        // 于是窗口每显示一次，每秒重申置顶 + 重绘的定时器就被停掉、再也没人启动 →
+        // 之后再被别的置顶窗口压住就不回来了（真机上表现为「点固定后窗口消失」）。
+        // 现在改成：显示之后确保定时器在跑（startTopmostWatch 自己幂等）。
+        startTopmostWatch();
     };
 
     /** 等页面回 IPC_SHOWN；超时就兜底上屏，宁可闪一下也不能让「词」按钮点了没反应。 */
@@ -3876,6 +3880,11 @@ module.exports = function activate(api) {
             clearInterval(state.topmostTick);
             state.topmostTick = null;
         }
+        // 1.8.2：焦点监听跟定时器一起登记、一起撤，避免重复挂监听。
+        if (state.focusBound) {
+            app.removeListener('browser-window-focus', onAppFocus);
+            state.focusBound = false;
+        }
     };
 
     const startTopmostWatch = () => {
@@ -3887,6 +3896,10 @@ module.exports = function activate(api) {
             }
             reassertTopmost();
         }, TOPMOST_REFRESH_MS);
+        if (!state.focusBound) {
+            app.on('browser-window-focus', onAppFocus);
+            state.focusBound = true;
+        }
     };
 
     /** 应用/窗口重新获得焦点时立刻补一次：alt-tab 回来、全屏应用退出后能马上回到最上层。 */
@@ -4120,7 +4133,15 @@ module.exports = function activate(api) {
             // showInactive：悬浮歌词不该把键盘焦点从主窗口/别的应用抢走。
             // 1.4.0：上次退出时是「关掉」状态就别显示，窗口建好先留着（播放条「词」按钮随时叫醒）。
             // 1.7.0：当前形态是悬浮窗歌词时也不上屏，由 applySurface / 启动逻辑负责摆窗口。
-            if (!widgetWindow.isDestroyed() && state.widgetOpen && state.surface === SURFACE_DESKTOP) widgetWindow.showInactive();
+            const shouldShow = !widgetWindow.isDestroyed() && state.widgetOpen && state.surface === SURFACE_DESKTOP;
+            // 1.8.2：启动时就该上屏却不上屏，是「窗口消失」的高频原因，把判断依据记下来。
+            api.log.info(LOG_PREFIX + ' 悬浮窗就绪', JSON.stringify({
+                shouldShow,
+                widgetOpen: state.widgetOpen,
+                surface: state.surface,
+                pinned: state.pinned,
+            }));
+            if (shouldShow) widgetWindow.showInactive();
             // 恢复的坐标可能正好压在任务栏上：立刻提升一次，别等 500ms 后的第一次轮询。
             if (taskbarGuard && !widgetWindow.isDestroyed()) taskbarGuard.tick();
         });
@@ -5061,7 +5082,24 @@ module.exports = function activate(api) {
         if (state.hoverTick) state.hoverTick();
         // 固定/解锁之后立刻补一帧重绘：老版本在真机上「点固定键窗口就消失」，
         // 现象更像合成面没刷新而不是窗口被关掉（日志里没有任何隐藏/销毁记录）。
+        const wasOnTop = state.win.isAlwaysOnTop();
+        const wasVisible = state.win.isVisible();
         nudgeWidgetRepaint();
+        // 1.8.2：顺手立刻重申一次置顶（原来是等每秒的周期 tick，最多要等 1 秒）。
+        reassertTopmost();
+        // 1.8.2：把现场记进日志。真机上「点固定键窗口消失」有两条互斥的可能——
+        // ①合成面没刷新（窗口还在、还置顶，只是不画）②窗口被别的置顶窗口压住 / 被隐藏。
+        // 没有这几行就分不清是哪种，只能猜。
+        api.log.info(LOG_PREFIX + ' 固定状态变更', JSON.stringify({
+            pinned: state.pinned,
+            wasVisible,
+            visible: !state.win.isDestroyed() && state.win.isVisible(),
+            wasOnTop,
+            onTop: !state.win.isDestroyed() && state.win.isAlwaysOnTop(),
+            surface: state.surface,
+            keepOnTop: !!(state.config && state.config.shared.keepOnTop),
+            topmostWatch: !!state.topmostTick,
+        }));
         if (!state.persisted) return;
         state.persisted.pinned = state.pinned;
         savePersistedState();
@@ -5238,6 +5276,20 @@ module.exports = function activate(api) {
         }
         // 1.5.1：停用时不留下「等握手」的计时器，否则 300ms 后会去 show 一个已销毁的窗口。
         cancelShownWait();
+        // 1.8.2：停掉每秒「重申置顶 + 重绘」的定时器与焦点监听。
+        // （1.7.14 这段清理被放错到了 showWidgetWindow 里，导致窗口每显示一次就永久失去置顶重申。）
+        try {
+            if (state.topmostTick) {
+                clearInterval(state.topmostTick);
+                state.topmostTick = null;
+            }
+            if (state.focusBound) {
+                app.removeListener('browser-window-focus', onAppFocus);
+                state.focusBound = false;
+            }
+        } catch (error) {
+            // 清理失败不影响停用流程。
+        }
         // 停用模组时窗口可能还活着：把当前位置落盘再关。
         if (state.win && !state.win.isDestroyed()) rememberWindowPosition(state.win);
         savePersistedState();
@@ -5288,9 +5340,8 @@ module.exports = function activate(api) {
         // 1.7.0：形态与桌面（穿透）模式也各推一次，播放条按钮靠它们高亮。
         reportSurface(true);
         reportPopupDesktop(true);
-        // 1.7.14：每秒重申置顶 + 重绘，并把「应用获得焦点」也接上（见 reassertTopmost）。
+        // 1.7.14：每秒重申置顶 + 重绘；1.8.2 起焦点监听也由它一起登记（见 startTopmostWatch）。
         startTopmostWatch();
-        app.on('browser-window-focus', onAppFocus);
         // 1.5.1：入口（重新）建起来就要配置。这条覆盖「主进程重载、client 没重跑」和
         // 「页面比 client 先加载完所以那次要早了」两种情况；client 侧做了合并，重复要不会抖动。
         requestConfigFromClient();
