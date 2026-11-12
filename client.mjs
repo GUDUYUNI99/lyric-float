@@ -1307,19 +1307,8 @@ const buildSettingsSection = () => ({
             group: L('通用', 'Shared'),
             defaultValue: false,
         },
-        {
-            // 1.7.14：无边框全屏窗口（浏览器 F11 / 游戏「窗口化全屏」）会和歌词抢置顶层，
-            // 靠每秒重申一次置顶 + 重绘一帧把自己保持在上面。
-            key: 'keepOnTop',
-            type: 'boolean',
-            label: L('全屏窗口下保持置顶', 'Stay on top of fullscreen windows'),
-            description: L(
-                '浏览器或游戏「无边框全屏」时，每秒重申一次置顶并重绘，避免歌词被盖住或显示旧画面。独占全屏无法覆盖。',
-                'Re-asserts topmost once per second during borderless fullscreen windows so the lyrics stay visible. Exclusive fullscreen cannot be overlaid.',
-            ),
-            group: L('通用', 'Shared'),
-            defaultValue: true,
-        },
+        // 1.8.4：1.7.14 的「全屏窗口下保持置顶」开关已取消 —— 桌面歌词 / 悬浮窗现在恒定置顶，
+        // 每秒重申一次（见 main.cjs 的 reassertTopmost）。留着开关只会让人以为关掉还能退出置顶层。
         {
             key: 'marquee',
             type: 'boolean',
@@ -1365,7 +1354,6 @@ const readConfigFromHandle = (handle) => {
             // 布尔项没写过时是 undefined，按「默认开」处理；只有明确 false 才算关。
             border: values.border !== false,
             pausedDim: values.pausedDim === true,
-            keepOnTop: values.keepOnTop !== false,
             backdrop: values.backdrop === true,
             // 1.8.1 逐字染色：默认关，只有明确 true 才开。
             karaoke: values.karaoke === true,

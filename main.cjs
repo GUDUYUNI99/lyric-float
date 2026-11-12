@@ -183,7 +183,10 @@ const PIN_HIT_PADDING = 2;
 const SHOWN_TIMEOUT_MS = 800;
 // 页面侧等「显示中之后的第一帧」最多等多久（ms）：等不到就用现有画面回信，宁可闪一下也不能不上屏。
 // 这个值写进页面模板，页面脚本里直接用它（曾经漏过模板插值，页面侧变成未定义变量、握手直接报错）。
-const SHOWN_FRAME_WAIT_MS = 400;
+const SHOWN_FRAME_WAIT_MS = 200;
+// 1.8.4：上屏之后强制摘「显示中」铺底的最长等待（ms）。暂停/停止时 client 不再发新帧，
+// 旧逻辑等「下一帧」会永远等不到，body.showing 挂住 → 窗口铺底色、按钮显隐错乱。
+const SHOW_RELEASE_MS = 320;
 // 右上角 ×（1.4.0，页面→主进程）：只隐藏悬浮窗，不停用模组。重新显示走播放条上的「词」按钮。
 const IPC_CLOSE = 'lyric-float:close';
 // 1.5.1 显示握手（解决「× 关掉再打开时先闪一下旧画面」）：
@@ -431,7 +434,8 @@ const normalizeConfig = (raw) => {
     config.shared.border = sharedSource.border !== false;
     config.shared.pausedDim = sharedSource.pausedDim === true;
     config.shared.backdrop = sharedSource.backdrop === true;
-    config.shared.keepOnTop = sharedSource.keepOnTop !== false;
+    // 1.8.4：置顶改成恒定行为（每秒重申一次），不再提供开关；老存档里的 false 也不再生效。
+    config.shared.keepOnTop = true;
     // 1.8.1 逐字染色：开关默认关；已唱色只认 #rrggbb；未唱透明度夹在 0.2–1（0 会让整句消失）。
     config.shared.karaoke = sharedSource.karaoke === true;
     if (typeof sharedSource.sungColor === 'string') {
@@ -1829,6 +1833,8 @@ els.layout.addEventListener('click', () => {
 let showMark = null;
 let shownPending = false;
 let showTimer = null;
+// 1.8.4：上屏后摘「显示中」铺底的兜底定时器（见 flushShown）。
+let showReleaseTimer = null;
 // 1.5.6 铺底：applyShownStyle 挂上 body.showing（底色 + 控制条提前展开），
 // releaseShownStyle 在上屏之后的第一帧快照里撤掉，交还给悬停规则。
 const applyShownStyle = () => {
@@ -1847,13 +1853,22 @@ const flushShown = () => {
     }
     shownPending = false;
     ipcRenderer.send('${IPC_SHOWN}');
+    // 1.8.4：兜底摘「显示中」铺底。以前只靠「上屏后再来一帧 IPC_DATA」才 releaseShownStyle()，
+    // 暂停 / 停止状态下 client 不会再有新帧，body.showing 就永远挂着 —— 窗口一直铺着底色、
+    // 控制条强制常显但切换键/关闭键又不出来，固定态还会看起来「不透明、不可穿透」。
+    if (showReleaseTimer) clearTimeout(showReleaseTimer);
+    showReleaseTimer = setTimeout(() => {
+        showReleaseTimer = null;
+        showMark = null;
+        releaseShownStyle();
+    }, ${SHOW_RELEASE_MS});
 };
 const syncShownState = () => {
     if (!shownPending || !showMark || !showMark.rendered) return;
-    // 还停在「显示中」那一刻之前的快照：等下一帧到了再回信，否则上屏的会是旧画面。
-    const renderedFrame = Number.isFinite(showMark.renderedFrame) ? showMark.renderedFrame : lastPayloadFrame;
-    if (renderedFrame < showMark.frame) return;
-    // 1.5.6：回信之前先把这一帧的底子铺好（正常路径 C），主进程收到 IPC_SHOWN 就立刻 showInactive。
+    // 1.8.4：判据从「帧号必须大于标记时刻」改成「标记之后收到并画完的任何一帧」——
+    // IPC_SHOW 之前 request-sync 的那一帧可能先在页面里画完、帧号已经≥标记值，
+    // 旧判据会把这次握手判成「永远等不到」，最后走 400ms 兜底、上屏旧句。
+    // 现在 IPC_SHOW 会把旧字清掉，所以标记之后的第一帧一定是新内容。
     applyShownStyle();
     flushShown();
 };
@@ -1868,7 +1883,18 @@ ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
 // 主进程说「该显示了」：先别让旧画面见人，等当下这一帧到了再回信上屏。
 ipcRenderer.on('${IPC_SHOW}', () => {
     shownPending = true;
-    showMark = { frame: payloadFrame + 1, rendered: false };
+    // 上一次显示留下的兜底定时器要作废，否则它会在这次上屏后提前把「显示中」摘掉。
+    if (showReleaseTimer) {
+        clearTimeout(showReleaseTimer);
+        showReleaseTimer = null;
+    }
+    showMark = { since: Date.now(), rendered: false };
+    // 1.8.4：先把旧句子从画面里撤掉。以前只铺底、把旧句留在 DOM 里等新帧替换 ——
+    // 新帧要是迟到（request-sync 慢于 200ms 兜底），上屏的第一眼就是上一句，就是用户说的「当前句闪」。
+    // 现在宁可空一瞬也不给旧字：新帧一到 render 会立刻把正确的那句画上。
+    if (els.lineTrack) els.lineTrack.textContent = '';
+    if (els.transTrack) els.transTrack.textContent = '';
+    if (els.trans) els.trans.hidden = true;
     // 先把旧画面压住（窗口还没上屏，这一步是防「万一露出来」和「同步 render 重绘后空一帧」）。
     applyShownStyle();
     // 上屏后马上会来一帧新快照，那一帧的 render 会重新量滚动；这里先复位，免得旧句的
@@ -2528,18 +2554,6 @@ const lyricTextOf = (payload) => {
     return text || WAITING_TEXT;
 };
 
-/** 读当前 translateY（动画中间也能读到真实值，用来做「不打架」的续接）。 */
-const readRowsShift = () => {
-    if (!els.rows) return 0;
-    const transform = getComputedStyle(els.rows).transform;
-    if (!transform || transform === 'none') return 0;
-    const match = transform.match(/matrix(?:3d)?\(([^)]+)\)/);
-    if (!match) return 0;
-    const parts = match[1].split(',').map((value) => Number(value));
-    if (parts.length === 16) return Number.isFinite(parts[13]) ? parts[13] : 0;
-    return Number.isFinite(parts[5]) ? parts[5] : 0;
-};
-
 /**
  * 把「上一句 / 当前句 / 下一句 …」整体上滑或下滑一段，模拟跟唱滚动。
  * 1.8.1 三处改动（真机反馈「切句动画很突出很刺眼」）：
@@ -2551,24 +2565,26 @@ const readRowsShift = () => {
 const scrollRows = (deltaLines) => {
     if (!els.rows || !deltaLines) return;
     const step = geometry.lineUnit + geometry.gap;
-    const shift = readRowsShift();
-    const start = shift + deltaLines * step;
-    // 跳多行 / 位移太大：不做动画，直接落到最终位置。
-    if (Math.abs(deltaLines) > 1 || Math.abs(start) > step * 1.6) {
+    // 1.8.4（用户 ③）：整块重建之后，旧内容已经不在画面里了，把新块按 ±1 行区间再滑回 0，
+    // 视觉上就是「新的当前句从旁边跳出来」。改成轻量 settle：只做 6px 级位移 + 透明度回正，
+    // 读起来像内容轻轻落定，而不是整屏平移。
+    if (Math.abs(deltaLines) > 1) {
         els.rows.style.transition = 'none';
         els.rows.style.transform = 'translateY(0)';
+        els.rows.style.opacity = '1';
         return;
     }
-    const distance = Math.abs(start);
-    // 1.8.3：下限 0.13s 太快，真机上「轻推一下」看起来像文字从下面弹出来；提到 0.2s 并把曲线放缓。
-    const duration = Math.min(0.3, Math.max(0.2, distance / 900));
+    const direction = deltaLines > 0 ? 1 : -1;
+    const shift = Math.min(6, step * 0.18) * direction;
     els.rows.style.transition = 'none';
-    els.rows.style.transform = 'translateY(' + start.toFixed(2) + 'px)';
+    els.rows.style.transform = 'translateY(' + shift.toFixed(2) + 'px)';
+    els.rows.style.opacity = '0.55';
     void els.rows.offsetHeight;
     requestAnimationFrame(() => {
         if (!els.rows) return;
-        els.rows.style.transition = 'transform ' + duration.toFixed(3) + 's cubic-bezier(0.25, 0.9, 0.3, 1)';
+        els.rows.style.transition = 'transform 0.2s cubic-bezier(0.22, 0.72, 0.3, 1), opacity 0.2s ease-out';
         els.rows.style.transform = 'translateY(0)';
+        els.rows.style.opacity = '1';
     });
 };
 
@@ -3968,19 +3984,17 @@ module.exports = function activate(api) {
      * 独占全屏（D3D exclusive）绕开合成器，任何窗口都盖不上去 —— 那种情况只能让路。
      */
     const reassertTopmost = () => {
-        // 1.8.3：置顶和重绘拆开。关掉「全屏窗口下保持置顶」只是不再抢层，
-        // 但透明窗口被全屏窗口完全遮挡后 DWM 会停更，退出全屏时必须重画一次，
-        // 否则窗口还在、内容却是空的（真机表现就是「退出全屏后出不来」）。
-        const keepOnTop = Boolean(state.config && state.config.shared.keepOnTop);
+        // 1.8.4：改成「永远置顶」——用户要求无论锁定与否都保持顶置，不再跟随设置开关。
+        // 每秒重申一次置顶 + 强制重绘：moveTop() 是 SWP_NOACTIVATE（不抢焦点、不改尺寸），
+        // 重绘是给透明分层窗口补帧（被完全遮挡期间 DWM 可能停更，露出来会显示旧画面）。
+        // 独占全屏（D3D exclusive）绕开合成器，任何窗口都盖不上去 —— 那种情况只能让路。
         for (const target of [state.win, state.popup]) {
             if (!target || target.isDestroyed() || !target.isVisible()) continue;
-            if (keepOnTop) {
-                try {
-                    if (!target.isAlwaysOnTop()) target.setAlwaysOnTop(true);
-                    target.moveTop();
-                } catch (error) {
-                    // 单个窗口失败不影响另一个窗口。
-                }
+            try {
+                if (!target.isAlwaysOnTop()) target.setAlwaysOnTop(true);
+                target.moveTop();
+            } catch (error) {
+                // 单个窗口失败不影响另一个窗口。
             }
             nudgeRepaintFor(target);
         }
@@ -4069,9 +4083,17 @@ module.exports = function activate(api) {
                     && point.x >= bounds.x && point.x < bounds.x + bounds.width
                     && point.y >= bounds.y && point.y < bounds.y + bounds.height;
                 // 部分点击穿透：固定状态整窗不吃鼠标，只有解锁按钮那块恢复可点。
-                // 固定但还没收到按钮矩形时保持可点（宁可挡一下，也别把人锁在外面解不开）。
-                const rect = state.pinRect;
-                if (hover && rect) {
+                // 1.8.4：页面没来得及上报按钮矩形（切形态后页面刚显示、或上报丢了）时，
+                // 以前会退化成「整窗可点」= 用户以为「穿透没用」。现在用一个保守兜底矩形
+                // （控制条正中、解锁键所在的那一块），保证固定态永远能穿透、也永远解得开锁。
+                const reported = state.pinRect;
+                const rect = reported || {
+                    x: Math.round(bounds.width / 2) - 48,
+                    y: 0,
+                    width: 96,
+                    height: 58,
+                };
+                if (hover) {
                     const left = bounds.x + rect.x - PIN_HIT_PADDING;
                     const top = bounds.y + rect.y - PIN_HIT_PADDING;
                     overPin = point.x >= left && point.x < left + rect.width + PIN_HIT_PADDING * 2
@@ -4079,7 +4101,7 @@ module.exports = function activate(api) {
                 }
                 // 1.5.2：窗口没上屏时（显示握手中）整窗忽略鼠标——它随时可能露出来，露出来也不能吃点击。
                 // 页面已经自己设过穿透（ignore-hint）时这一帧跳过，不用多等一次轮询。
-                const wantIgnore = !widgetWindow.isVisible() || (state.pinned && !!rect && !overPin);
+                const wantIgnore = !widgetWindow.isVisible() || (state.pinned && !overPin);
                 const pageAlreadySet = !widgetWindow.isVisible() && state.ignoreHint === true;
                 setIgnore(pageAlreadySet ? null : wantIgnore);
                 failCount = 0;
