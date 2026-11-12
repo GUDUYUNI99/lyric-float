@@ -868,7 +868,10 @@ const WIDGET_HTML = `<!DOCTYPE html>
         pointer-events: none;
         transition: opacity 0.18s ease;
     }
-    body.hover:not(.pinned) #surface {
+    body.hover:not(.pinned) #surface,
+    /* 1.8.6：显示握手期间（body.showing）控制条是提前展开的，如果切换键不跟着展开，
+       就会看到「切回桌面歌词的一瞬间其它按钮都在、只有切换键不在」。两者必须同进同出。 */
+    body.showing:not(.pinned) #surface {
         opacity: 1;
         pointer-events: auto;
     }
@@ -1079,6 +1082,8 @@ const WIDGET_HTML = `<!DOCTYPE html>
         transition: opacity 0.18s ease;
     }
     body.hover:not(.pinned) #close,
+    /* 1.8.6：同 #surface —— 显示握手期间控制条提前展开，× 也要一起出现，否则「一半按钮在、一半不在」。 */
+    body.showing:not(.pinned) #close,
     body:not(.pinned) #close:focus-visible {
         opacity: 1;
         pointer-events: auto;
