@@ -861,11 +861,15 @@ const WIDGET_HTML = `<!DOCTYPE html>
        左侧两组仍然是 flex: 1 等宽，所以正中的固定键依旧严格居中。 */
     #surface {
         margin-left: auto;
-        visibility: hidden;
+        /* 1.8.5：和其它按钮一样用 opacity 淡入淡出。原来用 visibility 切换，
+           visibility 不能过渡、是硬切，所以鼠标一离开窗口它就「先于所有按钮」消失
+           （父级 .controls 是 0.18s 淡出、窗口底色 0.22s），观感很突兀。 */
+        opacity: 0;
         pointer-events: none;
+        transition: opacity 0.18s ease;
     }
     body.hover:not(.pinned) #surface {
-        visibility: visible;
+        opacity: 1;
         pointer-events: auto;
     }
     /* 固定态（按需求）切换键不出现：控制条整条都收起来了，这里也不给任何显示条件。 */
@@ -1881,20 +1885,30 @@ ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
     if (lastPayload) render(lastPayload);
 });
 // 主进程说「该显示了」：先别让旧画面见人，等当下这一帧到了再回信上屏。
-ipcRenderer.on('${IPC_SHOW}', () => {
+ipcRenderer.on('${IPC_SHOW}', (event, info) => {
     shownPending = true;
     // 上一次显示留下的兜底定时器要作废，否则它会在这次上屏后提前把「显示中」摘掉。
     if (showReleaseTimer) {
         clearTimeout(showReleaseTimer);
         showReleaseTimer = null;
     }
-    showMark = { since: Date.now(), rendered: false };
-    // 1.8.4：先把旧句子从画面里撤掉。以前只铺底、把旧句留在 DOM 里等新帧替换 ——
-    // 新帧要是迟到（request-sync 慢于 200ms 兜底），上屏的第一眼就是上一句，就是用户说的「当前句闪」。
-    // 现在宁可空一瞬也不给旧字：新帧一到 render 会立刻把正确的那句画上。
-    if (els.lineTrack) els.lineTrack.textContent = '';
-    if (els.transTrack) els.transTrack.textContent = '';
-    if (els.trans) els.trans.hidden = true;
+    // 1.8.5：标记时刻用主进程发 IPC_SHOW 之前的时间戳（不是页面收到的时刻）。
+    // 这样「这次显示之后 client 生成的帧」（sentAt >= since）一定能通过判据，
+    // 而显示之前就在路上飞着的旧帧（sentAt 更早）会被挡掉 —— 1.8.4 用「任意一帧」当判据，
+    // 旧帧先到就上屏旧句，所以那个闪是偶发的。
+    const markSince = Number(info && info.since);
+    showMark = {
+        since: Number.isFinite(markSince) ? markSince : Date.now(),
+        rendered: false,
+    };
+    // 1.8.5：只有窗口当时不可见才清字。窗口已经可见时清空就是一次肉眼可见的「闪白」，
+    // 这次显示不需要再藏旧画面（本来就在屏幕上）。
+    const wasVisible = Boolean(info && info.visible);
+    if (!wasVisible) {
+        if (els.lineTrack) els.lineTrack.textContent = '';
+        if (els.transTrack) els.transTrack.textContent = '';
+        if (els.trans) els.trans.hidden = true;
+    }
     // 先把旧画面压住（窗口还没上屏，这一步是防「万一露出来」和「同步 render 重绘后空一帧」）。
     applyShownStyle();
     // 上屏后马上会来一帧新快照，那一帧的 render 会重新量滚动；这里先复位，免得旧句的
@@ -2059,8 +2073,14 @@ ipcRenderer.on('${IPC_DATA}', (event, payload) => {
     if (showMark) showMark.renderedFrame = frameNo;
     // 1.5.2：画完了再看这次显示握手能不能回信（要等的是「显示中」那一刻之后的帧）。
     if (shownPending && showMark) {
-        showMark.rendered = true;
-        syncShownState();
+        // 1.8.5：必须是「这次显示之后生成」的帧才放行（sentAt 由 client 生成快照时打）。
+        // 旧版本只要收到任意一帧就回信，而 request-sync 那一帧和正常轮询帧会竞争，
+        // 旧帧先到就先上屏旧句 —— 这就是「当前句闪」偶发的原因。
+        const sentAt = Number(payload && payload.sentAt);
+        if (!Number.isFinite(sentAt) || sentAt >= showMark.since) {
+            showMark.rendered = true;
+            syncShownState();
+        }
     } else if (showMark) {
         // 1.5.6：握手已经完成（回信已发），这一帧到达说明主进程已按回信上屏过：现在才撤铺底。
         showMark = null;
@@ -2562,12 +2582,23 @@ const lyricTextOf = (payload) => {
  *  - 跳多行不飞：点歌 / 拖进度 / 尺寸变化时 delta 可能有十几行，整屏飞行非常刺眼 —— 直接落位；
  *  - 距离越远时长略长：固定 0.24s 走 2 行和走 1 行的瞬时速度差一倍，按距离给 0.13–0.26s。
  */
-const scrollRows = (deltaLines) => {
+const scrollRows = (deltaLines, lineCount) => {
     if (!els.rows || !deltaLines) return;
+    // 1.8.5（用户 ③）：单行模式（一屏只放得下一句）不做纵向动画 ——
+    // 只有一个行位，纵向位移没有任何「上移一行」的信息量，只会像弹出来。
+    // 单行时换句靠横向走马灯（和桌面歌词同款）表现，纵向直接落位。
+    if (lineCount <= 1) {
+        els.rows.style.transition = 'none';
+        els.rows.style.transform = 'translateY(0)';
+        els.rows.style.opacity = '1';
+        return;
+    }
     const step = geometry.lineUnit + geometry.gap;
     // 1.8.4（用户 ③）：整块重建之后，旧内容已经不在画面里了，把新块按 ±1 行区间再滑回 0，
     // 视觉上就是「新的当前句从旁边跳出来」。改成轻量 settle：只做 6px 级位移 + 透明度回正，
     // 读起来像内容轻轻落定，而不是整屏平移。
+    // 1.8.5：多行模式改成「轻推」—— 起点接近一整行高（0.65 行），不加透明度，
+    // 0.18s ease-out 落位，读起来是列表被推了一格，而不是淡入新内容。
     if (Math.abs(deltaLines) > 1) {
         els.rows.style.transition = 'none';
         els.rows.style.transform = 'translateY(0)';
@@ -2575,14 +2606,14 @@ const scrollRows = (deltaLines) => {
         return;
     }
     const direction = deltaLines > 0 ? 1 : -1;
-    const shift = Math.min(6, step * 0.18) * direction;
+    const shift = Math.min(step, step * 0.65) * direction;
     els.rows.style.transition = 'none';
     els.rows.style.transform = 'translateY(' + shift.toFixed(2) + 'px)';
-    els.rows.style.opacity = '0.55';
+    els.rows.style.opacity = '1';
     void els.rows.offsetHeight;
     requestAnimationFrame(() => {
         if (!els.rows) return;
-        els.rows.style.transition = 'transform 0.2s cubic-bezier(0.22, 0.72, 0.3, 1), opacity 0.2s ease-out';
+        els.rows.style.transition = 'transform 0.18s cubic-bezier(0.22, 0.72, 0.3, 1)';
         els.rows.style.transform = 'translateY(0)';
         els.rows.style.opacity = '1';
     });
@@ -2847,7 +2878,18 @@ const paintRows = (payload) => {
     for (let i = 0; i < lines.length; i += 1) {
         if (lines[i] && lines[i].index === currentIndex) currentPos = i;
     }
-    if (currentPos < 0) currentPos = Math.min(lines.length - 1, Math.max(0, 0));
+    if (currentPos < 0) {
+        // 1.8.5：当前句不在 context.lines 里（前奏/插曲，payload.line.index = -1）。
+        // 旧版这里把窗口第一行当当前句，于是 00:00 时桌面歌词显示「……」（upcoming），
+        // 悬浮窗却显示第二句「编曲:…」—— 两个窗口不一致。现在跟桌面走同一套文案。
+        els.rows.innerHTML = '<div class="row current"><span class="row-text"></span></div>';
+        const textNode = els.rows.querySelector('.row-text');
+        if (textNode) textNode.textContent = lyricTextOf(payload);
+        lastWindow = { offset: 0, count: 1, step: 0 };
+        stopPopupKaraoke();
+        requestAnimationFrame(measureMarquee);
+        return;
+    }
     const available = els.lyrics ? els.lyrics.clientHeight : 0;
     // 行数算出来后再兜一次底：真实渲染高度可能略有出入，用 scrollHeight 回退一行。
     let win = computeWindow(lines.length, currentPos, available, 0);
@@ -2879,7 +2921,7 @@ const paintRows = (payload) => {
     geoUpdate: {
         // 只有「起点变了」才做滑动；换句但起点没变说明是在同一屏里换高亮，不需要动。
         const delta = lastWindow.count > 0 ? win.offset - lastWindow.offset : 0;
-        if (delta !== 0) scrollRows(delta);
+        if (delta !== 0) scrollRows(delta, win.count);
         break geoUpdate;
     }
     lastWindow = { offset: win.offset, count: win.count, step: geometry.lineUnit + geometry.gap };
@@ -3792,12 +3834,18 @@ module.exports = function activate(api) {
                     // 1.5.2：显示分两段。这里只做「让页面先准备好」：请 client 绕过去重发一帧当下这一句，
                     // 但**不**补发旧快照（旧快照 = 关窗那一刻的画面，闪旧句就是从它来的），
                     // 也先不上屏。页面画完新帧回 IPC_SHOWN，才由 showWidgetWindow 上屏。
+                    // 1.8.5：标记时刻要在发 request-sync 之前取 —— 页面用「sentAt >= since」
+                    // 判断这一帧是不是这次显示之后生成的，晚于发给 client 的请求时刻才不会被误挡。
+                    const showSince = Date.now();
                     sendActionToClient({ action: 'request-sync' });
                     // 隐藏期间可能改过字号：上屏前按当前配置定一次高度。
                     applyWindowSize();
                     // 窗口可能已销毁 / 页面没加载完：拿不到握手就兜底上屏。
                     try {
-                        widgetWindow.webContents.send(IPC_SHOW);
+                        widgetWindow.webContents.send(IPC_SHOW, {
+                            since: showSince,
+                            visible: widgetWindow.isVisible(),
+                        });
                     } catch (error) {
                         api.log.warn(LOG_PREFIX + ' 通知页面准备显示失败', error);
                     }
@@ -4989,9 +5037,14 @@ module.exports = function activate(api) {
                         // 1.7.11：切回桌面歌词走完整显示握手（和「词」按钮同一条路径）——
                         // 之前直接 showInactive()，页面还是旧帧、悬停状态也可能停在穿透态，
                         // 真机上会看到「闪旧句 / 窗口像消失了一样不可交互」。
+                        // 1.8.5：同 setWidgetOpen，since 必须在 request-sync 之前取。
+                        const showSince = Date.now();
                         sendActionToClient({ action: 'request-sync' });
                         applyWindowSize();
-                        widgetWindow.webContents.send(IPC_SHOW);
+                        widgetWindow.webContents.send(IPC_SHOW, {
+                            since: showSince,
+                            visible: widgetWindow.isVisible(),
+                        });
                         waitForShown();
                     } catch (error) {
                         api.log.warn(LOG_PREFIX + ' 切回桌面歌词时显示窗口失败', error);
