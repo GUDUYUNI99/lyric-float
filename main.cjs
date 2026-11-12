@@ -110,6 +110,9 @@ const IPC_POPUP_LAYOUT = 'lyric-float:popup-layout';
 const IPC_POPUP_TOAST = 'lyric-float:popup-toast';
 // 1.7.12：悬浮窗歌词里的播放列表面板（数据由 client 读宿主队列后回传）。
 const IPC_POPUP_PLAYLIST = 'lyric-float:popup-playlist';
+// 1.8.3：悬浮窗显示握手 —— 页面画完一帧后回信，主进程收到才上屏（切形态时不再先露旧画面）。
+const IPC_POPUP_FRAME = 'lyric-float:popup-frame';
+const POPUP_SHOW_FALLBACK_MS = 320;
 const RPC_PLAYLIST_DATA = 'playlist-data';
 const RPC_PLAYBACK_HINT = 'playback-hint';
 // 穿透态下「退出穿透」键的命中外扩（和桌面歌词固定键同一口径）。
@@ -1331,7 +1334,51 @@ const paintKaraokeAt = (time) => {
 const stepKaraoke = () => {
     if (!karaoke) return;
     paintKaraokeAt(karaokeNow());
+    paintSecondFollow(karaokeProgress());
     karaoke.raf = requestAnimationFrame(stepKaraoke);
+};
+
+/** 两个 #rrggbb 按比例混合（ratio 0 = from，1 = to）。 */
+const mixHex = (from, to, ratio) => {
+    const read = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+    const a = read(from);
+    const b = read(to);
+    const t = Math.min(1, Math.max(0, ratio));
+    return '#' + a.map((value, index) => Math.round(value + (b[index] - value) * t).toString(16).padStart(2, '0')).join('');
+};
+
+/** 当前句唱到哪了（0–1）：数不出时间就按 0 处理，与逐字染色同一份歌词时钟。 */
+const karaokeProgress = () => {
+    const line = lastPayload && lastPayload.line ? lastPayload.line : null;
+    if (!line) return 0;
+    const start = Number(line.startTime);
+    const end = Number(line.endTime);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+    const now = karaoke ? karaokeNow() : lyricNowFrom(lastPayload, lastPayloadReceivedAt);
+    return Math.min(1, Math.max(0, (now - start) / (end - start)));
+};
+
+/**
+ * 1.8.3（A 方案）：译文 / 罗马音没有词级时间（宿主只给原文的 words），做不了逐字染色。
+ * 这里让第二行「整行跟着当前句的进度渐亮」：颜色从歌词色混到已唱色，透明度从 unsungOpacity 升到 1，
+ * 视觉上和第一行的逐字进度对齐。逐字关掉或第二行是空的时候把内联覆盖清掉，回到 CSS 的默认状态。
+ */
+const paintSecondFollow = (progress) => {
+    if (!els.trans) return;
+    const secondLine = els.transTrack ? els.transTrack.textContent : '';
+    if (!karaokeEnabled() || secondLine === '') {
+        els.trans.style.color = '';
+        els.trans.style.opacity = '';
+        return;
+    }
+    const sungColor = /^#[0-9a-f]{6}$/i.test(String(config.shared.sungColor || '')) ? String(config.shared.sungColor).toLowerCase() : '#7dd3fc';
+    const baseColor = /^#[0-9a-f]{6}$/i.test(String(config.shared.lyricColor || '')) ? String(config.shared.lyricColor).toLowerCase() : '#ffffff';
+    const unsungOpacity = Number.isFinite(Number(config.shared.unsungOpacity))
+        ? Math.min(1, Math.max(0.2, Number(config.shared.unsungOpacity)))
+        : 0.55;
+    const t = Math.min(1, Math.max(0, progress));
+    els.trans.style.color = mixHex(baseColor, sungColor, t);
+    els.trans.style.opacity = String(unsungOpacity + (1 - unsungOpacity) * t);
 };
 
 /** 返回 true 表示这一行已按逐字画好；false 让调用方退回整行文本。 */
@@ -1363,6 +1410,8 @@ const renderKaraokeLine = (line, payload, receivedAt) => {
         }
     }
     paintKaraokeAt(karaokeNow());
+    // 1.8.3：第二行按整句进度同步渐亮（A 方案）。
+    paintSecondFollow(karaokeProgress());
     if (payload.state === 'playing') {
         if (!karaoke.raf) karaoke.raf = requestAnimationFrame(stepKaraoke);
     } else if (karaoke.raf) {
@@ -1683,6 +1732,8 @@ const render = (payload, receivedAt) => {
     }
     els.transTrack.textContent = secondLine;
     els.trans.hidden = secondLine === '';
+    // 1.8.3：逐字开启时第二行按进度渐亮；关掉或空行时这里会把内联覆盖清掉，回到 --lyric-color。
+    paintSecondFollow(karaokeProgress());
     // 三行排版（原文 + 译文 + 罗马音）已下线：这一行现在始终留空。
     // 要恢复：① 上面改成 secondLine = translation、并另算 showRoman；② 这里填罗马音；
     // ③ LAYOUT_MODES / LAYOUT_TIPS 和 CSS 的 #layout[data-mode="roman"] 规则各补一态。
@@ -2348,6 +2399,7 @@ const IPC_POPUP_HOVER = '${IPC_POPUP_HOVER}';
 const IPC_POPUP_LAYOUT = '${IPC_POPUP_LAYOUT}';
 const IPC_POPUP_TOAST = '${IPC_POPUP_TOAST}';
 const IPC_POPUP_PLAYLIST = '${IPC_POPUP_PLAYLIST}';
+const IPC_POPUP_FRAME = '${IPC_POPUP_FRAME}';
 const IPC_POPUP_POINTER_RECT = '${IPC_POPUP_POINTER_RECT}';
 
 const ICONS = ${JSON.stringify(ICON_SVG)};
@@ -2508,13 +2560,14 @@ const scrollRows = (deltaLines) => {
         return;
     }
     const distance = Math.abs(start);
-    const duration = Math.min(0.26, Math.max(0.13, distance / 900));
+    // 1.8.3：下限 0.13s 太快，真机上「轻推一下」看起来像文字从下面弹出来；提到 0.2s 并把曲线放缓。
+    const duration = Math.min(0.3, Math.max(0.2, distance / 900));
     els.rows.style.transition = 'none';
     els.rows.style.transform = 'translateY(' + start.toFixed(2) + 'px)';
     void els.rows.offsetHeight;
     requestAnimationFrame(() => {
         if (!els.rows) return;
-        els.rows.style.transition = 'transform ' + duration.toFixed(3) + 's cubic-bezier(0.22, 0.72, 0.3, 1)';
+        els.rows.style.transition = 'transform ' + duration.toFixed(3) + 's cubic-bezier(0.25, 0.9, 0.3, 1)';
         els.rows.style.transform = 'translateY(0)';
     });
 };
@@ -2649,11 +2702,54 @@ const paintPopupKaraokeAt = (time) => {
 const stepPopupKaraoke = () => {
     if (!popupKaraoke) return;
     paintPopupKaraokeAt(popupKaraokeNow());
+    paintPopupSecondFollow(popupKaraokeProgress());
     if (!lastPayload || lastPayload.state !== 'playing') {
         popupKaraoke.raf = 0;
         return;
     }
     popupKaraoke.raf = requestAnimationFrame(stepPopupKaraoke);
+};
+
+/** 两个 #rrggbb 按比例混合（与桌面歌词同一套算法）。 */
+const mixHex = (from, to, ratio) => {
+    const read = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+    const a = read(from);
+    const b = read(to);
+    const t = Math.min(1, Math.max(0, ratio));
+    return '#' + a.map((value, index) => Math.round(value + (b[index] - value) * t).toString(16).padStart(2, '0')).join('');
+};
+
+/** 当前句唱到哪了（0–1），用悬浮窗自己的歌词时钟。 */
+const popupKaraokeProgress = () => {
+    const line = lastPayload && lastPayload.line ? lastPayload.line : null;
+    if (!line) return 0;
+    const start = Number(line.startTime);
+    const end = Number(line.endTime);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+    const now = popupKaraoke ? popupKaraokeNow() : popupLyricNow(lastPayload);
+    return Math.min(1, Math.max(0, (now - start) / (end - start)));
+};
+
+/**
+ * 1.8.3（A 方案）：当前句的译文 / 罗马音没有词级时间，改成整行跟着进度渐亮。
+ * 颜色从悬浮窗文字色混到已唱色，透明度从 unsungOpacity 升到 1；逐字关掉时清掉内联覆盖。
+ */
+const paintPopupSecondFollow = (progress) => {
+    const row = els.rows ? els.rows.querySelector('.row.current .row-sub') : null;
+    if (!row) return;
+    if (config.shared.karaoke !== true || !row.textContent) {
+        row.style.color = '';
+        row.style.opacity = '';
+        return;
+    }
+    const sungColor = /^#[0-9a-f]{6}$/i.test(String(config.shared.sungColor || '')) ? String(config.shared.sungColor).toLowerCase() : '#7dd3fc';
+    const baseColor = /^#[0-9a-f]{6}$/i.test(String(config.shared.popupColor || '')) ? String(config.shared.popupColor).toLowerCase() : '#eaf6ff';
+    const unsungOpacity = Number.isFinite(Number(config.shared.unsungOpacity))
+        ? Math.min(1, Math.max(0.2, Number(config.shared.unsungOpacity)))
+        : 0.55;
+    const t = Math.min(1, Math.max(0, progress));
+    row.style.color = mixHex(baseColor, sungColor, t);
+    row.style.opacity = String(unsungOpacity + (1 - unsungOpacity) * t);
 };
 
 /** 把当前行的文本换成「每个词一个 span」；没词级时间就保持整行文本。 */
@@ -2773,6 +2869,8 @@ const paintRows = (payload) => {
     lastWindow = { offset: win.offset, count: win.count, step: geometry.lineUnit + geometry.gap };
     // 1.8.1：当前句换成 span 后再量滚动（重建 DOM 之后量，宽度才准）。
     paintCurrentKaraoke(payload);
+    // 1.8.3：第二行（译文 / 罗马音）按整句进度渐亮；逐字关掉时这里会把内联覆盖清掉。
+    paintPopupSecondFollow(popupKaraokeProgress());
     requestAnimationFrame(measureMarquee);
 };
 
@@ -2900,7 +2998,12 @@ if (els.volume) {
 
 /* ---- 主进程 → 页面 ---- */
 
-ipcRenderer.on(IPC_DATA, (event, payload) => render(payload));
+ipcRenderer.on(IPC_DATA, (event, payload) => {
+    render(payload);
+    // 1.8.3：显示握手 —— 这一帧画完后回信，主进程收到才让窗口上屏，
+    // 这样切形态时不会先露出上一份快照（真机上的「闪回」）。
+    ipcRenderer.send(IPC_POPUP_FRAME, {});
+});
 ipcRenderer.on(IPC_CONFIG, (event, payload) => applyConfig(payload));
 let toastTimer = null;
 /** 一次性提示（播放列表打不开之类），2.4 秒后自动淡出。 */
@@ -3152,6 +3255,9 @@ module.exports = function activate(api) {
         popupIgnore: null,
         // 1.7.11：拖动阻尼正在 setBounds（防 'move' 重入，见 createPopupWindow 里的 dampPopupOvershoot）。
         popupDamping: false,
+        // 1.8.3：显示握手中（等页面画完一帧再上屏）与兜底定时器。
+        popupShowPending: false,
+        popupShowTimer: null,
         // 1.7.11：最近一次形态切换时刻 / 最近一次显隐请求的来源（真机排查「窗口自己消失」用）。
         surfaceSwitchedAt: 0,
         lastVisibilitySource: null,
@@ -3862,14 +3968,19 @@ module.exports = function activate(api) {
      * 独占全屏（D3D exclusive）绕开合成器，任何窗口都盖不上去 —— 那种情况只能让路。
      */
     const reassertTopmost = () => {
-        if (!state.config || !state.config.shared.keepOnTop) return;
+        // 1.8.3：置顶和重绘拆开。关掉「全屏窗口下保持置顶」只是不再抢层，
+        // 但透明窗口被全屏窗口完全遮挡后 DWM 会停更，退出全屏时必须重画一次，
+        // 否则窗口还在、内容却是空的（真机表现就是「退出全屏后出不来」）。
+        const keepOnTop = Boolean(state.config && state.config.shared.keepOnTop);
         for (const target of [state.win, state.popup]) {
             if (!target || target.isDestroyed() || !target.isVisible()) continue;
-            try {
-                if (!target.isAlwaysOnTop()) target.setAlwaysOnTop(true);
-                target.moveTop();
-            } catch (error) {
-                // 单个窗口失败不影响另一个窗口。
+            if (keepOnTop) {
+                try {
+                    if (!target.isAlwaysOnTop()) target.setAlwaysOnTop(true);
+                    target.moveTop();
+                } catch (error) {
+                    // 单个窗口失败不影响另一个窗口。
+                }
             }
             nudgeRepaintFor(target);
         }
@@ -4113,6 +4224,11 @@ module.exports = function activate(api) {
         widgetWindow.on('move', () => {
             rememberWindowPosition(widgetWindow);
             scheduleSave();
+        });
+        // 1.8.3：拖完 / 系统移动窗口后立刻重算一次悬停与穿透，不等下一轮 80ms 轮询 ——
+        // 否则松手那一刻页面可能还停在「悬停中」或「穿透」的旧状态，看起来像偶发 bug。
+        widgetWindow.on('moved', () => {
+            if (state.hoverTick) state.hoverTick();
         });
 
         // 页面只该是这一份 data URL：禁止页面自己导航、禁止开新窗口。
@@ -4629,9 +4745,15 @@ module.exports = function activate(api) {
         popup.on('moved', () => {
             state.popupDamping = false;
             clampPopupBounds();
+            // 1.8.3：移动结束立刻重算悬停/穿透，避免拖完那一刻面板或退出键状态是旧的。
+            popupHoverStep();
         });
         popup.on('resize', savePopupBounds);
-        popup.on('resized', clampPopupBounds);
+        popup.on('resized', () => {
+            clampPopupBounds();
+            // 同理：尺寸变化会改变光标命中的位置，立刻重算一次。
+            popupHoverStep();
+        });
 
         popup.webContents.on('did-finish-load', () => {
             api.log.info(LOG_PREFIX + ' 悬浮窗歌词页面 did-finish-load');
@@ -4652,6 +4774,8 @@ module.exports = function activate(api) {
         popup.once('ready-to-show', () => {
             if (state.disposed || popup.isDestroyed()) return;
             if (!state.widgetOpen || state.surface !== SURFACE_POPUP) return;
+            // 1.8.3：握手中（等页面画完一帧）就不要在这里抢着上屏，否则又变成「先露旧画面」。
+            if (state.popupShowPending) return;
             try {
                 state.popupIgnore = null;
                 setPopupIgnore(state.popupDesktop, true);
@@ -4712,13 +4836,11 @@ module.exports = function activate(api) {
         return popupAlive();
     };
 
-    const showPopupWindow = () => {
-        if (state.disposed || !state.widgetOpen || state.surface !== SURFACE_POPUP) return;
-        const popup = ensurePopupWindow();
-        if (!popup) return;
+    /** 1.8.3：真正上屏（只在「页面已经画好一帧」之后调用）。 */
+    const revealPopup = () => {
+        const popup = popupAlive();
+        if (!popup || state.disposed || !state.widgetOpen || state.surface !== SURFACE_POPUP) return;
         try {
-            startPopupHoverWatch();
-            // 页面还在加载就先不上屏（否则露空白窗），交给 once('ready-to-show') 上屏。
             if (popup.webContents.isLoading()) return;
             // 桌面（穿透）模式下上屏也要保持穿透，否则开关一重启就变成可点，用户点两下就点乱了。
             state.popupIgnore = null;
@@ -4728,6 +4850,51 @@ module.exports = function activate(api) {
         } catch (error) {
             api.log.warn(LOG_PREFIX + ' 显示悬浮窗歌词失败', error);
         }
+    };
+
+    /**
+     * 1.8.3：切到悬浮窗时不再「先 show 再发数据」。
+     * 先让页面收到新快照、画完回一封 popup-frame，再上屏 —— 否则上屏那一帧露的是页面里残留的旧快照。
+     * 320ms 没等到回信就照常上屏兜底（页面异常也不能把窗口永久藏起来）。
+     */
+    const requestPopupShow = () => {
+        const popup = ensurePopupWindow();
+        if (!popup) return;
+        try {
+            startPopupHoverWatch();
+        } catch (error) {
+            // 轮询挂了不影响上屏，下一次显示会重试。
+        }
+        if (popup.webContents.isLoading()) return;
+        state.popupShowPending = true;
+        if (state.popupShowTimer) clearTimeout(state.popupShowTimer);
+        state.popupShowTimer = setTimeout(() => {
+            state.popupShowTimer = null;
+            state.popupShowPending = false;
+            if (state.lastPayload) sendPayloadToPopup(state.lastPayload);
+            revealPopup();
+        }, POPUP_SHOW_FALLBACK_MS);
+        sendActionToClient({ action: 'request-sync' });
+    };
+
+    const showPopupWindow = () => {
+        if (state.disposed || !state.widgetOpen || state.surface !== SURFACE_POPUP) return;
+        const popup = ensurePopupWindow();
+        if (!popup) return;
+        try {
+            startPopupHoverWatch();
+        } catch (error) {
+            // 同上：轮询失败不影响上屏。
+        }
+        // 页面还在加载就先不上屏（否则露空白窗），交给 ready-to-show / 显示握手负责。
+        try {
+            if (popup.webContents.isLoading()) return;
+        } catch (error) {
+            return;
+        }
+        // 握手期间等页面回信（见 ipcMain.on(IPC_POPUP_FRAME)），不要抢着先 show。
+        if (state.popupShowPending) return;
+        revealPopup();
     };
 
     const hidePopupWindow = () => {
@@ -4786,7 +4953,8 @@ module.exports = function activate(api) {
             // 切到悬浮窗：桌面歌词先藏起来（不销毁，切回来立刻能画），再按需建 / 显示悬浮窗。
             hideWidgetWindow();
             if (state.widgetOpen) {
-                showPopupWindow();
+                // 1.8.3：先发数据、等页面画完回信再上屏（见 requestPopupShow），不再先 show 后发。
+                requestPopupShow();
                 if (state.lastPayload) sendPayloadToPopup(state.lastPayload);
             }
         } else {
@@ -4806,7 +4974,8 @@ module.exports = function activate(api) {
                     } catch (error) {
                         api.log.warn(LOG_PREFIX + ' 切回桌面歌词时显示窗口失败', error);
                     }
-                    if (state.lastPayload) sendPayloadToWindow(state.lastPayload);
+                    // 1.8.3：不再在这里补发旧快照 —— 上面已经 request-sync，等新帧再上屏；
+                    // 这里再塞一份旧 payload，页面就会先画旧的（真机上的「闪回」）。
                 }
             }
         }
@@ -5185,6 +5354,15 @@ module.exports = function activate(api) {
         const popup = popupAlive();
         if (!popup) return { ok: false };
         try {
+            // 1.8.3：把分页元信息打进日志 —— 队列超过一页时，用它确认「当前歌在第几首、这一页从哪开始」，
+            // 歌单不够长没法真机验的场景就靠这行。
+            api.log.info(LOG_PREFIX + ' 播放列表数据', JSON.stringify({
+                length: payload && payload.length,
+                currentIndex: payload && payload.currentIndex,
+                offset: payload && payload.offset,
+                items: payload && Array.isArray(payload.items) ? payload.items.length : 0,
+                kind: payload && payload.kind,
+            }));
             popup.webContents.send(IPC_POPUP_PLAYLIST, payload);
             return { ok: true };
         } catch (error) {
@@ -5260,6 +5438,18 @@ module.exports = function activate(api) {
     // 1.7.0：悬浮窗歌词自己的控制通道（上一曲/播放/音量/循环/固定/桌面模式/播放列表/关闭）。
     ipcMain.on(IPC_POPUP_COMMAND, onPopupCommand);
     ipcMain.on(IPC_POPUP_POINTER_RECT, onPopupPointerRect);
+    // 1.8.3：悬浮窗页面画完一帧的回信 —— 显示握手里收到这条才真的上屏。
+    ipcMain.on(IPC_POPUP_FRAME, (event, payload) => {
+        const popup = popupAlive();
+        if (!popup || event.sender !== popup.webContents) return;
+        if (!state.popupShowPending) return;
+        state.popupShowPending = false;
+        if (state.popupShowTimer) {
+            clearTimeout(state.popupShowTimer);
+            state.popupShowTimer = null;
+        }
+        revealPopup();
+    });
     ipcMain.on(IPC_TOGGLE_SURFACE, onToggleSurfaceFromWindow);
     app.on('browser-window-created', onBrowserWindowCreated);
 
