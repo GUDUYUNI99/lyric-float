@@ -898,7 +898,15 @@ const WIDGET_HTML = `<!DOCTYPE html>
      */
     .controls-side.right {
         justify-content: flex-end;
-        padding-right: 44px;
+        /* 1.8.7：右上角 × 的 44px 位置改由组内 .close-gap 占位，不再用 padding-right。
+           原因：flex-basis: 0 + box-sizing: border-box 时，padding 会算进这条 flex 项的最小基础尺寸，
+           右组因此比左组宽 44px，正中的固定键被挤偏 22px（实测 pin 中心 298，窗口中心 320）。 */
+    }
+    /* 占位元素：44px 宽度里吃掉组内 gap 的 8px，净占位还是 44px（和原来 padding 的视觉结果一致）。 */
+    .close-gap {
+        flex: none;
+        width: 44px;
+        margin-left: -8px;
     }
     button {
         -webkit-app-region: no-drag;
@@ -1112,6 +1120,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
             <span class="volume-icon" id="volume-icon" aria-hidden="true">${ICON_SVG['volume-2']}</span>
             <input id="volume" class="volume" type="range" min="0" max="100" step="1" value="100" title="音量" aria-label="音量">
             <span class="volume-value" id="volume-value">100%</span>
+            <span class="close-gap" aria-hidden="true"></span>
         </div>
     </div>
     <div class="lyric" id="lyric" data-layout="text">
