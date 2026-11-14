@@ -2322,6 +2322,11 @@ body[data-desktop="true"] .topbar { visibility: hidden; }
 .row.current .row-sub { text-overflow: clip; }
 /* 1.8.1：当前句在横向滚动时改成左对齐 —— 居中会把句子开头裁掉，第一秒就看不到从哪开始。 */
 .row.current.is-scrolling { text-align: left; }
+/*
+ * 1.8.8：上一行改成左对齐时，译文行也跟着继承了 left，表现为「切到悬浮窗后译文靠左、
+ * 等这一句唱完才回正中」。译文不参与横向滚动，这里显式拉回居中。
+ */
+.row.current.is-scrolling .row-sub { text-align: center; }
 /* 1.8.1 逐字染色：只在「已唱 / 未唱」两态之间切 class，颜色与透明度来自 CSS 变量。 */
 .word { transition: color 0.1s linear, opacity 0.1s linear; }
 .word.is-unsung { opacity: var(--unsung-opacity, 0.55); }
