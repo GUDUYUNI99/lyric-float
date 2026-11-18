@@ -187,6 +187,11 @@ const SHOWN_FRAME_WAIT_MS = 200;
 // 1.8.4：上屏之后强制摘「显示中」铺底的最长等待（ms）。暂停/停止时 client 不再发新帧，
 // 旧逻辑等「下一帧」会永远等不到，body.showing 挂住 → 窗口铺底色、按钮显隐错乱。
 const SHOW_RELEASE_MS = 320;
+// 1.8.9：页面等不到「这次显示之后的新帧」时，不再拿现有画面回信（那就是旧句闪一下的成因），
+// 改为再向 client 要一帧，最多要 SHOW_RETRY_LIMIT 次；仍等不到才用空白上屏。
+const SHOW_RETRY_LIMIT = 2;
+// 1.8.9 页面 → 主进程：握手还没等到新帧，麻烦再让 client 强制发一帧。
+const IPC_NEED_FRAME = 'lyric-float:need-frame';
 // 右上角 ×（1.4.0，页面→主进程）：只隐藏悬浮窗，不停用模组。重新显示走播放条上的「词」按钮。
 const IPC_CLOSE = 'lyric-float:close';
 // 1.5.1 显示握手（解决「× 关掉再打开时先闪一下旧画面」）：
@@ -1074,6 +1079,14 @@ const WIDGET_HTML = `<!DOCTYPE html>
         opacity: 1;
     }
     /*
+     * 1.8.9 显示握手中（body.show-pending）：把歌词区压住。
+     * 只在「窗口本来不可见」时挂上，收到这次显示之后的第一帧有效快照再摘掉。
+     * 于是任何兜底提前上屏最多是短暂空白，绝不会再露出上一个句子。
+     */
+    body.show-pending .lyric {
+        opacity: 0;
+    }
+    /*
      * 右上角的关闭按钮（1.4.0）：只隐藏悬浮窗，不停用模组（播放条上的「词」按钮能找回来）。
      * 位置和控制条同一行（top 10px），悬停才露面；固定态不出现 —— 那时整窗忽略鼠标、
      * 只有解锁键那一小块可点，露出来也点不到，反而像个失效的按钮。
@@ -1411,7 +1424,10 @@ const renderKaraokeLine = (line, payload, receivedAt) => {
         return false;
     }
     const key = String(line.text || '') + '|' + words.map((word) => word.startTime).join(',');
-    if (!karaoke || karaoke.key !== key) {
+    // 1.8.9：span 被别的路径（显示握手清字、重新渲染）摘出 DOM 后，key 还是同一个，
+    // 只重设基准就会画在已经脱离文档的节点上 → 原文空白。这里补一道 isConnected 保险。
+    const detached = Boolean(karaoke && karaoke.spans.length && !karaoke.spans[0].el.isConnected);
+    if (!karaoke || detached || karaoke.key !== key) {
         stopKaraoke();
         els.lineTrack.textContent = '';
         const spans = [];
@@ -1853,6 +1869,8 @@ let shownPending = false;
 let showTimer = null;
 // 1.8.4：上屏后摘「显示中」铺底的兜底定时器（见 flushShown）。
 let showReleaseTimer = null;
+// 1.8.9：这次显示握手已经重试过几次（见 waitForFreshFrame）。
+let showRetry = 0;
 // 1.5.6 铺底：applyShownStyle 挂上 body.showing（底色 + 控制条提前展开），
 // releaseShownStyle 在上屏之后的第一帧快照里撤掉，交还给悬停规则。
 const applyShownStyle = () => {
@@ -1888,7 +1906,39 @@ const syncShownState = () => {
     // 旧判据会把这次握手判成「永远等不到」，最后走 400ms 兜底、上屏旧句。
     // 现在 IPC_SHOW 会把旧字清掉，所以标记之后的第一帧一定是新内容。
     applyShownStyle();
+    releaseShowPending();
     flushShown();
+};
+
+// 1.8.9：摘掉显示握手期间的歌词遮罩（规则见 body.show-pending）。
+const releaseShowPending = () => {
+    document.body.classList.remove('show-pending');
+};
+
+/**
+ * 1.8.9：等「这次显示之后生成」的第一帧再上屏。
+ * 原先 200ms 一到就拿现有画面回信 —— 页面上停着的是关闭那一刻的句子，上屏就成了「闪一下旧句」。
+ * 现在改成先向 client 再要一帧（最多 SHOW_RETRY_LIMIT 次），仍等不到才用空白上屏：
+ * 歌词区在 IPC_SHOW 时已清空并挂了遮罩，所以最差也只是空一下，绝不会露出别的句子。
+ */
+const waitForFreshFrame = () => {
+    if (showTimer) {
+        clearTimeout(showTimer);
+        showTimer = null;
+    }
+    showTimer = setTimeout(() => {
+        showTimer = null;
+        if (!shownPending) return;
+        if (showRetry < ${SHOW_RETRY_LIMIT}) {
+            showRetry += 1;
+            ipcRenderer.send('${IPC_NEED_FRAME}');
+            waitForFreshFrame();
+            return;
+        }
+        applyShownStyle();
+        releaseShowPending();
+        flushShown();
+    }, ${SHOWN_FRAME_WAIT_MS});
 };
 // 主进程在页面加载完后推来上次的排版选择（值不合法就保持默认的 text）。
 ipcRenderer.on('${IPC_LAYOUT}', (event, value) => {
@@ -1918,10 +1968,17 @@ ipcRenderer.on('${IPC_SHOW}', (event, info) => {
     // 1.8.5：只有窗口当时不可见才清字。窗口已经可见时清空就是一次肉眼可见的「闪白」，
     // 这次显示不需要再藏旧画面（本来就在屏幕上）。
     const wasVisible = Boolean(info && info.visible);
+    showRetry = 0;
     if (!wasVisible) {
+        // 1.8.9：清字之前必须先把逐字状态作废。1.8.5 只清了 DOM 没清 karaoke，
+        // 下一帧同句 key 相同 → renderKaraokeLine 不重建 span、只重设基准 → 原文永久空白，
+        // 只剩译文（真机「重开后原文消失、只剩译文」就是这么来的）。
+        stopKaraoke();
         if (els.lineTrack) els.lineTrack.textContent = '';
         if (els.transTrack) els.transTrack.textContent = '';
         if (els.trans) els.trans.hidden = true;
+        // 1.8.9：遮住歌词区，等这次显示之后的第一帧有效快照再摘掉。
+        document.body.classList.add('show-pending');
     }
     // 先把旧画面压住（窗口还没上屏，这一步是防「万一露出来」和「同步 render 重绘后空一帧」）。
     applyShownStyle();
@@ -1932,13 +1989,8 @@ ipcRenderer.on('${IPC_SHOW}', (event, info) => {
     // 控制器标成「显示中」：按钮立刻点亮；同时整窗先穿透（窗口还没上屏，万一在握手期间露出来
     // 也不能吃点击；上屏后主进程会把穿透状态改回真实的，见 ignore-hint）。
     ipcRenderer.send('${IPC_IGNORE_HINT}', true);
-    // 兜底：400ms 等不到新帧就用现有画面回信（回信前同样先铺底）。
-    showTimer = setTimeout(() => {
-        showTimer = null;
-        if (!shownPending) return;
-        applyShownStyle();
-        flushShown();
-    }, ${SHOWN_FRAME_WAIT_MS});
+    // 1.8.9：等不到新帧时不再「用现有画面回信」，改为再要一帧（见 waitForFreshFrame）。
+    waitForFreshFrame();
 });
 applyLayoutButton();
 
@@ -2077,6 +2129,13 @@ window.addEventListener('blur', stopVolumeDragging);
 els.volume.addEventListener('lostpointercapture', stopVolumeDragging);
 
 ipcRenderer.on('${IPC_DATA}', (event, payload) => {
+    const sentAt = Number(payload && payload.sentAt);
+    // 1.8.9：握手期间拒绝「画」旧帧 —— 1.8.5 只做到「不拿它回信」，但 render 是无条件的，
+    // 旧帧照样被画上屏，兜底一上屏就是旧句（偶发闪旧句的真正成因）。
+    if (shownPending && showMark && Number.isFinite(sentAt) && sentAt < showMark.since) {
+        debugToMain('握手中丢弃旧帧 sentAt=' + sentAt + ' since=' + showMark.since);
+        return;
+    }
     payloadFrame += 1;
     const frameNo = payloadFrame;
     render(payload, Date.now());
@@ -2090,7 +2149,6 @@ ipcRenderer.on('${IPC_DATA}', (event, payload) => {
         // 1.8.5：必须是「这次显示之后生成」的帧才放行（sentAt 由 client 生成快照时打）。
         // 旧版本只要收到任意一帧就回信，而 request-sync 那一帧和正常轮询帧会竞争，
         // 旧帧先到就先上屏旧句 —— 这就是「当前句闪」偶发的原因。
-        const sentAt = Number(payload && payload.sentAt);
         if (!Number.isFinite(sentAt) || sentAt >= showMark.since) {
             showMark.rendered = true;
             syncShownState();
@@ -5519,6 +5577,17 @@ module.exports = function activate(api) {
         noteShownFrame(shownGate, frame);
     };
 
+    /**
+     * 1.8.9：页面在显示握手里没等到「这次显示之后的新帧」。
+     * 以前直接拿现有画面回信，上屏就是旧句；现在由页面请求补发，主进程转给 client 强制重发。
+     */
+    const onNeedFrameFromWindow = (event) => {
+        if (!state.win || state.win.isDestroyed()) return;
+        if (event.sender !== state.win.webContents) return;
+        api.log.info(LOG_PREFIX + ' 显示握手未等到新帧，请求补发快照');
+        sendActionToClient({ action: 'request-sync' });
+    };
+
     ipcMain.on(IPC_ACTION, onActionFromWindowDebug);
     ipcMain.on(IPC_SHOWN_FRAME, onShownFrameFromWindow);
     ipcMain.on(IPC_DEBUG, onDebugFromWindow);
@@ -5529,6 +5598,8 @@ module.exports = function activate(api) {
     ipcMain.on(IPC_CLOSE, onCloseFromWindow);
     ipcMain.on(IPC_SHOWN, onShownFromWindow);
     ipcMain.on(IPC_IGNORE_HINT, onIgnoreHintFromWindow);
+    // 1.8.9：显示握手期间页面要不到新帧时，请主进程转给 client 强制重发。
+    ipcMain.on(IPC_NEED_FRAME, onNeedFrameFromWindow);
     // 1.7.0：悬浮窗歌词自己的控制通道（上一曲/播放/音量/循环/固定/桌面模式/播放列表/关闭）。
     ipcMain.on(IPC_POPUP_COMMAND, onPopupCommand);
     ipcMain.on(IPC_POPUP_POINTER_RECT, onPopupPointerRect);
@@ -5589,6 +5660,7 @@ module.exports = function activate(api) {
             ipcMain.removeListener(IPC_CLOSE, onCloseFromWindow);
             ipcMain.removeListener(IPC_SHOWN, onShownFromWindow);
             ipcMain.removeListener(IPC_IGNORE_HINT, onIgnoreHintFromWindow);
+            ipcMain.removeListener(IPC_NEED_FRAME, onNeedFrameFromWindow);
             ipcMain.removeListener(IPC_POPUP_COMMAND, onPopupCommand);
             ipcMain.removeListener(IPC_POPUP_POINTER_RECT, onPopupPointerRect);
             ipcMain.removeListener(IPC_TOGGLE_SURFACE, onToggleSurfaceFromWindow);
