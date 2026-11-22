@@ -93,6 +93,9 @@ const RPC_CONFIG = 'config';
 // 而配置真源在 client 侧，主进程会一直停在默认值（字号回 38）。
 const ACTION_REQUEST_CONFIG = 'request-config';
 const RPC_TOGGLE_PIN = 'toggle-pin';
+// 1.9.0 反馈闭环：导出诊断日志（主进程写文件并打开文件夹）/ 打开外部链接（反馈 issue）。
+const RPC_COLLECT_DIAGNOSTICS = 'collect-diagnostics';
+const RPC_OPEN_EXTERNAL = 'open-external';
 // 设置分区 id：设置 → 高级 → 模组 → 展开「悬浮窗歌词」。
 const SETTINGS_SECTION_ID = 'lyric-float';
 // 桌面歌词的字号范围（1.4.2 起就是这个范围，默认 38 不能动）。
@@ -944,8 +947,10 @@ const PROGRESS_BUTTON_CSS = `
     line-height: 1;
     cursor: pointer;
     color: inherit;
-    opacity: 0.4;
-    transition: opacity 0.15s ease, background-color 0.15s ease;
+    /* 1.9.0：常态 0.4 → 0.7 —— 全市场样本里我们最暗（enhanced-remote-widget 0.75、more-progress-buttons 0.7），
+       太暗会让新用户找不到这个开关；开启状态仍然完全不透明，对比度足够。 */
+    opacity: 0.7;
+    transition: opacity 0.18s ease, background-color 0.18s ease;
 }
 .lyric-float-btn:hover {
     opacity: 0.8;
@@ -1151,8 +1156,8 @@ const buildSettingsSection = () => ({
             type: 'select',
             label: L('桌面歌词字号', 'Desktop lyric font size'),
             description: L(
-                '桌面歌词的窗口高度会跟着字号一起缩放，歌词始终贴着窗口底部留白。',
-                'The desktop lyric window height follows the font size so the lyric keeps its bottom margin.',
+                '调大：窗口跟着变高、歌词更醒目；调小：更省桌面空间。窗口高度由字号决定，歌词始终贴住窗口底部留白。',
+                'Bigger grows the window and makes the lyric stand out; smaller saves desktop space. Window height follows the size.',
             ),
             group: L('桌面歌词', 'Desktop lyric'),
             defaultValue: String(FONT_SIZE_DEFAULT),
@@ -1163,8 +1168,8 @@ const buildSettingsSection = () => ({
             type: 'color',
             label: L('桌面歌词颜色', 'Desktop lyric color'),
             description: L(
-                '桌面歌词的原文与译文都用这个颜色，默认白色。',
-                'Both the line and its translation in the desktop lyric window use this color; white by default.',
+                '原文和译文都用这个颜色。深色壁纸配浅色（默认白），浅色壁纸配深色；和壁纸太接近会看不清。',
+                'Used by both the line and its translation. Light on dark wallpaper (white by default), dark on light; too close to the wallpaper reads poorly.',
             ),
             group: L('桌面歌词', 'Desktop lyric'),
             defaultValue: '#ffffff',
@@ -1174,8 +1179,8 @@ const buildSettingsSection = () => ({
             type: 'select',
             label: L('悬浮窗歌词字号', 'Popup lyric font size'),
             description: L(
-                '20–40 像素，只影响悬浮窗歌词；字号不随窗口大小变化，窗口拉宽只是每行能多放几个字。',
-                '20-40 px; only affects the popup lyric. The size never follows the window: widening shows more characters per line.',
+                '20–40 像素。只影响悬浮窗；字号不随窗口缩放 —— 把窗口拉宽只是每行多放几个字，仍放不下就横向滚动，不会自动变小。',
+                '20-40 px, popup only. The size never follows the window: widening shows more characters per line, and anything longer scrolls instead of shrinking.',
             ),
             group: L('悬浮窗歌词', 'Popup lyric'),
             defaultValue: String(POPUP_FONT_SIZE_DEFAULT),
@@ -1186,8 +1191,8 @@ const buildSettingsSection = () => ({
             type: 'color',
             label: L('悬浮窗歌词当前句颜色', 'Popup current line color'),
             description: L(
-                '只给悬浮窗歌词的当前句整句着色，不做逐字。',
-                'Colors the whole current line in the popup lyric window; no per-word coloring.',
+                '只给悬浮窗当前句整句着色，不做逐字。开了逐字染色时，这句的译文行会跟着用同色渐亮。',
+                'Colors the whole current line in the popup; no per-word coloring. With word-by-word on, the translation fades in with the same color.',
             ),
             group: L('悬浮窗歌词', 'Popup lyric'),
             defaultValue: '#eaf6ff',
@@ -1197,8 +1202,8 @@ const buildSettingsSection = () => ({
             type: 'boolean',
             label: L('逐字染色', 'Word-by-word coloring'),
             description: L(
-                '注意：只有歌词本身带逐字时间轴时才看得出效果，普通 LRC 一行一个词时间，看起来仍是整行同时变色。',
-                'Only lyrics that carry per-word timing show the effect; plain LRC lines keep one timing for the whole line.',
+                '开启后逐字染色：唱到的字换成「已唱字颜色」。只有带逐字时间轴的歌词看得出效果，普通 LRC 一行一个时间，看起来仍整行变色；译文行会整行跟着渐亮。',
+                'Colors words as they are sung. Only lyrics with per-word timing show it; plain LRC still changes the whole line at once. The translation line fades in with the line.',
             ),
             group: L('通用', 'Shared'),
             defaultValue: false,
@@ -1208,8 +1213,8 @@ const buildSettingsSection = () => ({
             type: 'color',
             label: L('已唱字颜色', 'Sung word color'),
             description: L(
-                '逐字染色开启时，已经唱到的字用这个颜色，其余字保持歌词颜色并降低透明度。',
-                'When word-by-word coloring is on, sung words use this color; the rest keep the lyric color at reduced opacity.',
+                '已唱到的字用这个颜色。和「桌面歌词颜色」「悬浮窗当前句颜色」要有明显差别，否则看不出唱到哪；太接近时主进程会在日志里提示对比度偏低。',
+                'Sung words use this color. Keep it clearly different from the lyric color, otherwise progress is invisible; the main process notes a low contrast warning in the log.',
             ),
             group: L('通用', 'Shared'),
             defaultValue: '#7dd3fc',
@@ -1219,8 +1224,8 @@ const buildSettingsSection = () => ({
             type: 'number',
             label: L('未唱字透明度', 'Unsung word opacity'),
             description: L(
-                '0.2–1，越小未唱的字越淡。',
-                '0.2-1; lower makes unsung words fainter.',
+                '0.2–1。越小，还没唱到的字越淡、进度对比越强；1 表示未唱字完全不透明。',
+                '0.2-1. Lower makes unsung words fainter and the progress contrast stronger; 1 keeps them fully opaque.',
             ),
             group: L('通用', 'Shared'),
             defaultValue: 0.55,
@@ -1233,8 +1238,8 @@ const buildSettingsSection = () => ({
             type: 'select',
             label: L('字体来源', 'Font source'),
             description: L(
-                '「跟随主题字体」用播放器当前主题解析出的字体栈。',
-                '"Theme" follows the player theme font stack.',
+                '「系统无衬线」和播放器界面一致；「跟随主题」用当前主题解析出的字体栈，某些主题会换成衬线字体（换了主题窗口里的字会跟着变）。',
+                '"System" matches the player UI; "Theme" uses the current theme font stack, so some themes switch to a serif face and the window text follows.',
             ),
             group: L('通用', 'Shared'),
             defaultValue: 'system',
@@ -1248,8 +1253,8 @@ const buildSettingsSection = () => ({
             type: 'select',
             label: L('底色', 'Background'),
             description: L(
-                '只在鼠标移到窗口上、且未锁定时出现（锁定穿透时不铺底色）。',
-                'Shown only while the pointer is over the window and it is not locked.',
+                '只在鼠标移到窗口上、且未锁定时出现；锁定（穿透）时不铺底色。想让歌词完全压在桌面上，选「不显示底色」。',
+                'Shown only while the pointer is over the window and it is unlocked. Choose "No background" to keep the lyric fully transparent on the desktop.',
             ),
             group: L('通用', 'Shared'),
             defaultValue: 'auto',
@@ -1264,7 +1269,10 @@ const buildSettingsSection = () => ({
             key: 'surfaceOpacity',
             type: 'number',
             label: L('底色不透明度', 'Background opacity'),
-            description: L('仅对深色底色生效，0.2–1.0。', 'Dark backgrounds only, 0.2-1.0.'),
+            description: L(
+                '仅深色底色生效，0.2–1.0。壁纸很花时调高更好读；想透出壁纸就调低。',
+                'Dark backgrounds only, 0.2-1.0. Raise it on busy wallpapers, lower it to let the wallpaper show through.',
+            ),
             group: L('通用', 'Shared'),
             defaultValue: 0.58,
             min: 0.2,
@@ -1275,7 +1283,10 @@ const buildSettingsSection = () => ({
             key: 'radius',
             type: 'number',
             label: L('窗口圆角', 'Window radius'),
-            description: L('0–28 像素；0 为直角。', '0-28 px; 0 means square corners.'),
+            description: L(
+                '0–28 像素；0 是直角。只改这个窗口自己的圆角，不动系统窗口的圆角。',
+                '0-28 px; 0 is square. Changes this window\'s corners only, not the system window rounding.',
+            ),
             group: L('通用', 'Shared'),
             defaultValue: 16,
             min: 0,
@@ -1286,6 +1297,10 @@ const buildSettingsSection = () => ({
             key: 'border',
             type: 'boolean',
             label: L('显示细描边', 'Show hairline border'),
+            description: L(
+                '悬停时窗口外那一圈细描边。关掉更干净，但在花壁纸上不太容易看出窗口边界。',
+                'The hairline outline while hovering. Off looks cleaner, but the window edge is harder to spot on busy wallpapers.',
+            ),
             group: L('通用', 'Shared'),
             defaultValue: true,
         },
@@ -1304,6 +1319,10 @@ const buildSettingsSection = () => ({
             key: 'pausedDim',
             type: 'boolean',
             label: L('暂停时整体变淡', 'Dim while paused'),
+            description: L(
+                '暂停时整块歌词变半透明，一眼能看出「歌停了」；播放中不受影响。',
+                'Makes the lyric translucent while paused so a stopped player is obvious; playback is unaffected.',
+            ),
             group: L('通用', 'Shared'),
             defaultValue: false,
         },
@@ -1314,8 +1333,8 @@ const buildSettingsSection = () => ({
             type: 'boolean',
             label: L('长句滚动', 'Scroll long lines'),
             description: L(
-                '放不下的长句子横向滚过去，速度跟着这一句剩余时间走。关掉时长的句子尾部省略号截断。',
-                'Scrolls lines that do not fit; speed follows the remaining time of the line. When off, long lines are truncated with an ellipsis.',
+                '桌面歌词专用：放不下的长句横向滚过去，速度跟着这一句剩余时间走。关掉时超长句用省略号截断。悬浮窗歌词始终按同样的规则滚动。',
+                'Desktop lyric only: long lines scroll, paced by the remaining time of the line. Off truncates them with an ellipsis. The popup lyric always scrolls by the same rule.',
             ),
             group: L('桌面歌词', 'Desktop lyric'),
             defaultValue: true,
@@ -1465,9 +1484,9 @@ const registerWidgetCommands = (folium, settings) => {
     const minor = (folium.host && folium.host.folium && folium.host.folium.minor) || 0;
     const handles = [];
     // 返回 Promise 而不是吞掉失败：命令面板会 await run，失败能显示在卡片上，而不是假装成功。
-    const callMain = (method) => {
+    const callMain = (method, payload) => {
         try {
-            return Promise.resolve(folium.rpc.call(method));
+            return Promise.resolve(folium.rpc.call(method, payload));
         } catch (error) {
             folium.log.warn('[lyric-float] 执行命令失败', error);
             return Promise.reject(error);
@@ -1548,6 +1567,82 @@ const registerWidgetCommands = (folium, settings) => {
         label: L('桌面歌词：字号 -1', 'Floating lyrics: font size -1'),
         keywords: ['歌词', '字号', '字体大小'],
         run: () => stepFontSize(-1),
+    });
+    // 1.9.0 反馈闭环（对齐 wallpaper-engine-bg 的做法：导出日志 + 带环境去开 issue）。
+    //   导出诊断：主进程收集「模组版本 / 宿主版本 / 当前设置 / 今日日志尾部」写成一个 txt 并打开文件夹；
+    //   反馈问题：把环境信息预填进 GitHub issue 正文，现象与截图由用户自己补。
+    const toast = (text, type) => {
+        try {
+            if (folium.ui && typeof folium.ui.toast === 'function') {
+                folium.ui.toast(text, { type, durationMs: 6000 });
+            }
+        } catch (error) {
+            folium.log.warn('[lyric-float] 提示显示失败', error);
+        }
+    };
+    add({
+        id: 'lyric-float-diagnostics',
+        label: L('歌词浮岛：导出诊断日志', 'Lyric Float: export diagnostics'),
+        description: L(
+            '把版本、设置和今天日志的尾部写成一个 txt 文件并打开所在文件夹；遇到问题时把这个文件一起发出去。',
+            'Writes versions, settings and today\'s log tail into a txt file and opens its folder; share that file when reporting a problem.',
+        ),
+        keywords: ['歌词', '诊断', '日志', '反馈', 'diagnostics', 'log', 'report'],
+        run: async () => {
+            const result = await callMain(RPC_COLLECT_DIAGNOSTICS, {
+                folium: (folium.host && folium.host.folium) || null,
+                context: folium.env && folium.env.context,
+            }).catch(() => null);
+            if (result && result.ok) {
+                toast(L('诊断日志已导出：' + result.path, 'Diagnostics exported: ' + result.path), 'success');
+                // 命令面板的摘要只认字符串 / { outputPath } / { message }，见 folium.d.ts。
+                return { outputPath: result.path };
+            }
+            const reason = (result && result.error) || '未知原因';
+            toast(L('导出失败：' + reason, 'Export failed: ' + reason), 'error');
+            return { message: L('导出失败：' + reason, 'Export failed: ' + reason) };
+        },
+    });
+    add({
+        id: 'lyric-float-report',
+        label: L('歌词浮岛：反馈问题', 'Lyric Float: report a problem'),
+        description: L(
+            '打开 GitHub 的 issue 页面，环境信息已经填好，你只需要写现象（能附截图更好）。',
+            'Opens the GitHub issue page with the environment prefilled; just describe what happened (a screenshot helps).',
+        ),
+        keywords: ['歌词', '反馈', '问题', 'bug', 'issue', 'report'],
+        run: async () => {
+            const modVersion = (folium.manifest && folium.manifest.version) || '';
+            const foliumVersion = folium.host && folium.host.folium
+                ? `${folium.host.folium.major}.${folium.host.folium.minor}.${folium.host.folium.patch}`
+                : 'unknown';
+            const body = [
+                '**现象 / What happened**',
+                '',
+                '',
+                '**复现步骤 / Steps**',
+                '1. ',
+                '',
+                '**环境 / Environment**',
+                `- 歌词浮岛 / Lyric Float: ${modVersion || 'unknown'}`,
+                `- Folium: ${foliumVersion}`,
+                `- 系统 / OS: ${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`,
+                '',
+                '**补充 / Extra**',
+                '如果方便，请把「歌词浮岛：导出诊断日志」生成的 txt 一起拖进来。',
+            ].join('\n');
+            const url = 'https://github.com/GUDUYUNI99/lyric-float/issues/new'
+                + '?title=' + encodeURIComponent('[Bug] ')
+                + '&body=' + encodeURIComponent(body);
+            const result = await callMain(RPC_OPEN_EXTERNAL, { url }).catch(() => null);
+            if (result && result.ok) {
+                toast(L('已打开反馈页面，请描述现象并拖入截图', 'Issue page opened; add what happened and a screenshot'), 'info');
+                return L('已打开反馈页面', 'Issue page opened');
+            }
+            const reason = (result && result.error) || '未知原因';
+            toast(L('打开失败：' + reason, 'Open failed: ' + reason), 'error');
+            return { message: L('打开失败：' + reason, 'Open failed: ' + reason) };
+        },
     });
     return handles;
 };

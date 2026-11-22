@@ -69,9 +69,10 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, shell } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const LOG_PREFIX = '[lyric-float]';
 
@@ -115,6 +116,9 @@ const IPC_POPUP_FRAME = 'lyric-float:popup-frame';
 const POPUP_SHOW_FALLBACK_MS = 320;
 const RPC_PLAYLIST_DATA = 'playlist-data';
 const RPC_PLAYBACK_HINT = 'playback-hint';
+// 1.9.0 反馈闭环：导出诊断日志（写 txt 并打开文件夹）/ 打开外部链接（反馈 issue）。
+const RPC_COLLECT_DIAGNOSTICS = 'collect-diagnostics';
+const RPC_OPEN_EXTERNAL = 'open-external';
 // 穿透态下「退出穿透」键的命中外扩（和桌面歌词固定键同一口径）。
 const POPUP_POINTER_PADDING = 2;
 
@@ -454,6 +458,58 @@ const normalizeConfig = (raw) => {
 };
 
 /**
+ * 1.9.0：自定义颜色对比度提醒。
+ * 宿主设置里挑颜色时不会告诉用户「挑了个和壁纸差不多的颜色」。这里按 WCAG 相对亮度算一下，
+ * 命中就在日志里说清楚哪一对颜色太接近、建议多少（不打断用户，也不改用户选的颜色）：
+ *   - 逐字染色时「已唱色」和歌词色对比太低 → 看不出唱到哪；
+ *   - 歌词色本身太暗 → 深色壁纸上整句看不清。
+ */
+const hexLuminance = (hex) => {
+    const value = typeof hex === 'string' ? hex.replace('#', '') : '';
+    if (!/^[0-9a-f]{6}$/i.test(value)) return null;
+    const channel = (offset) => {
+        const c = parseInt(value.slice(offset, offset + 2), 16) / 255;
+        return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    };
+    return 0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4);
+};
+const contrastRatioOf = (first, second) => {
+    const a = hexLuminance(first);
+    const b = hexLuminance(second);
+    if (a === null || b === null) return null;
+    const hi = Math.max(a, b);
+    const lo = Math.min(a, b);
+    return (hi + 0.05) / (lo + 0.05);
+};
+const contrastHintsOf = (config) => {
+    const hints = [];
+    if (config.shared.karaoke) {
+        const desktopRatio = contrastRatioOf(config.shared.lyricColor, config.shared.sungColor);
+        if (desktopRatio !== null && desktopRatio < 1.6) {
+            hints.push('已唱色 ' + config.shared.sungColor + ' 与桌面歌词色 ' + config.shared.lyricColor
+                + ' 对比度只有 ' + desktopRatio.toFixed(2) + '（建议 ≥ 1.6），逐字进度会看不出来');
+        }
+        const popupRatio = contrastRatioOf(config.shared.popupColor, config.shared.sungColor);
+        if (popupRatio !== null && popupRatio < 1.6) {
+            hints.push('已唱色 ' + config.shared.sungColor + ' 与悬浮窗当前句颜色 ' + config.shared.popupColor
+                + ' 对比度只有 ' + popupRatio.toFixed(2) + '（建议 ≥ 1.6），逐字进度会看不出来');
+        }
+    }
+    const desktopLuma = hexLuminance(config.shared.lyricColor);
+    if (desktopLuma !== null && desktopLuma < 0.02) {
+        hints.push('桌面歌词色 ' + config.shared.lyricColor + ' 偏暗（相对亮度 ' + desktopLuma.toFixed(3)
+            + '），深色壁纸上会看不清，建议调亮');
+    }
+    const popupLuma = hexLuminance(config.shared.popupColor);
+    if (popupLuma !== null && popupLuma < 0.02) {
+        hints.push('悬浮窗当前句颜色 ' + config.shared.popupColor + ' 偏暗（相对亮度 ' + popupLuma.toFixed(3)
+            + '），深色壁纸上会看不清，建议调亮');
+    }
+    return hints;
+};
+let lastContrastSignature = '';
+
+/**
  * 1.5.1：启动时先落一份默认配置，拿到 client 推来的真配置之前先用它建窗口。
  * 高度沿用上次的实际窗口高度（见 savePersistedState），字号 >38px 的用户重启不会先矮一截再变高；
  * 真配置一到就走 RPC_CONFIG → applyWindowSize，与这里无关。宽度始终 640。
@@ -669,7 +725,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
         border: 1px solid transparent;
         border-radius: var(--widget-radius, 16px);
         overflow: hidden;
-        transition: background-color 0.22s ease, border-color 0.22s ease, opacity 0.2s ease;
+        transition: background-color 0.22s ease, border-color 0.22s ease, opacity 0.22s ease;
     }
     body.hover:not(.pinned) .widget {
         background: rgba(0, 0, 0, var(--surface-alpha, 0.58));
@@ -963,7 +1019,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
         box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
         opacity: 0;
         pointer-events: none;
-        transition: opacity 0.12s ease;
+        transition: opacity 0.18s ease;
     }
     button:hover::after,
     button:focus-visible::after {
@@ -2265,7 +2321,7 @@ body.hover:not([data-desktop="true"]) .topbar { opacity: 1; pointer-events: auto
     color: #eaf6ff;
     opacity: 0.78;
     cursor: pointer;
-    transition: background 0.16s ease, opacity 0.16s ease, color 0.16s ease;
+    transition: background 0.18s ease, opacity 0.18s ease, color 0.18s ease;
 }
 .icon-btn:hover { background: rgba(125, 211, 252, 0.14); opacity: 1; }
 .icon-btn[data-on="true"] { color: #7dd3fc; opacity: 1; }
@@ -2351,7 +2407,11 @@ body[data-desktop="true"] .topbar { visibility: hidden; }
     padding: 2px 0;
     will-change: transform;
 }
-.rows.anim { transition: transform 0.24s cubic-bezier(0.25, 0.8, 0.35, 1); }
+/*
+ * 1.9.0：动效时长统一成两档 —— 悬停 / 控件 0.18s，容器与底色 0.22s。
+ * 之前这两个页面里散着 0.12 / 0.15 / 0.16 / 0.2 / 0.24s，同一类交互快慢不一，看起来像掉帧。
+ * （1.8.5 改掉整块重建后，旧的 .rows.anim 规则已经没人引用了，一并删掉。）
+ */
 
 .row {
     text-align: center;
@@ -5535,6 +5595,117 @@ module.exports = function activate(api) {
             return { ok: false };
         }
     });
+    // 1.9.0 反馈闭环：导出诊断日志 / 打开外部链接。
+    //   做法对齐已经上架的 wallpaper-engine-bg：那边是「导出错误日志」+「上报」两个按钮，
+    //   我们这里换成命令面板两个命令 —— 日志文件由主进程写（它有 fs，也读得到宿主日志目录），
+    //   打开链接也必须在主进程里做（模组 API 没有 openExternal，见 mods/folium.d.ts）。
+    const DIAGNOSTICS_LOG_TAIL_LINES = 240;
+    const readTodayLogTail = () => {
+        try {
+            const dir = path.join(app.getPath('appData'), 'Folia', 'logs', 'runtime');
+            if (!fs.existsSync(dir)) return '(日志目录不存在)';
+            const files = fs.readdirSync(dir)
+                .filter((name) => name.endsWith('.log'))
+                .map((name) => {
+                    const full = path.join(dir, name);
+                    return { full, mtime: fs.statSync(full).mtimeMs };
+                })
+                .sort((a, b) => b.mtime - a.mtime);
+            if (files.length === 0) return '(日志目录里没有 .log 文件)';
+            const text = fs.readFileSync(files[0].full, 'utf8');
+            const lines = text.split(/\r?\n/);
+            const tail = lines.slice(Math.max(0, lines.length - DIAGNOSTICS_LOG_TAIL_LINES));
+            return '文件：' + files[0].full + '\n\n' + tail.join('\n');
+        } catch (error) {
+            return '(读取日志失败：' + String((error && error.message) || error) + ')';
+        }
+    };
+    const writeDiagnosticsFile = (runtime) => {
+        const dir = path.join(app.getPath('userData'), 'diagnostics');
+        fs.mkdirSync(dir, { recursive: true });
+        const stamp = new Date();
+        const pad = (value) => String(value).padStart(2, '0');
+        const name = 'lyric-float-' + stamp.getFullYear() + pad(stamp.getMonth() + 1) + pad(stamp.getDate())
+            + '-' + pad(stamp.getHours()) + pad(stamp.getMinutes()) + pad(stamp.getSeconds()) + '.txt';
+        const file = path.join(dir, name);
+        let persisted = '(状态文件不存在)';
+        try {
+            if (fs.existsSync(stateFilePath())) persisted = fs.readFileSync(stateFilePath(), 'utf8');
+        } catch (error) {
+            persisted = '(读取状态文件失败：' + String((error && error.message) || error) + ')';
+        }
+        const lines = [
+            '歌词浮岛 / Lyric Float —— 诊断日志',
+            '生成时间 / Generated: ' + stamp.toString(),
+            '',
+            '== 版本 / Versions ==',
+            '- 模组 / mod: ' + ((api.manifest && api.manifest.version) || 'unknown'),
+            '- Folia: ' + app.getVersion(),
+            '- Folium: ' + (runtime.folium ? JSON.stringify(runtime.folium) : 'unknown'),
+            '- Electron: ' + process.versions.electron,
+            '- Chrome: ' + process.versions.chrome,
+            '- Node: ' + process.versions.node,
+            '- 平台 / Platform: ' + process.platform + ' ' + process.arch + ' ' + os.release(),
+            '- 上下文 / Context: ' + (runtime.context || 'unknown'),
+            '',
+            '== 运行状态 / Runtime ==',
+            '- 形态 / Surface: ' + state.surface,
+            '- 桌面歌词窗口 / Desktop window: visible=' + (state.win && !state.win.isDestroyed() ? state.win.isVisible() : 'destroyed')
+                + ' open=' + state.widgetOpen + ' pinned=' + state.pinned + ' layout=' + state.layout,
+            '- 悬浮窗歌词 / Popup: alive=' + Boolean(popupAlive())
+                + ' visible=' + (popupAlive() ? popupAlive().isVisible() : false)
+                + ' pinned=' + state.popupPinned + ' layout=' + state.popupLayout
+                + ' desktopMode=' + state.popupDesktop,
+            '- 置顶重申 / Topmost watch: ' + Boolean(state.topmostTick),
+            '',
+            '== 当前配置 / Config ==',
+            JSON.stringify(state.config, null, 2),
+            '',
+            '== 状态文件 / State file ==',
+            persisted,
+            '',
+            '== 今日日志尾部 / Log tail ==',
+            readTodayLogTail(),
+            '',
+        ];
+        fs.writeFileSync(file, lines.join('\n'), 'utf8');
+        return file;
+    };
+    api.rpc.handle(RPC_COLLECT_DIAGNOSTICS, (payload) => {
+        try {
+            const file = writeDiagnosticsFile({
+                folium: payload && payload.folium,
+                context: payload && payload.context,
+            });
+            api.log.info(LOG_PREFIX + ' 诊断日志已导出', file);
+            try {
+                shell.showItemInFolder(file);
+            } catch (error) {
+                api.log.warn(LOG_PREFIX + ' 打开诊断日志所在文件夹失败', error);
+            }
+            return { ok: true, path: file };
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 导出诊断日志失败', error);
+            return { ok: false, error: String((error && error.message) || error) };
+        }
+    });
+    api.rpc.handle(RPC_OPEN_EXTERNAL, async (payload) => {
+        const raw = payload && typeof payload.url === 'string' ? payload.url.trim() : '';
+        let parsed;
+        try {
+            parsed = new URL(raw);
+        } catch (error) {
+            return { ok: false, error: 'bad-url' };
+        }
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return { ok: false, error: 'bad-url' };
+        try {
+            await shell.openExternal(parsed.toString());
+            return { ok: true };
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 打开外部链接失败', error);
+            return { ok: false, error: 'open-failed' };
+        }
+    });
     api.rpc.handle(RPC_TOGGLE_DESKTOP_MODE, () => ({ desktopMode: togglePopupDesktop() }));
     // 1.5.0：配置真源在宿主的模组设置里，client 每次变化后整份推过来。
     // 这里只做校验与生效：改窗口高度、把整份配置转给页面；没变化就不动，免得每帧都重设尺寸。
@@ -5550,6 +5721,17 @@ module.exports = function activate(api) {
             LOG_PREFIX + ' 配置已更新',
             JSON.stringify({ shared: next.shared, desktop: next.desktop }),
         );
+        // 1.9.0：颜色对比度提醒。同样一次配置只报一次，避免每帧刷屏。
+        try {
+            const hints = contrastHintsOf(next);
+            const signature = hints.join('|');
+            if (signature !== lastContrastSignature) {
+                lastContrastSignature = signature;
+                for (const hint of hints) api.log.warn(LOG_PREFIX + ' 配色提醒：' + hint);
+            }
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 配色对比度检查失败', error);
+        }
         return { changed: true, height: windowHeightFor(next) };
     });
     // 1.5.0：命令面板的「锁定 / 解锁」。和页面上那个固定键走同一套状态，命令回来的结果自带新值。
