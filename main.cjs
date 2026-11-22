@@ -277,6 +277,8 @@ const ICON_PATHS = {
     'list-music': '<path d="M21 15V6"/><path d="M18.5 18a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5"/><path d="M12 12H3"/><path d="M16 6H3"/><path d="M12 18H3"/>',
     // 1.7.0：形态切换（桌面歌词 ⇄ 悬浮窗歌词）：外框里套一个小窗，示意「换成可缩放的悬浮窗」。
     popup: '<rect width="20" height="14" x="2" y="4" rx="2"/><rect width="8" height="6" x="12" y="10" rx="1"/><path d="M6 8h4"/>',
+    // 1.9.1：收藏（喜欢）当前歌曲。只有一条路径，已收藏由 CSS 用 currentColor 填实（见 #like[data-mode="on"]）。
+    heart: '<path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/>',
 };
 
 /** 包一层 <svg>：只有 filled 的图标用 currentColor 填实（和播放器的 Pause/Play 一致）。 */
@@ -308,6 +310,8 @@ const ICON_SVG = {
     'volume-1': svgIcon('volume-1'),
     'volume-2': svgIcon('volume-2'),
     'volume-x': svgIcon('volume-x'),
+    // 1.9.1：收藏键。已收藏只是换 CSS 填充色（不换图形），避免两套路径不一致。
+    heart: svgIcon('heart'),
     layout: layoutIcon,
     pin: svgIcon('pin'),
     'pin-off': svgIcon('pin-off'),
@@ -1115,6 +1119,41 @@ const WIDGET_HTML = `<!DOCTYPE html>
         text-align: center;
         background: rgba(8, 22, 36, 0.55);
         border-radius: 6px;
+        cursor: pointer;
+    }
+    /* 1.9.1：点百分比就地变输入框。输入框要和胶囊同宽同高，切换时不跳。 */
+    .volume-input {
+        flex: none;
+        width: 48px;
+        box-sizing: border-box;
+        padding: 1px 3px;
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1.4;
+        font-variant-numeric: tabular-nums;
+        text-align: center;
+        color: #eaf6ff;
+        background: rgba(8, 22, 36, 0.85);
+        border: 1px solid #7dd3fc;
+        border-radius: 6px;
+        outline: none;
+        -webkit-app-region: no-drag;
+        /* 去掉 number 输入的上下箭头，避免误点成步进。 */
+        -moz-appearance: textfield;
+        appearance: textfield;
+    }
+    .volume-input::-webkit-outer-spin-button,
+    .volume-input::-webkit-inner-spin-button {
+        -webkit-appearance: none;
+        margin: 0;
+    }
+    /* 1.9.1：收藏键。已收藏填实；当前歌曲不支持收藏（canLike=false）时压暗且不可点。 */
+    #like[data-mode="on"] .icon {
+        fill: currentColor;
+    }
+    #like:disabled {
+        opacity: 0.32;
+        cursor: default;
     }
     body.volume-dragging .volume-value {
         color: #7dd3fc;
@@ -1180,6 +1219,7 @@ const WIDGET_HTML = `<!DOCTYPE html>
             <button id="prev" type="button" data-tip="上一首" aria-label="上一首">${ICON_SVG.prev}</button>
             <button id="toggle" type="button" data-tip="播放" aria-label="播放">${ICON_SVG.play}</button>
             <button id="next" type="button" data-tip="下一首" aria-label="下一首">${ICON_SVG.next}</button>
+            <button id="like" type="button" data-tip="收藏" aria-label="收藏" data-mode="off">${ICON_SVG.heart}</button>
             <button id="surface" type="button" data-tip="切换到悬浮窗歌词" aria-label="切换到悬浮窗歌词">${ICON_SVG.popup}</button>
         </div>
         <button id="pin" type="button" data-tip="固定位置" aria-label="固定位置" data-mode="floating">${ICON_SVG.pin}</button>
@@ -1188,7 +1228,8 @@ const WIDGET_HTML = `<!DOCTYPE html>
             <button id="layout" type="button" data-tip="排版：只显示原文" aria-label="排版" data-mode="text">${ICON_SVG.layout}</button>
             <span class="volume-icon" id="volume-icon" aria-hidden="true">${ICON_SVG['volume-2']}</span>
             <input id="volume" class="volume" type="range" min="0" max="100" step="1" value="100" title="音量" aria-label="音量">
-            <span class="volume-value" id="volume-value">100%</span>
+            <span class="volume-value" id="volume-value" role="button" tabindex="0" title="点击输入音量（0–100）">100%</span>
+            <input id="volume-input" class="volume-input" type="number" min="0" max="100" step="1" inputmode="numeric" aria-label="音量百分比" hidden>
             <span class="close-gap" aria-hidden="true"></span>
         </div>
     </div>
@@ -1218,6 +1259,7 @@ const els = {
     prev: document.getElementById('prev'),
     toggle: document.getElementById('toggle'),
     next: document.getElementById('next'),
+    like: document.getElementById('like'),
     loop: document.getElementById('loop'),
     layout: document.getElementById('layout'),
     surface: document.getElementById('surface'),
@@ -1226,6 +1268,7 @@ const els = {
     volume: document.getElementById('volume'),
     volumeIcon: document.getElementById('volume-icon'),
     volumeValue: document.getElementById('volume-value'),
+    volumeInput: document.getElementById('volume-input'),
     close: document.getElementById('close'),
 };
 
@@ -1262,6 +1305,8 @@ const volumeIconName = (percent) => {
 let volumeDragging = false;
 let volumeTimer = null;
 let lastVolumeSent = null;
+// 1.9.1：正在手输音量时，主进程回推的帧不许覆盖输入框（否则打一个字就被上一帧拽回去）。
+let volumeEditing = false;
 
 const sendAction = (payload) => {
     debugToMain('sendAction: ' + JSON.stringify(payload));
@@ -1856,7 +1901,18 @@ const render = (payload, receivedAt) => {
     els.loop.setAttribute('data-mode', loopMode);
     setButtonLabel(els.loop, '循环模式：' + LOOP_TITLES[loopMode]);
 
-    if (!volumeDragging) {
+    // 1.9.1：收藏键状态。canLike=false（本地文件 / 外部舞台 / 电台）时压暗不可点，
+    // 否则「点了没反应」会被当成 bug。
+    const liked = payload.liked === true;
+    const canLike = payload.canLike === true;
+    if (els.like) {
+        els.like.dataset.mode = canLike ? (liked ? 'on' : 'off') : 'off';
+        els.like.disabled = !canLike;
+        els.like.setAttribute('aria-pressed', liked ? 'true' : 'false');
+        setButtonLabel(els.like, canLike ? (liked ? '取消收藏' : '收藏') : '当前歌曲不支持收藏');
+    }
+
+    if (!volumeDragging && !volumeEditing) {
         const volume = Number.isFinite(payload.volume) ? payload.volume : 1;
         const percent = Math.round(Math.min(1, Math.max(0, volume)) * 100);
         els.volume.value = String(percent);
@@ -1895,6 +1951,8 @@ const scheduleVolume = () => {
 els.prev.addEventListener('click', () => sendAction('prev'));
 els.toggle.addEventListener('click', () => sendAction('toggle'));
 els.next.addEventListener('click', () => sendAction('next'));
+// 1.9.1：收藏当前歌曲（结果由下一帧 payload.liked 回写，按钮会自己亮/灭）。
+els.like.addEventListener('click', () => sendAction({ type: 'toggle-like' }));
 els.loop.addEventListener('click', () => sendAction({ type: 'cycle-loop' }));
 // 排版切换是纯显示逻辑，不用问宿主：切完用最后一次快照就地重渲染。
 els.layout.addEventListener('click', () => {
@@ -2161,6 +2219,7 @@ const setVolumeDragging = (dragging) => {
 };
 
 els.volume.addEventListener('pointerdown', () => {
+    if (volumeEditing) endVolumeEdit(true);
     setVolumeDragging(true);
 });
 els.volume.addEventListener('input', () => {
@@ -2183,6 +2242,58 @@ window.addEventListener('pointerup', stopVolumeDragging);
 window.addEventListener('pointercancel', stopVolumeDragging);
 window.addEventListener('blur', stopVolumeDragging);
 els.volume.addEventListener('lostpointercapture', stopVolumeDragging);
+
+// 1.9.1：点百分比就地变输入框（0–100 整数）。Enter / 失焦提交，Esc 取消。
+// 输入期间 volumeEditing 为真：render() 不再用回推帧覆盖输入框，拖动滑块也会先结束输入。
+const clampPercent = (value) => Math.min(100, Math.max(0, Math.round(Number(value))));
+const endVolumeEdit = (commit) => {
+    if (!volumeEditing) return;
+    volumeEditing = false;
+    const typed = Number(els.volumeInput.value);
+    els.volumeInput.hidden = true;
+    els.volumeValue.hidden = false;
+    if (!commit || !Number.isFinite(typed)) {
+        els.volumeValue.textContent = Math.round(Number(els.volume.value)) + '%';
+        return;
+    }
+    const percent = clampPercent(typed);
+    els.volume.value = String(percent);
+    els.volumeValue.textContent = percent + '%';
+    lastVolumeSent = percent;
+    setIcon(els.volumeIcon, volumeIconName(percent));
+    sendAction({ type: 'set-volume', value: percent });
+    // 用户要求（1.9.1）：静音时手输音量「输多少就调成多少」——顺带取消静音，否则听不到效果。
+    if (lastPayload && lastPayload.muted === true) sendAction({ type: 'set-muted', muted: false });
+    debugToMain('volume edit commit: ' + percent);
+};
+const startVolumeEdit = () => {
+    if (volumeEditing) return;
+    volumeEditing = true;
+    const current = Math.round(Number(els.volume.value));
+    els.volumeInput.value = String(Number.isFinite(current) ? current : 100);
+    els.volumeValue.hidden = true;
+    els.volumeInput.hidden = false;
+    els.volumeInput.focus();
+    els.volumeInput.select();
+};
+els.volumeValue.addEventListener('click', startVolumeEdit);
+els.volumeValue.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        startVolumeEdit();
+    }
+});
+els.volumeInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        endVolumeEdit(true);
+    } else if (event.key === 'Escape') {
+        event.preventDefault();
+        endVolumeEdit(false);
+    }
+});
+els.volumeInput.addEventListener('blur', () => endVolumeEdit(true));
+els.volumeInput.addEventListener('click', (event) => event.stopPropagation());
 
 ipcRenderer.on('${IPC_DATA}', (event, payload) => {
     const sentAt = Number(payload && payload.sentAt);
@@ -2376,7 +2487,34 @@ body[data-desktop="true"] .topbar { visibility: hidden; }
     font-variant-numeric: tabular-nums;
     color: #eaf6ff;
     opacity: 0.85;
+    cursor: pointer;
 }
+/* 1.9.1：点百分比就地变输入框（0–100 整数）。 */
+.volume-input {
+    flex: 0 0 auto;
+    width: 34px;
+    box-sizing: border-box;
+    padding: 0 2px;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+    color: #eaf6ff;
+    background: rgba(8, 22, 36, 0.85);
+    border: 1px solid #7dd3fc;
+    border-radius: 5px;
+    outline: none;
+    -webkit-app-region: no-drag;
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+.volume-input::-webkit-outer-spin-button,
+.volume-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+/* 1.9.1：收藏键。已收藏填实；当前歌曲不支持收藏时压暗不可点。 */
+#like[data-mode="on"] .icon { fill: currentColor; color: #7dd3fc; }
+#like:disabled { opacity: 0.32; cursor: default; }
 /* 右列放不下的按钮挪到左列音量条下方（用户要求：先缩音量条的空间）。 */
 .rail-extra {
     flex: 0 0 auto;
@@ -2538,7 +2676,8 @@ body[data-desktop="true"][data-pointer="true"] #desktop-exit { opacity: 1; }
         <div class="rail left" id="rail-left">
             <span class="volume-icon" id="volume-icon">${ICON_SVG['volume-2']}</span>
             <input id="volume" type="range" min="0" max="100" step="1" value="100" aria-label="音量" />
-            <span id="volume-value">100%</span>
+            <span id="volume-value" role="button" tabindex="0" title="点击输入音量（0–100）">100%</span>
+            <input id="volume-input" class="volume-input" type="number" min="0" max="100" step="1" inputmode="numeric" aria-label="音量百分比" hidden>
             <div class="rail-extra" id="rail-extra"></div>
         </div>
 
@@ -2550,6 +2689,7 @@ body[data-desktop="true"][data-pointer="true"] #desktop-exit { opacity: 1; }
             <button id="surface" class="icon-btn" type="button" title="切换到桌面歌词" aria-label="切换到桌面歌词">${ICON_SVG.popup}</button>
             <button id="layout" class="icon-btn" type="button" data-mode="text" title="歌词排版：原文" aria-label="歌词排版">${ICON_SVG.layout}</button>
             <button id="playlist" class="icon-btn" type="button" title="播放列表" aria-label="播放列表">${ICON_SVG['list-music']}</button>
+            <button id="like" class="icon-btn" type="button" title="收藏" aria-label="收藏" data-mode="off">${ICON_SVG.heart}</button>
             <button id="loop" class="icon-btn" type="button" title="循环模式：不循环" aria-label="循环模式">${ICON_SVG['loop-off']}</button>
             <button id="prev" class="icon-btn" type="button" title="上一首" aria-label="上一首">${ICON_SVG.prev}</button>
             <button id="toggle" class="icon-btn" type="button" title="播放/暂停" aria-label="播放/暂停">${ICON_SVG.play}</button>
@@ -2611,12 +2751,14 @@ const els = {
     playlistList: document.getElementById('playlist-list'),
     playlistClose: document.getElementById('playlist-close'),
     playlist: document.getElementById('playlist'),
+    like: document.getElementById('like'),
     surface: document.getElementById('surface'),
     layout: document.getElementById('layout'),
     close: document.getElementById('close'),
     volume: document.getElementById('volume'),
     volumeIcon: document.getElementById('volume-icon'),
     volumeValue: document.getElementById('volume-value'),
+    volumeInput: document.getElementById('volume-input'),
 };
 
 const setIcon = (element, name) => {
@@ -2641,6 +2783,8 @@ let lastLineIndex = null;
 let volumeDragging = false;
 let volumeTimer = null;
 let lastVolumeSent = null;
+// 1.9.1：手输音量期间不接收回推帧的音量覆盖。
+let volumeEditing = false;
 let popupLayout = 'text';
 let config = { shared: { popupFontSize: ${POPUP_FONT_SIZE_DEFAULT}, popupColor: '#eaf6ff', karaoke: false, sungColor: '#7dd3fc', unsungOpacity: 0.55 } };
 // 滚动歌词的几何量：每次 fitLayout 重算。
@@ -3084,7 +3228,17 @@ const render = (payload) => {
     els.loop.dataset.mode = loopMode;
     els.loop.title = '循环模式：' + LOOP_TITLES[loopMode];
 
-    if (!volumeDragging) {
+    // 1.9.1：收藏键状态（canLike=false 时压暗不可点）。
+    if (els.like) {
+        const liked = payload.liked === true;
+        const canLike = payload.canLike === true;
+        els.like.dataset.mode = canLike && liked ? 'on' : 'off';
+        els.like.disabled = !canLike;
+        els.like.setAttribute('aria-pressed', liked ? 'true' : 'false');
+        els.like.title = canLike ? (liked ? '取消收藏' : '收藏') : '当前歌曲不支持收藏';
+    }
+
+    if (!volumeDragging && !volumeEditing) {
         const volume = Number.isFinite(payload.volume) ? payload.volume : 1;
         const percent = Math.round(Math.min(1, Math.max(0, volume)) * 100);
         els.volume.value = String(percent);
@@ -3097,7 +3251,7 @@ const render = (payload) => {
 };
 
 /** 按可用高度把 8 颗按钮分配到右列 / 左列（放不下时先缩音量条的空间）。 */
-const BUTTON_ORDER = ['surface', 'layout', 'playlist', 'loop', 'prev', 'toggle', 'next'];
+const BUTTON_ORDER = ['surface', 'layout', 'playlist', 'like', 'loop', 'prev', 'toggle', 'next'];
 const packRails = () => {
     if (!els.railRight || !els.railExtra) return;
     const stageHeight = els.stage ? els.stage.clientHeight : 0;
@@ -3149,6 +3303,8 @@ if (els.desktop) els.desktop.addEventListener('click', () => sendCommand({ type:
 if (els.desktopExit) els.desktopExit.addEventListener('click', () => sendCommand({ type: 'toggle-desktop' }));
 if (els.surface) els.surface.addEventListener('click', () => sendCommand({ type: 'toggle-surface' }));
 if (els.playlist) els.playlist.addEventListener('click', () => togglePlaylistPanel());
+// 1.9.1：收藏当前歌曲（结果由下一帧 payload.liked 回写）。
+if (els.like) els.like.addEventListener('click', () => sendCommand({ type: 'toggle-like' }));
 if (els.prev) els.prev.addEventListener('click', () => sendCommand({ type: 'prev' }));
 if (els.toggle) els.toggle.addEventListener('click', () => sendCommand({ type: 'toggle' }));
 if (els.next) els.next.addEventListener('click', () => sendCommand({ type: 'next' }));
@@ -3177,7 +3333,7 @@ const scheduleVolume = () => {
     }, 150);
 };
 if (els.volume) {
-    const startDrag = () => { volumeDragging = true; };
+    const startDrag = () => { if (volumeEditing) endVolumeEdit(true); volumeDragging = true; };
     const stopDrag = () => {
         if (!volumeDragging) return;
         volumeDragging = false;
@@ -3189,6 +3345,61 @@ if (els.volume) {
     els.volume.addEventListener('change', stopDrag);
     els.volume.addEventListener('pointerup', stopDrag);
     window.addEventListener('pointerup', stopDrag);
+}
+
+/* 1.9.1：点百分比就地变输入框（0–100 整数）。Enter / 失焦提交，Esc 取消。
+ * 输入期间 volumeEditing 为真：render() 不用回推帧覆盖输入框，拖音量条会先结束输入。 */
+const clampVolumePercent = (value) => Math.min(100, Math.max(0, Math.round(Number(value))));
+const endVolumeEdit = (commit) => {
+    if (!volumeEditing) return;
+    volumeEditing = false;
+    const typed = Number(els.volumeInput.value);
+    els.volumeInput.hidden = true;
+    els.volumeValue.hidden = false;
+    if (!commit || !Number.isFinite(typed)) {
+        els.volumeValue.textContent = Math.round(Number(els.volume.value)) + '%';
+        return;
+    }
+    const percent = clampVolumePercent(typed);
+    els.volume.value = String(percent);
+    els.volumeValue.textContent = percent + '%';
+    lastVolumeSent = percent;
+    setIcon(els.volumeIcon, percent > 0 ? (percent > 50 ? 'volume-2' : 'volume-1') : 'volume-x');
+    sendCommand({ type: 'set-volume', value: percent });
+    // 用户要求（1.9.1）：静音时手输音量「输多少就调成多少」——顺带取消静音，否则听不到效果。
+    if (lastPayload && lastPayload.muted === true) sendCommand({ type: 'set-muted', muted: false });
+};
+const startVolumeEdit = () => {
+    if (volumeEditing) return;
+    volumeEditing = true;
+    const current = Math.round(Number(els.volume.value));
+    els.volumeInput.value = String(Number.isFinite(current) ? current : 100);
+    els.volumeValue.hidden = true;
+    els.volumeInput.hidden = false;
+    els.volumeInput.focus();
+    els.volumeInput.select();
+};
+if (els.volumeValue) {
+    els.volumeValue.addEventListener('click', startVolumeEdit);
+    els.volumeValue.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            startVolumeEdit();
+        }
+    });
+}
+if (els.volumeInput) {
+    els.volumeInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            endVolumeEdit(true);
+        } else if (event.key === 'Escape') {
+            event.preventDefault();
+            endVolumeEdit(false);
+        }
+    });
+    els.volumeInput.addEventListener('blur', () => endVolumeEdit(true));
+    els.volumeInput.addEventListener('click', (event) => event.stopPropagation());
 }
 
 /* ---- 主进程 → 页面 ---- */
@@ -3653,6 +3864,11 @@ module.exports = function activate(api) {
                 }
                 case 'set-loop':
                     return LOOP_MODES.includes(raw.mode) ? { action: 'set-loop', mode: raw.mode } : null;
+                // 1.9.1：收藏 / 静音开关。静音是 set 语义（不是 toggle），两个窗口同时点也不会互相抵消。
+                case 'toggle-like':
+                    return { action: 'toggle-like' };
+                case 'set-muted':
+                    return { action: 'set-muted', muted: raw.muted !== false };
                 // 1.7.0：悬浮窗歌词的播放列表按钮 → client.mjs 调 folium.ui.openPlayerPanel()。
                 case 'open-playlist':
                     return { action: 'open-playlist' };
@@ -3680,7 +3896,10 @@ module.exports = function activate(api) {
             case 'prev':
             case 'toggle':
             case 'request-sync':
+            case 'toggle-like':
                 return { action: raw.type };
+            case 'set-muted':
+                return { action: 'set-muted', muted: raw.value !== false && raw.muted !== false };
             case 'open-playlist':
                 return { action: 'open-playlist' };
             default:

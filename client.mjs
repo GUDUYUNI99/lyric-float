@@ -614,6 +614,29 @@ const handleAction = (folium, message) => {
         case 'toggle':
             folium.playback.toggle();
             break;
+        // 1.9.1：收藏当前歌曲。canLike 为 false（本地文件 / 外部舞台 / 电台）时宿主自己的按钮也是灰的，
+        // 所以这里不发请求，直接回一句提示，避免「点了没反应」被当成 bug。
+        case 'toggle-like': {
+            let canLike = true;
+            try {
+                const playbackState = folium.playback.getState();
+                canLike = playbackState && playbackState.canLike === true;
+            } catch (error) {
+                folium.log.warn('[lyric-float] 收藏：读取 canLike 失败，按可收藏处理', error);
+            }
+            if (!canLike) {
+                folium.log.info('[lyric-float] 收藏：当前歌曲不支持收藏');
+                reportPlaybackHint(folium, '当前歌曲不支持收藏');
+                break;
+            }
+            const liked = folium.playback.toggleLike();
+            folium.log.info('[lyric-float] 收藏：toggleLike 返回 ' + liked);
+            break;
+        }
+        // 1.9.1：静音开关（set 语义，两个窗口同时点也不会互相抵消）。
+        case 'set-muted':
+            folium.playback.setMuted(message.muted !== false);
+            break;
         case 'set-volume': {
             // 只接受真正的 number：主进程发来 null / 字符串 / 缺字段时忽略，避免把音量误设成 0。
             const volume = message.volume;
