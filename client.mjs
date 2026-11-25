@@ -617,6 +617,11 @@ const handleAction = (folium, message) => {
         // 1.9.1：收藏当前歌曲。canLike 为 false（本地文件 / 外部舞台 / 电台）时宿主自己的按钮也是灰的，
         // 所以这里不发请求，直接回一句提示，避免「点了没反应」被当成 bug。
         case 'toggle-like': {
+            if (!folium.playback || typeof folium.playback.toggleLike !== 'function') {
+                folium.log.warn('[lyric-float] 收藏：当前宿主没有 toggleLike 接口，已跳过');
+                reportPlaybackHint(folium, '当前宿主版本不支持收藏');
+                break;
+            }
             let canLike = true;
             try {
                 const playbackState = folium.playback.getState();
@@ -635,6 +640,11 @@ const handleAction = (folium, message) => {
         }
         // 1.9.1：静音开关（set 语义，两个窗口同时点也不会互相抵消）。
         case 'set-muted':
+            // 2.0.0：老宿主可能还没有 setMuted，别让一次提示把整条指令链打断。
+            if (!folium.playback || typeof folium.playback.setMuted !== 'function') {
+                folium.log.warn('[lyric-float] set-muted：当前宿主没有 setMuted 接口，已跳过');
+                break;
+            }
             folium.playback.setMuted(message.muted !== false);
             break;
         case 'set-volume': {

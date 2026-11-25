@@ -5894,6 +5894,16 @@ module.exports = function activate(api) {
             return '(读取日志失败：' + String((error && error.message) || error) + ')';
         }
     };
+    // 2.0.0：诊断里带上窗口矩形，方便判断「位置顶出屏幕 / 尺寸算错」这类问题。
+    const boundsTextOf = (target) => {
+        if (!target || typeof target.isDestroyed !== 'function' || target.isDestroyed()) return 'destroyed';
+        try {
+            const bounds = target.getBounds();
+            return bounds.x + ',' + bounds.y + ',' + bounds.width + ',' + bounds.height;
+        } catch (error) {
+            return '(读取失败：' + String((error && error.message) || error) + ')';
+        }
+    };
     const writeDiagnosticsFile = (runtime) => {
         const dir = path.join(app.getPath('userData'), 'diagnostics');
         fs.mkdirSync(dir, { recursive: true });
@@ -5925,11 +5935,15 @@ module.exports = function activate(api) {
             '== 运行状态 / Runtime ==',
             '- 形态 / Surface: ' + state.surface,
             '- 桌面歌词窗口 / Desktop window: visible=' + (state.win && !state.win.isDestroyed() ? state.win.isVisible() : 'destroyed')
-                + ' open=' + state.widgetOpen + ' pinned=' + state.pinned + ' layout=' + state.layout,
+                + ' open=' + state.widgetOpen + ' pinned=' + state.pinned
+                // 2.0.0：桌面排版存在状态文件里（state.persisted.layout），原来打印的是不存在的 state.layout，恒为 undefined。
+                + ' layout=' + ((state.persisted && state.persisted.layout) || 'text')
+                + ' bounds=' + boundsTextOf(state.win),
             '- 悬浮窗歌词 / Popup: alive=' + Boolean(popupAlive())
                 + ' visible=' + (popupAlive() ? popupAlive().isVisible() : false)
                 + ' pinned=' + state.popupPinned + ' layout=' + state.popupLayout
-                + ' desktopMode=' + state.popupDesktop,
+                + ' desktopMode=' + state.popupDesktop
+                + ' bounds=' + boundsTextOf(popupAlive()),
             '- 置顶重申 / Topmost watch: ' + Boolean(state.topmostTick),
             // 1.9.2：置顶失败的现场，用户导出诊断日志时一并带上（没出问题时是 0）
             '- 置顶状态 / Topmost: ' + JSON.stringify({
