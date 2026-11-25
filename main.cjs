@@ -4387,6 +4387,38 @@ module.exports = function activate(api) {
      * 重绘是给透明分层窗口补帧（被完全遮挡期间 DWM 可能停更，露出来会显示旧画面）。
      * 独占全屏（D3D exclusive）绕开合成器，任何窗口都盖不上去 —— 那种情况只能让路。
      */
+    // 1.9.2：置顶失败的诊断状态。    // 2026-11-25 的真机日志里出现过「窗口可见、但调用完 setAlwaysOnTop(true) 之后 isAlwaysOnTop() 仍是 false」，
+    // 而原来的 catch 把异常吞掉了，查不出是系统拒绝置顶还是 Electron 返回值不准。这里把异常、重设结果和
+    // 持续时长记下来（只在状态变化时打日志，不会每秒刷屏），也写进「导出诊断日志」。
+    const topmostTrouble = {
+        win: { since: 0, lastError: '', lastWarnAt: 0 },
+        popup: { since: 0, lastError: '', lastWarnAt: 0 },
+    };
+    const reportTopmostTrouble = (key, error, onTopAfterReset) => {
+        const trouble = topmostTrouble[key];
+        const now = Date.now();
+        const reason = error ? (error.message || String(error)) : '强制重设后 isAlwaysOnTop() 仍为 false';
+        trouble.lastError = reason;
+        if (!trouble.since) {
+            trouble.since = now;
+            trouble.lastWarnAt = now;
+            api.log.warn(LOG_PREFIX + ' 置顶重申失败', JSON.stringify({ window: key, reason, onTopAfterReset }));
+            return;
+        }
+        // 持续失败：最多每 10 秒记一条，避免把日志刷满。
+        if (now - trouble.lastWarnAt >= 10000) {
+            trouble.lastWarnAt = now;
+            api.log.warn(LOG_PREFIX + ' 置顶重申持续失败', JSON.stringify({ window: key, reason, failedForMs: now - trouble.since }));
+        }
+    };
+    const clearTopmostTrouble = (key) => {
+        const trouble = topmostTrouble[key];
+        if (!trouble.since) return;
+        api.log.info(LOG_PREFIX + ' 置顶重申恢复', JSON.stringify({ window: key, failedForMs: Date.now() - trouble.since }));
+        trouble.since = 0;
+        trouble.lastError = '';
+        trouble.lastWarnAt = 0;
+    };
     const reassertTopmost = () => {
         // 1.8.4：改成「永远置顶」——用户要求无论锁定与否都保持顶置，不再跟随设置开关。
         // 每秒重申一次置顶 + 强制重绘：moveTop() 是 SWP_NOACTIVATE（不抢焦点、不改尺寸），
@@ -4394,12 +4426,35 @@ module.exports = function activate(api) {
         // 独占全屏（D3D exclusive）绕开合成器，任何窗口都盖不上去 —— 那种情况只能让路。
         for (const target of [state.win, state.popup]) {
             if (!target || target.isDestroyed() || !target.isVisible()) continue;
+            const key = target === state.popup ? 'popup' : 'win';
+            let error = null;
             try {
                 if (!target.isAlwaysOnTop()) target.setAlwaysOnTop(true);
                 target.moveTop();
-            } catch (error) {
-                // 单个窗口失败不影响另一个窗口。
+            } catch (failure) {
+                // 单个窗口失败不影响另一个窗口，但要记下来（1.9.2）。
+                error = failure;
             }
+            let onTop = false;
+            try {
+                onTop = target.isAlwaysOnTop();
+            } catch (failure) {
+                error = error || failure;
+            }
+            // 1.9.2：复核不过就做一次「硬重设」——先取消置顶再重新置顶，让 Windows 重写一遍 WS_EX_TOPMOST。
+            // 被全屏应用的顶层窗口压过之后、或窗口刚重建时，这一步比单纯重复 setAlwaysOnTop(true) 有效。
+            if (!onTop) {
+                try {
+                    target.setAlwaysOnTop(false);
+                    target.setAlwaysOnTop(true, 'screen-saver');
+                    target.moveTop();
+                    onTop = target.isAlwaysOnTop();
+                } catch (failure) {
+                    error = error || failure;
+                }
+            }
+            if (onTop) clearTopmostTrouble(key);
+            else reportTopmostTrouble(key, error, onTop);
             nudgeRepaintFor(target);
         }
     };
@@ -5876,6 +5931,14 @@ module.exports = function activate(api) {
                 + ' pinned=' + state.popupPinned + ' layout=' + state.popupLayout
                 + ' desktopMode=' + state.popupDesktop,
             '- 置顶重申 / Topmost watch: ' + Boolean(state.topmostTick),
+            // 1.9.2：置顶失败的现场，用户导出诊断日志时一并带上（没出问题时是 0）
+            '- 置顶状态 / Topmost: ' + JSON.stringify({
+                desktop: state.win && !state.win.isDestroyed() ? state.win.isAlwaysOnTop() : null,
+                popup: popupAlive() ? popupAlive().isAlwaysOnTop() : null,
+                desktopFailedForMs: topmostTrouble.win.since ? Date.now() - topmostTrouble.win.since : 0,
+                popupFailedForMs: topmostTrouble.popup.since ? Date.now() - topmostTrouble.popup.since : 0,
+                lastError: topmostTrouble.win.lastError || topmostTrouble.popup.lastError || '',
+            }),
             '',
             '== 当前配置 / Config ==',
             JSON.stringify(state.config, null, 2),
