@@ -32,8 +32,9 @@
  *     这里会重新创建它（macOS 点 Dock 图标重开主窗口就靠这条）。
  *   - 循环模式只有 off / all / one；宿主的 playback 没有「随机」这个循环模式，所以窗口显示
  *     不循环 / 列表循环 / 单曲循环。
- *   - 窗口页面是本地 data URL（页面里要 require('electron')，所以开 nodeIntegration、关上下文隔离），
- *     内容全部由本文件生成，歌词只经 textContent 写入，不加载任何外部资源。
+ *   - 窗口页面是本地 data URL，内容全部由本文件生成，歌词只经 textContent 写入，不加载任何外部资源。
+ *     2.1.0 起两个窗口都开 contextIsolation + sandbox、关 nodeIntegration，页面脚本只通过
+ *     preload.cjs 暴露的 window.lyricFloatBridge（send / on）跟主进程通信。
  *   - api.rpc.send 是 fire-and-forget：client 没挂载时消息直接丢弃。所以窗口加载完会先补发最后一份
  *     快照，再发一次 request-sync。
  *   - 快照按「帧顺序」挑：同一 playSessionId 内只丢「小幅后退且行号也退回去」的乱序旧帧，
@@ -47,7 +48,7 @@
  *     folium.rpc.call('toggle-widget') 切显示/隐藏（返回 { visible }），首帧用
  *     folium.rpc.call('widget-state') 对齐（主进程可能先于 client 推送）；每次显隐变化再用
  *     api.rpc.send('widget-visibility', { visible }) 推回 client 给按钮高亮。
- *     窗口右上角的 × 走 ipcRenderer.send('lyric-float:close')，效果同样是隐藏（模组仍启用）。
+ *     窗口右上角的 × 走桥上的 send('lyric-float:close')，效果同样是隐藏（模组仍启用）。
  *     隐藏期间照收快照（记 lastPayload）但不转给页面；重新显示时补发最后一份并 request-sync。
  *   - 1.6.1 长句横向滚动（页内叫 marquee）：配置在 desktop.marquee。开着时页面把歌词拆成
  *     「视口 + 轨道」两层，溢出才 translateX，速度按这一句剩余可唱时间反推，句首留白、滚到底交还
@@ -75,6 +76,8 @@ const path = require('path');
 const os = require('os');
 
 const LOG_PREFIX = '[lyric-float]';
+// 2.1.0：两个窗口页面的桥（contextIsolation 下页面唯一能碰到的 IPC 入口）。
+const PRELOAD_PATH = path.join(__dirname, 'preload.cjs');
 
 // 和 client.mjs 约定的 RPC 名字（那边是 RPC_UPDATE / RPC_ACTION）。
 const RPC_UPDATE = 'update-data';
@@ -1241,7 +1244,8 @@ const WIDGET_HTML = `<!DOCTYPE html>
     <button id="close" type="button" data-tip="关闭悬浮歌词（模组仍启用）" aria-label="关闭悬浮歌词">${ICON_SVG.close}</button>
 </div>
 <script>
-const { ipcRenderer } = require('electron');
+// 2.1.0：页面不再 require('electron')，改由 preload.cjs 暴露的桥（contextIsolation 下唯一通道）。
+const ipcRenderer = window.lyricFloatBridge;
 
 // ---- 排查日志：页面里的打印只有它自己的 DevTools 看得见，这里统一转发到主进程日志面板（定位完连监听一起删）。
 const debugToMain = (message) => ipcRenderer.send('${IPC_DEBUG}', message);
@@ -2710,7 +2714,8 @@ body[data-desktop="true"][data-pointer="true"] #desktop-exit { opacity: 1; }
 
 <script>
 'use strict';
-const { ipcRenderer } = require('electron');
+// 2.1.0：同桌面歌词页，走 preload.cjs 的桥，不再 require('electron')。
+const ipcRenderer = window.lyricFloatBridge;
 
 const IPC_DATA = '${IPC_DATA}';
 const IPC_CONFIG = '${IPC_CONFIG}';
@@ -3689,34 +3694,95 @@ module.exports = function activate(api) {
 
     // ---- 窗口状态持久化（位置 + 是否固定） ----
     // 以前每次启动都把窗口摆回「主屏底部居中」，用户拖到的位置一重启就丢；
-    // 这里在 userData 下记一个小 JSON，启动时恢复。
-    const stateFilePath = () => path.join(app.getPath('userData'), STATE_FILE_NAME);
+    // 这里记一个小 JSON，启动时恢复。
+    //
+    // 2.1.0：文件从 <userData> 根目录挪进 api.storage.paths.data（= <userData>/mods-data/<id>/files），
+    // 并在 mod.json 里声明 filesystem.data 权限 —— 这是市场「正式发布」的硬性要求：
+    // 模组自己的文件不能散落在 Folia 的数据根目录里，卸载模组时要能被一起清掉。
+    const storagePaths = () => {
+        try {
+            const paths = api.storage && api.storage.paths;
+            if (paths && typeof paths.data === 'string' && paths.data) return paths;
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' api.storage.paths 不可用，本次退回 userData：' + String((error && error.message) || error));
+        }
+        return null;
+    };
+    /** 模组自己的数据目录：优先 api.storage.paths.data，老宿主 / 权限被拒时退回 userData。 */
+    const dataDirOf = () => {
+        const paths = storagePaths();
+        return paths ? paths.data : app.getPath('userData');
+    };
+    const stateFilePath = () => path.join(dataDirOf(), STATE_FILE_NAME);
     const legacyStateFilePath = () => path.join(app.getPath('userData'), LEGACY_STATE_FILE_NAME);
+    /** 2.1.0 之前的状态文件就躺在 userData 根目录（新路径之外），迁移成功后要删掉。 */
+    const previousStateFilePath = () => path.join(app.getPath('userData'), STATE_FILE_NAME);
+    /** 待删除的迁移源文件：写成功后删，避免迁移途中丢掉状态。 */
+    const migratedStateSources = [];
+
+    const readStateFile = (file) => {
+        const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    };
 
     const readPersistedState = () => {
         try {
-            const parsed = JSON.parse(fs.readFileSync(stateFilePath(), 'utf8'));
-            return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+            const parsed = readStateFile(stateFilePath());
+            if (parsed) return parsed;
         } catch (error) {
-            // 改名后的第一次启动：新文件还没有，回退读旧名字。
-            try {
-                const legacy = JSON.parse(fs.readFileSync(legacyStateFilePath(), 'utf8'));
-                if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
-                    api.log.info(LOG_PREFIX + ' 已从旧状态文件迁移窗口状态（my-lyric-widget-state.json → ' + STATE_FILE_NAME + '）');
-                    return legacy;
-                }
-            } catch {
-                // 旧文件也没有：按全新安装处理。
-            }
-            // 第一次运行没有这个文件是正常情况，不打扰用户。
             if (!error || error.code !== 'ENOENT') {
                 api.log.warn(LOG_PREFIX + ' 读取窗口状态失败，本次用默认位置', error);
+                return {};
             }
-            return {};
+        }
+        // 新位置没有：按「上一版位置 → 改名前的旧名字」顺序各回退读一次，读到了就记下待删除。
+        for (const [file, note] of [
+            [previousStateFilePath(), '已把窗口状态从 userData 根目录迁进 api.storage.paths.data'],
+            [legacyStateFilePath(), '已从旧状态文件迁移窗口状态（my-lyric-widget-state.json → ' + STATE_FILE_NAME + '）'],
+        ]) {
+            if (file === stateFilePath()) continue;
+            try {
+                const parsed = readStateFile(file);
+                if (parsed) {
+                    migratedStateSources.push(file);
+                    api.log.info(LOG_PREFIX + ' ' + note);
+                    return parsed;
+                }
+            } catch {
+                // 这个位置也没有，继续试下一个。
+            }
+        }
+        return {};
+    };
+
+    /** 迁移成功后清掉旧文件（老的 userData 根目录那份 / 改名前的旧名字）。 */
+    const dropMigratedStateSources = () => {
+        while (migratedStateSources.length > 0) {
+            const file = migratedStateSources.pop();
+            try {
+                fs.unlinkSync(file);
+                api.log.info(LOG_PREFIX + ' 已删除迁移前的状态文件', file);
+            } catch (error) {
+                if (!error || error.code !== 'ENOENT') {
+                    api.log.warn(LOG_PREFIX + ' 删除迁移前的状态文件失败', error);
+                }
+            }
         }
     };
 
-    const savePersistedState = () => {
+    // 2.1.0：改成异步写（市场审查的建议项），拖动时已经合并成一次写盘，这里再避免同步 IO 阻塞主进程；
+    // 停用 / 退出走同步兜底，保证最后一份状态一定落盘。
+    let saveChain = Promise.resolve();
+    const writePersistedStateSync = () => {
+        try {
+            fs.mkdirSync(path.dirname(stateFilePath()), { recursive: true });
+            fs.writeFileSync(stateFilePath(), JSON.stringify(state.persisted));
+            dropMigratedStateSources();
+        } catch (error) {
+            api.log.warn(LOG_PREFIX + ' 保存窗口状态失败（不影响歌词显示）', error);
+        }
+    };
+    const savePersistedState = (options) => {
         if (!state.persisted) return;
         // 1.5.0：高度跟着字号走，而建窗那一刻只有默认配置（38px/180）。这里把窗口的实际高度也记下来，
         // 否则字号 >38px 的用户每次启动都要经历「先按 180 建窗、再变高」，见 createWidgetWindow。
@@ -3727,12 +3793,20 @@ module.exports = function activate(api) {
                 // 读不到就算了，下次启动按默认字号的高度建窗。
             }
         }
-        try {
-            fs.mkdirSync(path.dirname(stateFilePath()), { recursive: true });
-            fs.writeFileSync(stateFilePath(), JSON.stringify(state.persisted));
-        } catch (error) {
-            api.log.warn(LOG_PREFIX + ' 保存窗口状态失败（不影响歌词显示）', error);
+        if (options && options.sync) {
+            writePersistedStateSync();
+            return;
         }
+        const snapshot = JSON.stringify(state.persisted);
+        saveChain = saveChain.then(async () => {
+            try {
+                await fs.promises.mkdir(path.dirname(stateFilePath()), { recursive: true });
+                await fs.promises.writeFile(stateFilePath(), snapshot);
+                dropMigratedStateSources();
+            } catch (error) {
+                api.log.warn(LOG_PREFIX + ' 保存窗口状态失败（不影响歌词显示）', error);
+            }
+        });
     };
 
     /** 拖动时 'move' 触发得很密，合并成一次写盘。 */
@@ -4681,10 +4755,12 @@ module.exports = function activate(api) {
                 thickFrame: false,
                 show: false,
                 webPreferences: {
-                    // 页面里的脚本要用 require('electron').ipcRenderer；页面内容全部由本文件生成。
-                    nodeIntegration: true,
-                    contextIsolation: false,
-                    sandbox: false,
+                    // 2.1.0：页面脚本不再 require('electron')，只经 preload.cjs 暴露的桥；
+                    // 因此开 contextIsolation + sandbox、关 nodeIntegration（市场「正式发布」的硬性要求）。
+                    preload: PRELOAD_PATH,
+                    nodeIntegration: false,
+                    contextIsolation: true,
+                    sandbox: true,
                     webviewTag: false,
                     // 窗口很少获得焦点，别让后台节流拖慢歌词刷新。
                     backgroundThrottling: false,
@@ -5131,9 +5207,11 @@ module.exports = function activate(api) {
                 maxHeight: Math.max(POPUP_MIN_HEIGHT, Math.min(POPUP_MAX_HEIGHT_CAP, screen.getPrimaryDisplay().workArea.height)),
                 show: false,
                 webPreferences: {
-                    nodeIntegration: true,
-                    contextIsolation: false,
-                    sandbox: false,
+                    // 2.1.0：同桌面歌词窗口，走 preload.cjs 的桥。
+                    preload: PRELOAD_PATH,
+                    nodeIntegration: false,
+                    contextIsolation: true,
+                    sandbox: true,
                     webviewTag: false,
                     backgroundThrottling: false,
                     spellcheck: false,
@@ -5871,29 +5949,11 @@ module.exports = function activate(api) {
     });
     // 1.9.0 反馈闭环：导出诊断日志 / 打开外部链接。
     //   做法对齐已经上架的 wallpaper-engine-bg：那边是「导出错误日志」+「上报」两个按钮，
-    //   我们这里换成命令面板两个命令 —— 日志文件由主进程写（它有 fs，也读得到宿主日志目录），
-    //   打开链接也必须在主进程里做（模组 API 没有 openExternal，见 mods/folium.d.ts）。
-    const DIAGNOSTICS_LOG_TAIL_LINES = 240;
-    const readTodayLogTail = () => {
-        try {
-            const dir = path.join(app.getPath('appData'), 'Folia', 'logs', 'runtime');
-            if (!fs.existsSync(dir)) return '(日志目录不存在)';
-            const files = fs.readdirSync(dir)
-                .filter((name) => name.endsWith('.log'))
-                .map((name) => {
-                    const full = path.join(dir, name);
-                    return { full, mtime: fs.statSync(full).mtimeMs };
-                })
-                .sort((a, b) => b.mtime - a.mtime);
-            if (files.length === 0) return '(日志目录里没有 .log 文件)';
-            const text = fs.readFileSync(files[0].full, 'utf8');
-            const lines = text.split(/\r?\n/);
-            const tail = lines.slice(Math.max(0, lines.length - DIAGNOSTICS_LOG_TAIL_LINES));
-            return '文件：' + files[0].full + '\n\n' + tail.join('\n');
-        } catch (error) {
-            return '(读取日志失败：' + String((error && error.message) || error) + ')';
-        }
-    };
+    //   我们这里换成命令面板两个命令 —— 日志文件由主进程写，打开链接也必须在主进程里做
+    //   （模组 API 没有 openExternal，见 mods/folium.d.ts）。
+    //
+    // 2.1.0 起不再读宿主运行日志（市场审查要求：模组只记自己的事，宿主日志让用户自己导出），
+    // 诊断文件也写进 api.storage.paths.data，卸载模组时能被一起清掉。
     // 2.0.0：诊断里带上窗口矩形，方便判断「位置顶出屏幕 / 尺寸算错」这类问题。
     const boundsTextOf = (target) => {
         if (!target || typeof target.isDestroyed !== 'function' || target.isDestroyed()) return 'destroyed';
@@ -5905,7 +5965,7 @@ module.exports = function activate(api) {
         }
     };
     const writeDiagnosticsFile = (runtime) => {
-        const dir = path.join(app.getPath('userData'), 'diagnostics');
+        const dir = path.join(dataDirOf(), 'diagnostics');
         fs.mkdirSync(dir, { recursive: true });
         const stamp = new Date();
         const pad = (value) => String(value).padStart(2, '0');
@@ -5958,10 +6018,11 @@ module.exports = function activate(api) {
             JSON.stringify(state.config, null, 2),
             '',
             '== 状态文件 / State file ==',
+            '路径 / Path: ' + stateFilePath(),
             persisted,
             '',
-            '== 今日日志尾部 / Log tail ==',
-            readTodayLogTail(),
+            '== 宿主日志 / Host logs ==',
+            '模组不再读取宿主运行日志。需要时请在 Folia 里自行导出（模组只记录自己的状态）。',
             '',
         ];
         fs.writeFileSync(file, lines.join('\n'), 'utf8');
@@ -5993,7 +6054,11 @@ module.exports = function activate(api) {
         } catch (error) {
             return { ok: false, error: 'bad-url' };
         }
-        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return { ok: false, error: 'bad-url' };
+        // 2.1.0：只允许 https 的 GitHub 链接 —— 这个接口的用途就是「反馈问题」，
+        // 限制到 github.com（含子域）可以避免被当成任意 URL 打开器（市场审查的建议项）。
+        if (parsed.protocol !== 'https:') return { ok: false, error: 'bad-url' };
+        const host = parsed.hostname.toLowerCase();
+        if (host !== 'github.com' && !host.endsWith('.github.com')) return { ok: false, error: 'bad-host' };
         try {
             await shell.openExternal(parsed.toString());
             return { ok: true };
@@ -6123,9 +6188,9 @@ module.exports = function activate(api) {
         } catch (error) {
             // 清理失败不影响停用流程。
         }
-        // 停用模组时窗口可能还活着：把当前位置落盘再关。
+        // 停用模组时窗口可能还活着：把当前位置落盘再关。异步写在退出时可能来不及，这里同步兜底。
         if (state.win && !state.win.isDestroyed()) rememberWindowPosition(state.win);
-        savePersistedState();
+        savePersistedState({ sync: true });
         app.removeListener('browser-window-created', onBrowserWindowCreated);
         try {
             ipcMain.removeListener(IPC_ACTION, onActionFromWindowDebug);
