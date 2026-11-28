@@ -1,0 +1,125 @@
+name: Bug 报告 / Bug report
+description: 歌词浮岛出了问题？按这个表单填，能省掉来回报信息的几轮。
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。填之前建议先做两件事：
+        1. 确认用的是最新版本（设置 → 高级 → 模组 → 歌词浮岛）；
+        2. 先用命令面板搜「歌词浮岛：导出诊断日志」，把生成的 txt 附在下面。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么 / What happened
+      description: 越具体越好，比如「切到悬浮窗后歌词不更新」比「窗口有问题」好定位。
+      placeholder: 描述现象、出现频率（必现 / 偶发）、从什么时候开始出现。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      description: 从启动 Folia 开始写，一步一行。
+      placeholder: |
+        1. 启动 Folia，播放任意一首歌
+        2. 点播放条右侧「词」显示桌面歌词
+        3. 点固定键，然后切到悬浮窗
+        4. 现象出现
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望的表现 / Expected
+      description: 本来应该是什么样（可选）
+    validations:
+      required: false
+
+  - type: input
+    id: mod-version
+    attributes:
+      label: 歌词浮岛版本 / Lyric Float version
+      description: 在「设置 → 高级 → 模组」里能看到
+      placeholder: 2.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: folia-version
+    attributes:
+      label: Folia 版本 / Folia version
+      description: 设置 → 关于，或安装包文件名
+      placeholder: 0.8.1
+    validations:
+      required: true
+
+  - type: input
+    id: folium-version
+    attributes:
+      label: Folium 版本 / Folium version
+      description: 设置 → 关于里 Folia 会连带显示 Folium 版本；不确定就写「不确定」
+      placeholder: 2.1
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: 系统 / OS
+      description: Windows 版本号可在「winver」里看；macOS / Linux 写发行版和版本
+      placeholder: Windows 11 26200
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: 出问题的是哪种窗口 / Which window
+      options:
+        - 桌面歌词 / Desktop lyric
+        - 悬浮窗歌词 / Floating lyric
+        - 两个都有 / Both
+        - 不确定 / Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: karaoke
+    attributes:
+      label: 是否开启逐字染色 / Word-by-word coloring on
+      options:
+        - 开着 / On
+        - 关着 / Off
+        - 不确定 / Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断日志 / Diagnostics
+      description: 命令面板搜「歌词浮岛：导出诊断日志」，把生成的 txt 直接拖到这个框里（或粘贴内容）。
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: media
+    attributes:
+      label: 截图或录屏 / Screenshots
+      description: 图片直接拖进来即可，音视频问题录屏最有用。
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认 / Confirmation
+      options:
+        - label: 我用的是最新版本，并且搜过现有 issue 没有重复
+          required: true
